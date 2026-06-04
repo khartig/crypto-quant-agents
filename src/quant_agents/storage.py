@@ -1,0 +1,74 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PHASE1_TREE = (
+    "raw",
+    "curated/features",
+    "backtests",
+    "paper-trading",
+    "models/ollama-cache",
+    "logs/agents",
+    "archive/monthly",
+)
+
+
+def ensure_phase1_tree(root: Path) -> None:
+    for rel_path in PHASE1_TREE:
+        (root / rel_path).mkdir(parents=True, exist_ok=True)
+
+
+def symbol_slug(symbol: str) -> str:
+    return symbol.replace("/", "-").replace(":", "-")
+
+
+def raw_dataset_dir(root: Path, exchange: str, symbol: str, timeframe: str, ts: datetime) -> Path:
+    return (
+        root
+        / "raw"
+        / f"exchange={exchange}"
+        / f"symbol={symbol_slug(symbol)}"
+        / f"interval={timeframe}"
+        / f"year={ts:%Y}"
+        / f"month={ts:%m}"
+    )
+
+
+def latest_raw_dataset(root: Path, exchange: str, symbol: str, timeframe: str) -> Path:
+    base = (
+        root
+        / "raw"
+        / f"exchange={exchange}"
+        / f"symbol={symbol_slug(symbol)}"
+        / f"interval={timeframe}"
+    )
+    if not base.exists():
+        raise FileNotFoundError(f"No raw dataset directory found: {base}")
+
+    candidates = sorted(base.rglob("*.parquet"))
+    if not candidates:
+        raise FileNotFoundError(f"No raw parquet files found under: {base}")
+
+    return candidates[-1]
+
+
+def new_backtest_run_dir(root: Path, strategy_name: str) -> Path:
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = root / "backtests" / strategy_name / run_id
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def latest_backtest_run_dir(root: Path, strategy_name: str) -> Path:
+    base = root / "backtests" / strategy_name
+    if not base.exists():
+        raise FileNotFoundError(f"No backtest directory found: {base}")
+
+    candidates = sorted([p for p in base.iterdir() if p.is_dir()])
+    if not candidates:
+        raise FileNotFoundError(f"No backtest runs found under: {base}")
+
+    return candidates[-1]
+

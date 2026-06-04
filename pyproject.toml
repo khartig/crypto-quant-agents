@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-quant-agents"
+version = "0.1.0"
+description = "Phase 1 deterministic crypto quant workflow with agent-ready outputs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "ccxt>=4.4.0",
+  "numpy>=1.26.0",
+  "pandas>=2.2.0",
+  "pyarrow>=16.0.0",
+  "python-dotenv>=1.0.1"
+]
+
+[project.scripts]
+quant-phase1 = "quant_agents.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

@@ -1,0 +1,47 @@
+QUANT PROJECT MEMORY
+Last updated: 2026-06-04
+
+External storage identity
+- Disk: /dev/sdb (Seagate ST4000LM024-2U817V, ~3.6T)
+- Data partition: /dev/sdb2
+- Filesystem: exfat
+- Label: QUANTDATA
+- UUID: 6A20-D100
+
+Current mount information
+- Automount path: /media/kevin/QUANTDATA
+- Project working path: /mnt/quant-data
+- Verified source for both paths: /dev/sdb2
+- Mount options:
+  rw,nosuid,nodev,relatime,uid=1000,gid=1000,fmask=0022,dmask=0022,iocharset=utf8,errors=remount-ro
+
+External directory tree for quant workloads
+- /mnt/quant-data/raw
+- /mnt/quant-data/curated/features
+- /mnt/quant-data/backtests
+- /mnt/quant-data/paper-trading
+- /mnt/quant-data/models/ollama-cache
+- /mnt/quant-data/logs/agents
+- /mnt/quant-data/archive/monthly
+
+Manual remount (non-persistent) after reboot/login
+1) Ensure drive is mounted by Ubuntu at /media/kevin/QUANTDATA.
+2) Run:
+   sudo mkdir -p /mnt/quant-data
+   if ! mountpoint -q /mnt/quant-data; then
+     sudo mount --bind /media/kevin/QUANTDATA /mnt/quant-data
+   fi
+
+Verification commands
+- lsblk -o NAME,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINTS,TYPE,MODEL,TRAN /dev/sdb
+- findmnt /media/kevin/QUANTDATA
+- findmnt /mnt/quant-data
+
+Driver/workaround note
+- UAS quirk configured for Seagate bridge 0bc2:2344:
+  /etc/modprobe.d/seagate-uas-quirk.conf
+  options usb-storage quirks=0bc2:2344:u
+
+Boot behavior note
+- If reboot hangs while the external drive is connected, boot without the drive attached.
+- After login, plug in the drive and confirm it mounts, then bind to /mnt/quant-data if needed.
