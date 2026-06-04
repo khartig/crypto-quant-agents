@@ -25,12 +25,40 @@ class Settings:
     exchange_api_key: str | None
     exchange_api_secret: str | None
     exchange_api_passphrase: str | None
+    ollama_base_url: str
+    ollama_strategy_model: str
+    ollama_ops_model: str
+    agent_step_retries: int
+    agent_minimum_bars: int
+    risk_min_total_return: float
+    risk_min_sharpe: float
+    risk_max_drawdown: float
+    risk_min_signal_confidence: float
+    paper_trade_notional_usd: float
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _as_int(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value.strip())
+    except ValueError:
+        return default
+
+
+def _as_float(value: str | None, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
+    except ValueError:
+        return default
 
 
 def load_settings() -> Settings:
@@ -45,6 +73,16 @@ def load_settings() -> Settings:
         exchange_api_key=os.getenv("EXCHANGE_API_KEY") or None,
         exchange_api_secret=os.getenv("EXCHANGE_API_SECRET") or None,
         exchange_api_passphrase=os.getenv("EXCHANGE_API_PASSPHRASE") or None,
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+        ollama_strategy_model=os.getenv("OLLAMA_STRATEGY_MODEL", "llama3.1:8b"),
+        ollama_ops_model=os.getenv("OLLAMA_OPS_MODEL", "llama3.1:8b"),
+        agent_step_retries=max(0, _as_int(os.getenv("AGENT_STEP_RETRIES"), default=2)),
+        agent_minimum_bars=max(10, _as_int(os.getenv("AGENT_MINIMUM_BARS"), default=120)),
+        risk_min_total_return=_as_float(os.getenv("RISK_MIN_TOTAL_RETURN"), default=0.0),
+        risk_min_sharpe=_as_float(os.getenv("RISK_MIN_SHARPE"), default=0.0),
+        risk_max_drawdown=_as_float(os.getenv("RISK_MAX_DRAWDOWN"), default=-0.20),
+        risk_min_signal_confidence=_as_float(os.getenv("RISK_MIN_SIGNAL_CONFIDENCE"), default=0.55),
+        paper_trade_notional_usd=_as_float(os.getenv("PAPER_TRADE_NOTIONAL_USD"), default=100.0),
     )
 
 

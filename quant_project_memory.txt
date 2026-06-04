@@ -45,3 +45,32 @@ Driver/workaround note
 Boot behavior note
 - If reboot hangs while the external drive is connected, boot without the drive attached.
 - After login, plug in the drive and confirm it mounts, then bind to /mnt/quant-data if needed.
+
+Milestone 4 memory (agent plane)
+- Date: 2026-06-04
+- New agent-plane modules:
+  - src/quant_agents/agent_contracts.py
+  - src/quant_agents/ollama_client.py
+  - src/quant_agents/agent_plane.py
+- Existing modules updated:
+  - src/quant_agents/config.py
+  - src/quant_agents/cli.py
+  - src/quant_agents/backtest.py
+- New command:
+  - quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
+- Deterministic contract artifacts written per run:
+  - data_quality_signal.json
+  - strategy_proposal_signal.json
+  - backtest_evaluation.json
+  - risk_decision.json
+  - paper_trade_intent.json
+  - ops_report.md
+  - ops_report_contract.json
+  - run_manifest.json
+- Agent-plane run location:
+  - /mnt/quant-data/logs/agents/openclaw-orchestrator/<yyyy-mm-dd>/<run_id>/
+- Validation state observed on 2026-06-04:
+  - command execution succeeded and produced full artifact set
+  - strategy + ops steps fell back when Ollama model llama3.1:8b was unavailable (404)
+  - data quality gate failed due to insufficient_bars=20<120
+  - risk gate failed and paper_trade_intent status remained blocked

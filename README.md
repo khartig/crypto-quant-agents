@@ -3,6 +3,7 @@ This repository includes a runnable Phase 1 baseline pipeline:
 1. Ingest OHLCV market data from an exchange (`ccxt`).
 2. Run a deterministic SMA crossover backtest.
 3. Generate a daily markdown operations report.
+4. Run Milestone 4 agent-plane orchestration with Ollama-backed analysis/reporting and deterministic risk gating.
 
 All large outputs are written under the external storage root (`QUANT_DATA_ROOT`), defaulting to `/mnt/quant-data`.
 
@@ -59,6 +60,22 @@ quant-phase1 run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limi
 ```bash path=null start=null
 quant-phase1 run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000 --archive-backtest
 ```
+### Run Milestone 4 agent-plane workflow
+```bash path=null start=null
+quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
+```
+
+### Run Milestone 4 workflow with explicit deterministic gate thresholds
+```bash path=null start=null
+quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
+```
+
+## Agent-plane troubleshooting notes
+- If the configured Ollama model is unavailable, strategy/report steps will retry then fall back to deterministic output. Check `strategy_proposal_signal.json` and `ops_report_contract.json` warnings in the run directory.
+- If `data_quality_signal.json` reports `insufficient_bars`, ingest more data (`quant-phase1 ingest --limit ...`) or lower the gate for controlled testing (`--minimum-bars` or `AGENT_MINIMUM_BARS`).
+- When deterministic risk gating fails, `paper_trade_intent.json` will remain `status=blocked`, and no paper intent file is emitted into `paper-trading/<yyyy-mm-dd>/`.
+- Each run writes step-attempt diagnostics to:
+  - `logs/agents/openclaw-orchestrator/<yyyy-mm-dd>/<run_id>/steps/<step-name>/attempt_*.json`
 
 ### Enforce exchange-secret readiness
 ```bash path=null start=null
@@ -79,6 +96,26 @@ quant-phase1 run-daily --require-secrets
 - Backtests: `backtests/sma_crossover/<run_id>/`
   - includes `metrics.json`, `equity_curve.parquet`, `run_manifest.json`
 - Ops reports: `logs/agents/ops-report-agent/<yyyy-mm-dd>/`
+- Agent-plane orchestration runs:
+  - `logs/agents/openclaw-orchestrator/<yyyy-mm-dd>/<run_id>/`
+  - includes contract artifacts:
+    - `data_quality_signal.json`
+    - `strategy_proposal_signal.json`
+    - `backtest_evaluation.json`
+    - `risk_decision.json`
+    - `paper_trade_intent.json`
+    - `ops_report.md`
+    - `ops_report_contract.json`
+    - `run_manifest.json`
+  - step-boundary retry traces:
+    - `steps/data-quality-agent/attempt_*.json`
+    - `steps/strategy-agent/attempt_*.json`
+    - `steps/backtest-agent/attempt_*.json`
+    - `steps/risk-review-agent/attempt_*.json`
+    - `steps/execution-gateway/attempt_*.json`
+    - `steps/ops-report-agent/attempt_*.json`
+- Paper-trading intent spool:
+  - `paper-trading/<yyyy-mm-dd>/paper_trade_intent_<run_id>.json` (written only when deterministic risk gate approves)
 - Operational metrics baseline:
   - JSONL events: `logs/metrics/<yyyy-mm-dd>/pipeline_metrics.jsonl`
   - summary counters: `logs/metrics/summary.json`

@@ -4,6 +4,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from quant_agents.agent_plane import AgentPlaneConfig, RiskThresholds, run_agent_plane
 from quant_agents.backtest import STRATEGY_NAME, archive_backtest_run, run_sma_backtest
 from quant_agents.config import (
     ensure_data_root_ready,
@@ -88,6 +89,70 @@ def _base_parser() -> argparse.ArgumentParser:
         "--require-secrets",
         action="store_true",
         help="Fail if exchange API secrets are missing.",
+    )
+    agent_plane = subparsers.add_parser(
+        "agent-plane",
+        help="Run OpenClaw-style agent-plane orchestration with deterministic risk gating.",
+    )
+    agent_plane.add_argument("--exchange", default=None)
+    agent_plane.add_argument("--symbol", default=None)
+    agent_plane.add_argument("--timeframe", default=None)
+    agent_plane.add_argument(
+        "--input-file",
+        default=None,
+        help="Optional explicit parquet input file used by data-quality, strategy, and backtest phases.",
+    )
+    agent_plane.add_argument(
+        "--strategy-model",
+        default=None,
+        help="Ollama model for strategy proposal generation (default from settings).",
+    )
+    agent_plane.add_argument(
+        "--ops-model",
+        default=None,
+        help="Ollama model for ops report generation (default from settings).",
+    )
+    agent_plane.add_argument(
+        "--step-retries",
+        type=int,
+        default=None,
+        help="Retries per orchestration step before fallback.",
+    )
+    agent_plane.add_argument(
+        "--minimum-bars",
+        type=int,
+        default=None,
+        help="Minimum bars required for data-quality pass.",
+    )
+    agent_plane.add_argument(
+        "--min-total-return",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: minimum backtest total return.",
+    )
+    agent_plane.add_argument(
+        "--min-sharpe",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: minimum backtest sharpe.",
+    )
+    agent_plane.add_argument(
+        "--max-drawdown",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: minimum allowed max drawdown (negative value).",
+    )
+    agent_plane.add_argument(
+        "--min-signal-confidence",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: minimum strategy confidence.",
+    )
+    agent_plane.add_argument(
+        "--paper-notional-usd",
+        type=float,
+        default=None,
+        help="Notional USD for emitted paper intents.",
     )
 
     doctor = subparsers.add_parser(
@@ -245,6 +310,64 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("Report complete at %s", report_result.report_path)
             metric["report"] = {"report_path": str(report_result.report_path)}
         print(f"Daily pipeline complete -> {report_result.report_path}")
+        return
+
+    if args.command == "agent-plane":
+        source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
+        thresholds = RiskThresholds(
+            min_total_return=(
+                args.min_total_return
+                if args.min_total_return is not None
+                else settings.risk_min_total_return
+            ),
+            min_sharpe=args.min_sharpe if args.min_sharpe is not None else settings.risk_min_sharpe,
+            max_drawdown=args.max_drawdown if args.max_drawdown is not None else settings.risk_max_drawdown,
+            min_signal_confidence=(
+                args.min_signal_confidence
+                if args.min_signal_confidence is not None
+                else settings.risk_min_signal_confidence
+            ),
+        )
+        config = AgentPlaneConfig(
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            strategy_model=args.strategy_model or settings.ollama_strategy_model,
+            ops_model=args.ops_model or settings.ollama_ops_model,
+            step_retries=max(
+                0,
+                args.step_retries if args.step_retries is not None else settings.agent_step_retries,
+            ),
+            thresholds=thresholds,
+            paper_notional_usd=(
+                args.paper_notional_usd
+                if args.paper_notional_usd is not None
+                else settings.paper_trade_notional_usd
+            ),
+            minimum_bars=max(
+                10,
+                args.minimum_bars if args.minimum_bars is not None else settings.agent_minimum_bars,
+            ),
+            source_data_path=source_file,
+        )
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="agent-plane",
+            dimensions={"exchange": exchange, "symbol": symbol, "timeframe": timeframe},
+        ) as metric:
+            result = run_agent_plane(settings, config)
+            metric["run_id"] = result.run_id
+            metric["run_dir"] = str(result.run_dir)
+            metric["risk_approved"] = result.risk_approved
+            metric["intent_status"] = result.intent_status
+            metric["ops_report_contract"] = str(result.ops_report_contract_path)
+            if result.intent_destination_path is not None:
+                metric["intent_destination_path"] = str(result.intent_destination_path)
+        print(
+            "Agent plane complete -> "
+            f"{result.run_dir} "
+            f"(risk_approved={result.risk_approved} intent={result.intent_status})"
+        )
         return
 
     parser.error(f"Unknown command: {args.command}")

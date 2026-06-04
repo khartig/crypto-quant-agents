@@ -94,7 +94,6 @@ def run_sma_backtest(
         raise FileNotFoundError(f"Backtest input file does not exist: {source_file}")
 
     source_hash = _sha256_file(source_file)
-    source_file = latest_raw_dataset(settings.quant_data_root, exchange, symbol, timeframe)
     logger.info("Loading market data from %s", source_file)
     df = pd.read_parquet(source_file).sort_values("timestamp").reset_index(drop=True)
 
