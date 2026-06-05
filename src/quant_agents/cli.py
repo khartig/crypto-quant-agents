@@ -15,6 +15,7 @@ from quant_agents.doctor import format_doctor_report, run_doctor
 from quant_agents.ingestion import fetch_ohlcv_to_parquet
 from quant_agents.logging_utils import configure_logging
 from quant_agents.metrics import tracked_operation
+from quant_agents.paper_account import run_paper_account_probe
 from quant_agents.reporting import generate_daily_report
 from quant_agents.storage import ensure_phase1_tree, latest_backtest_run_dir
 from quant_agents.visualization import generate_run_visuals
@@ -166,6 +167,45 @@ def _base_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Per-trade fee in basis points used by deterministic paper execution.",
+    )
+    paper_account = subparsers.add_parser(
+        "paper-account-check",
+        help="Validate connectivity to configured paper-account provider.",
+    )
+    paper_account.add_argument(
+        "--provider",
+        choices=["tradingview", "ccxt"],
+        default=None,
+        help="Paper account provider override (default from settings).",
+    )
+    paper_account.add_argument(
+        "--exchange",
+        default=None,
+        help="CCXT exchange id when provider=ccxt (default from settings).",
+    )
+    paper_account.add_argument(
+        "--sandbox",
+        dest="paper_sandbox",
+        action="store_true",
+        help="Enable CCXT sandbox mode (provider=ccxt).",
+    )
+    paper_account.add_argument(
+        "--no-sandbox",
+        dest="paper_sandbox",
+        action="store_false",
+        help="Disable CCXT sandbox mode (provider=ccxt).",
+    )
+    paper_account.set_defaults(paper_sandbox=None)
+    paper_account.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=None,
+        help="Provider connectivity timeout override.",
+    )
+    paper_account.add_argument(
+        "--tradingview-base-url",
+        default=None,
+        help="TradingView base URL override for provider=tradingview.",
     )
     visualize = subparsers.add_parser(
         "visualize-run",
@@ -409,6 +449,51 @@ def main(argv: list[str] | None = None) -> None:
             f"intent={result.intent_status} "
             f"execution={result.paper_trade_execution_status})"
         )
+        return
+
+    if args.command == "paper-account-check":
+        provider = args.provider or settings.paper_account_provider
+        exchange_id = args.exchange or settings.paper_account_exchange
+        timeout_seconds = (
+            args.timeout_seconds
+            if args.timeout_seconds is not None
+            else settings.paper_account_timeout_seconds
+        )
+        sandbox = (
+            args.paper_sandbox
+            if args.paper_sandbox is not None
+            else settings.paper_account_sandbox
+        )
+        tradingview_base_url = args.tradingview_base_url or settings.tradingview_base_url
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="paper-account-check",
+            dimensions={
+                "provider": provider,
+                "exchange": exchange_id if provider == "ccxt" else "n/a",
+            },
+        ) as metric:
+            result = run_paper_account_probe(
+                provider=provider,
+                timeout_seconds=max(1.0, float(timeout_seconds)),
+                tradingview_base_url=tradingview_base_url,
+                exchange_id=exchange_id,
+                sandbox=bool(sandbox),
+                api_key=settings.paper_account_api_key,
+                api_secret=settings.paper_account_api_secret,
+                api_passphrase=settings.paper_account_api_passphrase,
+            )
+            metric["ok"] = result.ok
+            metric["provider"] = result.provider
+            metric["message"] = result.message
+            metric["details"] = result.details
+
+        status = "PASS" if result.ok else "FAIL"
+        print(f"{status} provider={result.provider} message={result.message}")
+        for key, value in result.details.items():
+            print(f"- {key}={value}")
+        if not result.ok:
+            raise SystemExit(1)
         return
 
     if args.command == "visualize-run":

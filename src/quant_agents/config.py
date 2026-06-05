@@ -38,6 +38,14 @@ class Settings:
     paper_trade_notional_usd: float
     paper_trade_starting_cash_usd: float
     paper_trade_fee_bps: float
+    paper_account_provider: str
+    paper_account_exchange: str
+    paper_account_sandbox: bool
+    paper_account_timeout_seconds: float
+    paper_account_api_key: str | None
+    paper_account_api_secret: str | None
+    paper_account_api_passphrase: str | None
+    tradingview_base_url: str
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -95,6 +103,17 @@ def load_settings() -> Settings:
             0.0,
             _as_float(os.getenv("PAPER_TRADE_FEE_BPS"), default=5.0),
         ),
+        paper_account_provider=os.getenv("PAPER_ACCOUNT_PROVIDER", "tradingview"),
+        paper_account_exchange=os.getenv("PAPER_ACCOUNT_EXCHANGE", "kraken"),
+        paper_account_sandbox=_as_bool(os.getenv("PAPER_ACCOUNT_SANDBOX"), default=True),
+        paper_account_timeout_seconds=max(
+            1.0,
+            _as_float(os.getenv("PAPER_ACCOUNT_TIMEOUT_SECONDS"), default=15.0),
+        ),
+        paper_account_api_key=os.getenv("PAPER_ACCOUNT_API_KEY") or None,
+        paper_account_api_secret=os.getenv("PAPER_ACCOUNT_API_SECRET") or None,
+        paper_account_api_passphrase=os.getenv("PAPER_ACCOUNT_API_PASSPHRASE") or None,
+        tradingview_base_url=os.getenv("TRADINGVIEW_BASE_URL", "https://www.tradingview.com"),
     )
 
 
