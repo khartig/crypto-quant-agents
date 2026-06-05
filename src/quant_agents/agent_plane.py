@@ -15,6 +15,7 @@ from quant_agents.agent_contracts import (
     BacktestEvaluation,
     DataQualitySignal,
     OpsReportContract,
+    PaperTradeExecution,
     PaperTradeIntent,
     Recommendation,
     RiskDecision,
@@ -24,6 +25,7 @@ from quant_agents.agent_contracts import (
 from quant_agents.backtest import STRATEGY_NAME, run_sma_backtest
 from quant_agents.config import Settings
 from quant_agents.ollama_client import OllamaClient
+from quant_agents.paper_trading import execute_paper_trade_intent
 from quant_agents.storage import latest_raw_dataset
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,8 @@ class AgentPlaneConfig:
     step_retries: int
     thresholds: RiskThresholds
     paper_notional_usd: float
+    paper_starting_cash_usd: float
+    paper_fee_bps: float
     minimum_bars: int
     source_data_path: Path | None = None
 
@@ -75,11 +79,13 @@ class AgentPlaneRunResult:
     backtest_evaluation_path: Path
     risk_decision_path: Path
     paper_trade_intent_path: Path
+    paper_trade_execution_path: Path
     ops_report_markdown_path: Path
     ops_report_contract_path: Path
     run_manifest_path: Path
     risk_approved: bool
     intent_status: str
+    paper_trade_execution_status: str
     intent_destination_path: Path | None
 
 
@@ -336,6 +342,7 @@ def _ops_prompt(context: dict[str, Any]) -> str:
             "## Run summary",
             "## Deterministic gate outcome",
             "## Paper intent",
+            "## Paper execution",
             "## Follow-ups",
             "Use only facts from the context JSON and do not invent metrics.",
             json.dumps(context, indent=2, sort_keys=True),
@@ -346,6 +353,7 @@ def _ops_prompt(context: dict[str, Any]) -> str:
 def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
     risk_approved = bool(context["risk"]["approved"])
     intent_status = str(context["intent"]["status"])
+    execution_status = str(context["execution"]["status"])
     return "\n".join(
         [
             f"# Agent Plane Ops Report ({context['run_id']})",
@@ -365,6 +373,14 @@ def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
             f"- Status: `{intent_status}`",
             f"- Action: `{context['intent']['action']}`",
             f"- Notional USD: `{context['intent']['notional_usd']}`",
+            "",
+            "## Paper execution",
+            f"- Status: `{execution_status}`",
+            f"- Executed action: `{context['execution']['executed_action']}`",
+            f"- Executed notional USD: `{context['execution']['executed_notional_usd']}`",
+            f"- Fee USD: `{context['execution']['fee_usd']}`",
+            f"- Cash after USD: `{context['execution']['cash_after_usd']}`",
+            f"- Position qty after: `{context['execution']['position_qty_after']}`",
             "",
             "## Follow-ups",
             "- Validate model availability in local Ollama if fallback mode was used.",
@@ -396,6 +412,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     backtest_evaluation_path = run_dir / "backtest_evaluation.json"
     risk_decision_path = run_dir / "risk_decision.json"
     paper_trade_intent_path = run_dir / "paper_trade_intent.json"
+    paper_trade_execution_path = run_dir / "paper_trade_execution.json"
     ops_report_markdown_path = run_dir / "ops_report.md"
     ops_report_contract_path = run_dir / "ops_report_contract.json"
     run_manifest_path = run_dir / "run_manifest.json"
@@ -714,6 +731,31 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         intent_destination_path = Path(paper_trade_intent.destination_path)
         write_contract(intent_destination_path, paper_trade_intent)
 
+    def paper_execution_runner() -> PaperTradeExecution:
+        closes = pd.to_numeric(market_frame["close"], errors="coerce").dropna()
+        mark_price = float(closes.iloc[-1]) if not closes.empty else None
+        return execute_paper_trade_intent(
+            quant_data_root=settings.quant_data_root,
+            run_id=run_id,
+            created_at_utc=_utc_now_iso(),
+            exchange=config.exchange,
+            symbol=config.symbol,
+            timeframe=config.timeframe,
+            intent=paper_trade_intent,
+            mark_price=mark_price,
+            starting_cash_usd=config.paper_starting_cash_usd,
+            fee_bps=config.paper_fee_bps,
+        )
+
+    paper_trade_execution, paper_execution_step = _run_step_with_retries(
+        run_dir=run_dir,
+        step_name="paper-trading-executor",
+        max_retries=config.step_retries,
+        runner=paper_execution_runner,
+    )
+    write_contract(paper_trade_execution_path, paper_trade_execution)
+    step_records.append(paper_execution_step)
+
     ops_context = {
         "run_id": run_id,
         "scope": {
@@ -748,6 +790,19 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "action": paper_trade_intent.action,
             "notional_usd": paper_trade_intent.notional_usd,
             "destination_path": paper_trade_intent.destination_path,
+        },
+        "execution": {
+            "status": paper_trade_execution.execution_status,
+            "executed_action": paper_trade_execution.executed_action,
+            "executed_notional_usd": paper_trade_execution.executed_notional_usd,
+            "fee_usd": paper_trade_execution.fee_usd,
+            "cash_after_usd": paper_trade_execution.cash_after_usd,
+            "position_qty_after": paper_trade_execution.position_qty_after,
+            "position_avg_entry_after": paper_trade_execution.position_avg_entry_after,
+            "reason": paper_trade_execution.reason,
+            "portfolio_state_path": paper_trade_execution.portfolio_state_path,
+            "fills_log_path": paper_trade_execution.fills_log_path,
+            "execution_record_path": paper_trade_execution.execution_record_path,
         },
     }
 
@@ -813,7 +868,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "backtest_evaluation": str(backtest_evaluation_path),
             "risk_decision": str(risk_decision_path),
             "paper_trade_intent": str(paper_trade_intent_path),
+            "paper_trade_execution": str(paper_trade_execution_path),
             "paper_trade_destination": str(intent_destination_path) if intent_destination_path else "",
+            "paper_portfolio_state": paper_trade_execution.portfolio_state_path or "",
+            "paper_fills_log": paper_trade_execution.fills_log_path or "",
+            "paper_execution_record": paper_trade_execution.execution_record_path or "",
         },
         warnings=list(report_payload.get("warnings", [])),
     )
@@ -836,6 +895,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "step_retries": config.step_retries,
             "minimum_bars": config.minimum_bars,
             "paper_notional_usd": config.paper_notional_usd,
+            "paper_starting_cash_usd": config.paper_starting_cash_usd,
+            "paper_fee_bps": config.paper_fee_bps,
             "thresholds": _json_safe(asdict(config.thresholds)),
         },
         "steps": [_json_safe(asdict(record)) for record in step_records],
@@ -846,22 +907,28 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "backtest_evaluation": str(backtest_evaluation_path),
             "risk_decision": str(risk_decision_path),
             "paper_trade_intent": str(paper_trade_intent_path),
+            "paper_trade_execution": str(paper_trade_execution_path),
             "ops_report_markdown": str(ops_report_markdown_path),
             "ops_report_contract": str(ops_report_contract_path),
             "paper_trade_destination": str(intent_destination_path) if intent_destination_path else None,
+            "paper_portfolio_state": paper_trade_execution.portfolio_state_path,
+            "paper_fills_log": paper_trade_execution.fills_log_path,
+            "paper_execution_record": paper_trade_execution.execution_record_path,
         },
         "outcome": {
             "risk_approved": risk_decision.approved,
             "intent_status": paper_trade_intent.status,
+            "paper_trade_execution_status": paper_trade_execution.execution_status,
             "deterministic_gate": risk_decision.deterministic_gate,
         },
     }
     _write_json(run_manifest_path, run_manifest)
     logger.info(
-        "Agent-plane run complete run_id=%s risk_approved=%s intent_status=%s",
+        "Agent-plane run complete run_id=%s risk_approved=%s intent_status=%s execution_status=%s",
         run_id,
         risk_decision.approved,
         paper_trade_intent.status,
+        paper_trade_execution.execution_status,
     )
 
     return AgentPlaneRunResult(
@@ -873,10 +940,12 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         backtest_evaluation_path=backtest_evaluation_path,
         risk_decision_path=risk_decision_path,
         paper_trade_intent_path=paper_trade_intent_path,
+        paper_trade_execution_path=paper_trade_execution_path,
         ops_report_markdown_path=ops_report_markdown_path,
         ops_report_contract_path=ops_report_contract_path,
         run_manifest_path=run_manifest_path,
         risk_approved=risk_decision.approved,
         intent_status=paper_trade_intent.status,
+        paper_trade_execution_status=paper_trade_execution.execution_status,
         intent_destination_path=intent_destination_path,
     )

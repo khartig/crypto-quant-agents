@@ -9,6 +9,7 @@ PHASE1_TREE = (
     "curated/features",
     "backtests",
     "paper-trading",
+    "paper-trading/state",
     "models/ollama-cache",
     "logs/agents",
     "archive/monthly",

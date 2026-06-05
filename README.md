@@ -69,6 +69,10 @@ quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 ```bash path=null start=null
 quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
 ```
+### Run Milestone 4 workflow with paper-trading execution controls
+```bash path=null start=null
+quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5
+```
 
 ### Generate evaluation visuals for the latest agent-plane run
 ```bash path=null start=null
@@ -83,7 +87,7 @@ quant-phase1 visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orches
 ## Agent-plane troubleshooting notes
 - If the configured Ollama model is unavailable, strategy/report steps will retry then fall back to deterministic output. Check `strategy_proposal_signal.json` and `ops_report_contract.json` warnings in the run directory.
 - If `data_quality_signal.json` reports `insufficient_bars`, ingest more data (`quant-phase1 ingest --limit ...`) or lower the gate for controlled testing (`--minimum-bars` or `AGENT_MINIMUM_BARS`).
-- When deterministic risk gating fails, `paper_trade_intent.json` will remain `status=blocked`, and no paper intent file is emitted into `paper-trading/<yyyy-mm-dd>/`.
+- When deterministic risk gating fails, `paper_trade_intent.json` remains `status=blocked` and `paper_trade_execution.json` records `execution_status=skipped`.
 - Each run writes step-attempt diagnostics to:
   - `logs/agents/openclaw-orchestrator/<yyyy-mm-dd>/<run_id>/steps/<step-name>/attempt_*.json`
 
@@ -114,6 +118,7 @@ quant-phase1 run-daily --require-secrets
     - `backtest_evaluation.json`
     - `risk_decision.json`
     - `paper_trade_intent.json`
+    - `paper_trade_execution.json`
     - `ops_report.md`
     - `ops_report_contract.json`
     - `run_manifest.json`
@@ -127,9 +132,14 @@ quant-phase1 run-daily --require-secrets
     - `steps/backtest-agent/attempt_*.json`
     - `steps/risk-review-agent/attempt_*.json`
     - `steps/execution-gateway/attempt_*.json`
+    - `steps/paper-trading-executor/attempt_*.json`
     - `steps/ops-report-agent/attempt_*.json`
 - Paper-trading intent spool:
   - `paper-trading/<yyyy-mm-dd>/paper_trade_intent_<run_id>.json` (written only when deterministic risk gate approves)
+- Paper-trading execution state:
+  - `paper-trading/state/portfolio_state.json`
+  - `paper-trading/<yyyy-mm-dd>/fills.jsonl`
+  - `paper-trading/<yyyy-mm-dd>/paper_trade_execution_<run_id>.json`
 - Operational metrics baseline:
   - JSONL events: `logs/metrics/<yyyy-mm-dd>/pipeline_metrics.jsonl`
   - summary counters: `logs/metrics/summary.json`

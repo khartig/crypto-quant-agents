@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 Recommendation = Literal["buy", "sell", "hold"]
 IntentStatus = Literal["emitted", "blocked"]
+ExecutionStatus = Literal["executed", "skipped", "rejected"]
 
 
 def _json_safe(value: Any) -> Any:
@@ -117,6 +118,33 @@ class PaperTradeIntent:
     risk_approved: bool
     reason: str
     destination_path: str | None
+
+@dataclass(frozen=True)
+class PaperTradeExecution:
+    contract: str
+    run_id: str
+    created_at_utc: str
+    mode: Literal["paper"]
+    exchange: str
+    symbol: str
+    timeframe: str
+    intent_status: IntentStatus
+    intent_action: Recommendation
+    execution_status: ExecutionStatus
+    executed_action: Recommendation
+    requested_notional_usd: float
+    executed_notional_usd: float
+    executed_quantity: float
+    mark_price: float | None
+    fee_usd: float
+    cash_after_usd: float | None
+    position_qty_after: float | None
+    position_avg_entry_after: float | None
+    realized_pnl_delta_usd: float
+    reason: str
+    portfolio_state_path: str | None
+    fills_log_path: str | None
+    execution_record_path: str | None
 
 
 @dataclass(frozen=True)

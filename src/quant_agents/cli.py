@@ -155,6 +155,18 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Notional USD for emitted paper intents.",
     )
+    agent_plane.add_argument(
+        "--paper-starting-cash-usd",
+        type=float,
+        default=None,
+        help="Starting cash used by deterministic paper execution ledger.",
+    )
+    agent_plane.add_argument(
+        "--paper-fee-bps",
+        type=float,
+        default=None,
+        help="Per-trade fee in basis points used by deterministic paper execution.",
+    )
     visualize = subparsers.add_parser(
         "visualize-run",
         help="Generate readable backtest/strategy evaluation charts for an agent-plane run.",
@@ -359,6 +371,16 @@ def main(argv: list[str] | None = None) -> None:
                 if args.paper_notional_usd is not None
                 else settings.paper_trade_notional_usd
             ),
+            paper_starting_cash_usd=(
+                args.paper_starting_cash_usd
+                if args.paper_starting_cash_usd is not None
+                else settings.paper_trade_starting_cash_usd
+            ),
+            paper_fee_bps=(
+                args.paper_fee_bps
+                if args.paper_fee_bps is not None
+                else settings.paper_trade_fee_bps
+            ),
             minimum_bars=max(
                 10,
                 args.minimum_bars if args.minimum_bars is not None else settings.agent_minimum_bars,
@@ -375,13 +397,17 @@ def main(argv: list[str] | None = None) -> None:
             metric["run_dir"] = str(result.run_dir)
             metric["risk_approved"] = result.risk_approved
             metric["intent_status"] = result.intent_status
+            metric["paper_trade_execution_status"] = result.paper_trade_execution_status
+            metric["paper_trade_execution_path"] = str(result.paper_trade_execution_path)
             metric["ops_report_contract"] = str(result.ops_report_contract_path)
             if result.intent_destination_path is not None:
                 metric["intent_destination_path"] = str(result.intent_destination_path)
         print(
             "Agent plane complete -> "
             f"{result.run_dir} "
-            f"(risk_approved={result.risk_approved} intent={result.intent_status})"
+            f"(risk_approved={result.risk_approved} "
+            f"intent={result.intent_status} "
+            f"execution={result.paper_trade_execution_status})"
         )
         return
 

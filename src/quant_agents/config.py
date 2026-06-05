@@ -36,6 +36,8 @@ class Settings:
     risk_max_drawdown: float
     risk_min_signal_confidence: float
     paper_trade_notional_usd: float
+    paper_trade_starting_cash_usd: float
+    paper_trade_fee_bps: float
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -85,6 +87,14 @@ def load_settings() -> Settings:
         risk_max_drawdown=_as_float(os.getenv("RISK_MAX_DRAWDOWN"), default=-0.20),
         risk_min_signal_confidence=_as_float(os.getenv("RISK_MIN_SIGNAL_CONFIDENCE"), default=0.55),
         paper_trade_notional_usd=_as_float(os.getenv("PAPER_TRADE_NOTIONAL_USD"), default=100.0),
+        paper_trade_starting_cash_usd=max(
+            0.0,
+            _as_float(os.getenv("PAPER_TRADE_STARTING_CASH_USD"), default=10000.0),
+        ),
+        paper_trade_fee_bps=max(
+            0.0,
+            _as_float(os.getenv("PAPER_TRADE_FEE_BPS"), default=5.0),
+        ),
     )
 
 
