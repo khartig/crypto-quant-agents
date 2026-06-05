@@ -26,6 +26,7 @@ class Settings:
     exchange_api_secret: str | None
     exchange_api_passphrase: str | None
     ollama_base_url: str
+    ollama_timeout_seconds: float
     ollama_strategy_model: str
     ollama_ops_model: str
     agent_step_retries: int
@@ -74,6 +75,7 @@ def load_settings() -> Settings:
         exchange_api_secret=os.getenv("EXCHANGE_API_SECRET") or None,
         exchange_api_passphrase=os.getenv("EXCHANGE_API_PASSPHRASE") or None,
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+        ollama_timeout_seconds=max(1.0, _as_float(os.getenv("OLLAMA_TIMEOUT_SECONDS"), default=180.0)),
         ollama_strategy_model=os.getenv("OLLAMA_STRATEGY_MODEL", "llama3.1:8b"),
         ollama_ops_model=os.getenv("OLLAMA_OPS_MODEL", "llama3.1:8b"),
         agent_step_retries=max(0, _as_int(os.getenv("AGENT_STEP_RETRIES"), default=2)),

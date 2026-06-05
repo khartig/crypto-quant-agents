@@ -385,7 +385,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     source_data_path = source_data_path.expanduser().resolve()
     source_data_sha256 = _sha256_file(source_data_path)
 
-    ollama = OllamaClient(settings.ollama_base_url)
+    ollama = OllamaClient(
+        settings.ollama_base_url,
+        timeout_seconds=settings.ollama_timeout_seconds,
+    )
     step_records: list[StepExecutionRecord] = []
 
     data_quality_path = run_dir / "data_quality_signal.json"

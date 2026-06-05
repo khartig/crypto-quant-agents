@@ -1,5 +1,5 @@
 QUANT PROJECT MEMORY
-Last updated: 2026-06-04
+Last updated: 2026-06-05
 
 External storage identity
 - Disk: /dev/sdb (Seagate ST4000LM024-2U817V, ~3.6T)
@@ -74,3 +74,54 @@ Milestone 4 memory (agent plane)
   - strategy + ops steps fell back when Ollama model llama3.1:8b was unavailable (404)
   - data quality gate failed due to insufficient_bars=20<120
   - risk gate failed and paper_trade_intent status remained blocked
+
+Operational updates (2026-06-05)
+- GitHub push access setup:
+  - Added remote: git@github.com:khartig/crypto-quant-agents.git
+  - Generated and configured a local SSH key pair for GitHub access (key material is not stored in this repository)
+  - Added local SSH config entry for host github.com to use the dedicated GitHub key
+  - Push verified:
+    - git push -u origin main succeeded
+
+- Ollama integration status:
+  - Pulled model: llama3.1:8b
+  - Added configurable request timeout:
+    - env key: OLLAMA_TIMEOUT_SECONDS (default 180)
+    - wired in src/quant_agents/config.py and src/quant_agents/agent_plane.py
+  - Validation:
+    - agent-plane strategy and ops steps now complete with source=ollama (no fallback output)
+    - first-attempt timeouts can still occur on slower inference; retries recover under current settings
+
+- Visual evaluation command added:
+  - New CLI command:
+    - quant-phase1 visualize-run
+  - Optional flags:
+    - --run-dir <agent-plane run path>
+    - --output-dir <custom output path>
+  - Output files written under <run-dir>/visuals by default:
+    - price_sma_triggers.png
+    - equity_vs_buyhold_drawdown.png
+    - returns_quality_diagnostics.png
+  - Implementation file:
+    - src/quant_agents/visualization.py
+
+Quick start checklist (daily/operator use)
+1) Verify external storage is mounted to /mnt/quant-data
+   - findmnt /mnt/quant-data
+2) Activate virtual environment
+   - source .venv/bin/activate
+3) Verify Ollama model availability
+   - ollama list
+   - confirm llama3.1:8b is present
+4) Ingest fresh market data (example)
+   - quant-phase1 ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 300
+5) Run agent plane with stable timeout (example)
+   - OLLAMA_TIMEOUT_SECONDS=180 quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --strategy-model llama3.1:8b --ops-model llama3.1:8b
+6) Generate visual diagnostics
+   - quant-phase1 visualize-run
+7) Review outputs in the latest run directory
+   - strategy_proposal_signal.json
+   - backtest_evaluation.json
+   - risk_decision.json
+   - paper_trade_intent.json
+   - visuals/*.png

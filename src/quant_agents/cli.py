@@ -17,6 +17,7 @@ from quant_agents.logging_utils import configure_logging
 from quant_agents.metrics import tracked_operation
 from quant_agents.reporting import generate_daily_report
 from quant_agents.storage import ensure_phase1_tree, latest_backtest_run_dir
+from quant_agents.visualization import generate_run_visuals
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,20 @@ def _base_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Notional USD for emitted paper intents.",
+    )
+    visualize = subparsers.add_parser(
+        "visualize-run",
+        help="Generate readable backtest/strategy evaluation charts for an agent-plane run.",
+    )
+    visualize.add_argument(
+        "--run-dir",
+        default=None,
+        help="Agent-plane run directory path. Defaults to the latest openclaw-orchestrator run.",
+    )
+    visualize.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for generated charts. Defaults to <run-dir>/visuals.",
     )
 
     doctor = subparsers.add_parser(
@@ -367,6 +382,33 @@ def main(argv: list[str] | None = None) -> None:
             "Agent plane complete -> "
             f"{result.run_dir} "
             f"(risk_approved={result.risk_approved} intent={result.intent_status})"
+        )
+        return
+
+    if args.command == "visualize-run":
+        run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else None
+        output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="visualize-run",
+            dimensions={"run_dir": str(run_dir) if run_dir else "latest"},
+        ) as metric:
+            result = generate_run_visuals(
+                quant_data_root=settings.quant_data_root,
+                run_dir=run_dir,
+                output_dir=output_dir,
+            )
+            metric["run_dir"] = str(result.run_dir)
+            metric["output_dir"] = str(result.output_dir)
+            metric["price_signals_path"] = str(result.price_signals_path)
+            metric["equity_drawdown_path"] = str(result.equity_drawdown_path)
+            metric["returns_diagnostics_path"] = str(result.returns_diagnostics_path)
+            metric["buy_trigger_count"] = result.buy_trigger_count
+            metric["sell_trigger_count"] = result.sell_trigger_count
+        print(
+            "Visuals generated -> "
+            f"{result.output_dir} "
+            f"(buy_triggers={result.buy_trigger_count} sell_triggers={result.sell_trigger_count})"
         )
         return
 

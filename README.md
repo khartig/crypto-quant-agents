@@ -70,6 +70,16 @@ quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
 ```
 
+### Generate evaluation visuals for the latest agent-plane run
+```bash path=null start=null
+quant-phase1 visualize-run
+```
+
+### Generate evaluation visuals for a specific run and output directory
+```bash path=null start=null
+quant-phase1 visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z --output-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z/visuals
+```
+
 ## Agent-plane troubleshooting notes
 - If the configured Ollama model is unavailable, strategy/report steps will retry then fall back to deterministic output. Check `strategy_proposal_signal.json` and `ops_report_contract.json` warnings in the run directory.
 - If `data_quality_signal.json` reports `insufficient_bars`, ingest more data (`quant-phase1 ingest --limit ...`) or lower the gate for controlled testing (`--minimum-bars` or `AGENT_MINIMUM_BARS`).
@@ -107,6 +117,10 @@ quant-phase1 run-daily --require-secrets
     - `ops_report.md`
     - `ops_report_contract.json`
     - `run_manifest.json`
+    - visualization artifacts (via `quant-phase1 visualize-run`):
+      - `visuals/price_sma_triggers.png`
+      - `visuals/equity_vs_buyhold_drawdown.png`
+      - `visuals/returns_quality_diagnostics.png`
   - step-boundary retry traces:
     - `steps/data-quality-agent/attempt_*.json`
     - `steps/strategy-agent/attempt_*.json`
