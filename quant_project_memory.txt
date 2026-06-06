@@ -1,5 +1,5 @@
 QUANT PROJECT MEMORY
-Last updated: 2026-06-05
+Last updated: 2026-06-06
 
 External storage identity
 - Disk: /dev/sdb (Seagate ST4000LM024-2U817V, ~3.6T)
@@ -125,3 +125,64 @@ Quick start checklist (daily/operator use)
    - risk_decision.json
    - paper_trade_intent.json
    - visuals/*.png
+
+Latest project updates (2026-06-05 to 2026-06-06)
+- Repository and push status:
+  - Commit 7489b2a pushed to origin/main:
+    - added src/quant_agents/openclaw_native.py
+    - added src/quant_agents/paper_account.py
+  - Commit 3572872 ("added job supervision tracking") pushed to origin/main:
+    - updated .env.example
+    - updated README.md
+    - updated pyproject.toml
+    - updated src/quant_agents/cli.py
+    - updated src/quant_agents/config.py
+  - Push verified:
+    - origin/main advanced 7489b2a..3572872
+
+- OpenClaw orchestration hardening:
+  - quant-openclaw-entrypoint now supports async job modes:
+    - --job-mode submit
+    - --job-mode status --job-id <id>
+    - --job-mode wait --job-id <id>
+    - --job-mode run-sync
+    - --job-mode run (internal worker)
+  - Deterministic async supervisor persists job files under:
+    - /mnt/quant-data/logs/agents/openclaw-supervisor/<job_id>/request.json
+    - /mnt/quant-data/logs/agents/openclaw-supervisor/<job_id>/status.json
+    - /mnt/quant-data/logs/agents/openclaw-supervisor/<job_id>/result.json
+    - /mnt/quant-data/logs/agents/openclaw-supervisor/<job_id>/verification_gate.json
+    - /mnt/quant-data/logs/agents/openclaw-supervisor/<job_id>/worker.log
+  - Strict fail-closed verification gate added (openclaw_execution_gate.v1):
+    - requires core artifacts to exist and parse
+    - requires risk decision approved + deterministic_gate=pass
+    - requires intent emitted/actionable and paper execution executed with positive notional
+    - marks job status blocked when checks fail
+
+- Paper-account connectivity support added:
+  - New module:
+    - src/quant_agents/paper_account.py
+  - New CLI command:
+    - quant-phase1 paper-account-check
+  - Supported providers:
+    - tradingview (reachability + explicit unsupported direct paper-account API note)
+    - ccxt (authenticated exchange/testnet probe path)
+  - New env keys:
+    - PAPER_ACCOUNT_PROVIDER
+    - PAPER_ACCOUNT_EXCHANGE
+    - PAPER_ACCOUNT_SANDBOX
+    - PAPER_ACCOUNT_TIMEOUT_SECONDS
+    - PAPER_ACCOUNT_API_KEY
+    - PAPER_ACCOUNT_API_SECRET
+    - PAPER_ACCOUNT_API_PASSPHRASE
+    - TRADINGVIEW_BASE_URL
+
+- Entrypoints and docs:
+  - New script entrypoint in pyproject.toml:
+    - quant-openclaw-entrypoint = "quant_agents.openclaw_native:main"
+  - README rewritten as overall project documentation (not phase/milestone framing):
+    - includes process flow
+    - model usage and responsibilities
+    - OpenClaw usage and async supervision behavior
+    - orchestration and signal-generation explanation
+    - updated command and output layout sections
