@@ -1,0 +1,169 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --panel: #131a30;
+  --panel-2: #19213a;
+  --text: #e8ecff;
+  --muted: #a6b0cf;
+  --accent: #5b8cff;
+  --buy: #2cc878;
+  --sell: #f25f5c;
+  --hold: #f2c14e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    Segoe UI,
+    Roboto,
+    Helvetica,
+    Arial,
+    "Apple Color Emoji",
+    "Segoe UI Emoji";
+}
+
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 16px 0 20px;
+}
+
+.toolbar label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+select,
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid #2a3455;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+
+button {
+  cursor: pointer;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+  margin: 16px 0 24px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid #273155;
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.card .label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.card .value {
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.section {
+  background: var(--panel);
+  border: 1px solid #273155;
+  border-radius: 12px;
+  padding: 14px;
+  margin: 0 0 16px;
+}
+
+.section h2 {
+  margin-bottom: 10px;
+  font-size: 18px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  border-bottom: 1px solid #273155;
+  padding: 10px 8px;
+  vertical-align: top;
+  font-size: 13px;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.pill {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pill.buy {
+  background: color-mix(in srgb, var(--buy) 18%, transparent);
+  color: var(--buy);
+}
+
+.pill.sell {
+  background: color-mix(in srgb, var(--sell) 18%, transparent);
+  color: var(--sell);
+}
+
+.pill.hold {
+  background: color-mix(in srgb, var(--hold) 18%, transparent);
+  color: var(--hold);
+}
+
+.reason-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.reason-list li {
+  margin-bottom: 4px;
+}

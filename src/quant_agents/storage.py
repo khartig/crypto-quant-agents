@@ -7,11 +7,15 @@ from pathlib import Path
 PHASE1_TREE = (
     "raw",
     "curated/features",
+    "curated/training",
     "backtests",
     "paper-trading",
     "paper-trading/state",
     "models/ollama-cache",
+    "models/trigger-models",
     "logs/agents",
+    "logs/agents/model-predictor",
+    "logs/agents/trigger-monitor",
     "archive/monthly",
 )
 

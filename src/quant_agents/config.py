@@ -46,6 +46,14 @@ class Settings:
     paper_account_api_secret: str | None
     paper_account_api_passphrase: str | None
     tradingview_base_url: str
+    trigger_model_horizon_bars: int
+    trigger_model_buy_threshold: float
+    trigger_model_sell_threshold: float
+    trigger_model_min_train_samples: int
+    trigger_monitor_poll_seconds: float
+    trigger_monitor_signal_confidence: float
+    trigger_monitor_webhook_url: str | None
+    trigger_monitor_notify_on_hold: bool
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -114,6 +122,40 @@ def load_settings() -> Settings:
         paper_account_api_secret=os.getenv("PAPER_ACCOUNT_API_SECRET") or None,
         paper_account_api_passphrase=os.getenv("PAPER_ACCOUNT_API_PASSPHRASE") or None,
         tradingview_base_url=os.getenv("TRADINGVIEW_BASE_URL", "https://www.tradingview.com"),
+        trigger_model_horizon_bars=max(
+            1,
+            _as_int(os.getenv("TRIGGER_MODEL_HORIZON_BARS"), default=6),
+        ),
+        trigger_model_buy_threshold=_as_float(
+            os.getenv("TRIGGER_MODEL_BUY_THRESHOLD"),
+            default=0.004,
+        ),
+        trigger_model_sell_threshold=abs(
+            _as_float(os.getenv("TRIGGER_MODEL_SELL_THRESHOLD"), default=0.004)
+        ),
+        trigger_model_min_train_samples=max(
+            20,
+            _as_int(os.getenv("TRIGGER_MODEL_MIN_TRAIN_SAMPLES"), default=120),
+        ),
+        trigger_monitor_poll_seconds=max(
+            5.0,
+            _as_float(os.getenv("TRIGGER_MONITOR_POLL_SECONDS"), default=300.0),
+        ),
+        trigger_monitor_signal_confidence=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("TRIGGER_MONITOR_SIGNAL_CONFIDENCE"),
+                    default=0.60,
+                ),
+            ),
+        ),
+        trigger_monitor_webhook_url=os.getenv("TRIGGER_MONITOR_WEBHOOK_URL") or None,
+        trigger_monitor_notify_on_hold=_as_bool(
+            os.getenv("TRIGGER_MONITOR_NOTIFY_ON_HOLD"),
+            default=False,
+        ),
     )
 
 

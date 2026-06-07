@@ -18,6 +18,11 @@ from quant_agents.metrics import tracked_operation
 from quant_agents.paper_account import run_paper_account_probe
 from quant_agents.reporting import generate_daily_report
 from quant_agents.storage import ensure_phase1_tree, latest_backtest_run_dir
+from quant_agents.trigger_model import (
+    monitor_trigger_signals,
+    predict_trigger_signal,
+    train_trigger_model,
+)
 from quant_agents.visualization import generate_run_visuals
 
 logger = logging.getLogger(__name__)
@@ -221,6 +226,107 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output directory for generated charts. Defaults to <run-dir>/visuals.",
     )
+    trigger_train = subparsers.add_parser(
+        "train-trigger-model",
+        help="Train deterministic buy/sell/hold trigger model from OHLCV data.",
+    )
+    trigger_train.add_argument("--exchange", default=None)
+    trigger_train.add_argument("--symbol", default=None)
+    trigger_train.add_argument("--timeframe", default=None)
+    trigger_train.add_argument(
+        "--input-file",
+        default=None,
+        help="Optional explicit parquet input file for training.",
+    )
+    trigger_train.add_argument(
+        "--horizon-bars",
+        type=int,
+        default=None,
+        help="Forward bars used for labeling (default from settings).",
+    )
+    trigger_train.add_argument(
+        "--buy-threshold",
+        type=float,
+        default=None,
+        help="Forward return threshold for buy labels (default from settings).",
+    )
+    trigger_train.add_argument(
+        "--sell-threshold",
+        type=float,
+        default=None,
+        help="Absolute forward return threshold for sell labels (default from settings).",
+    )
+    trigger_train.add_argument(
+        "--min-train-samples",
+        type=int,
+        default=None,
+        help="Minimum training rows required after feature/label generation.",
+    )
+
+    trigger_predict = subparsers.add_parser(
+        "predict-trigger",
+        help="Generate one explainable buy/sell/hold prediction from latest market data.",
+    )
+    trigger_predict.add_argument("--exchange", default=None)
+    trigger_predict.add_argument("--symbol", default=None)
+    trigger_predict.add_argument("--timeframe", default=None)
+    trigger_predict.add_argument(
+        "--model-path",
+        default=None,
+        help="Optional explicit model.json path. Defaults to latest model for scope.",
+    )
+    trigger_predict.add_argument(
+        "--input-file",
+        default=None,
+        help="Optional explicit parquet input file for prediction.",
+    )
+
+    trigger_monitor = subparsers.add_parser(
+        "monitor-triggers",
+        help="Continuously ingest market data, run trigger predictions, and emit alerts.",
+    )
+    trigger_monitor.add_argument("--exchange", default=None)
+    trigger_monitor.add_argument("--symbol", default=None)
+    trigger_monitor.add_argument("--timeframe", default=None)
+    trigger_monitor.add_argument(
+        "--model-path",
+        default=None,
+        help="Optional explicit model.json path. Defaults to latest model for scope.",
+    )
+    trigger_monitor.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="OHLCV row limit fetched each monitoring cycle.",
+    )
+    trigger_monitor.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=None,
+        help="Seconds between monitor cycles (default from settings).",
+    )
+    trigger_monitor.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=None,
+        help="Minimum confidence required for alerts (default from settings).",
+    )
+    trigger_monitor.add_argument(
+        "--webhook-url",
+        default=None,
+        help="Optional webhook URL for outbound alert delivery.",
+    )
+    trigger_monitor.add_argument(
+        "--notify-on-hold",
+        action="store_true",
+        help="Also notify for hold predictions (disabled by default).",
+    )
+    trigger_monitor.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="Optional finite cycle cap for bounded monitor runs.",
+    )
 
     doctor = subparsers.add_parser(
         "doctor",
@@ -302,6 +408,96 @@ def main(argv: list[str] | None = None) -> None:
             if result.archive_path is not None:
                 metric["archive_path"] = str(result.archive_path)
         print(f"Backtest complete -> {result.run_dir}")
+        return
+    if args.command == "train-trigger-model":
+        source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
+        horizon_bars = (
+            args.horizon_bars
+            if args.horizon_bars is not None
+            else settings.trigger_model_horizon_bars
+        )
+        buy_threshold = (
+            args.buy_threshold
+            if args.buy_threshold is not None
+            else settings.trigger_model_buy_threshold
+        )
+        sell_threshold = (
+            args.sell_threshold
+            if args.sell_threshold is not None
+            else settings.trigger_model_sell_threshold
+        )
+        min_train_samples = (
+            args.min_train_samples
+            if args.min_train_samples is not None
+            else settings.trigger_model_min_train_samples
+        )
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="train-trigger-model",
+            dimensions={
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+            },
+        ) as metric:
+            result = train_trigger_model(
+                settings=settings,
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe,
+                input_file=source_file,
+                horizon_bars=max(1, int(horizon_bars)),
+                buy_threshold=float(buy_threshold),
+                sell_threshold=float(sell_threshold),
+                min_train_samples=max(20, int(min_train_samples)),
+            )
+            metric["model_path"] = str(result.model_path)
+            metric["run_dir"] = str(result.run_dir)
+            metric["sample_count"] = result.sample_count
+            metric["train_count"] = result.train_count
+            metric["test_count"] = result.test_count
+            metric["accuracy"] = result.accuracy
+        print(
+            "Trigger model training complete -> "
+            f"{result.model_path} "
+            f"(samples={result.sample_count} accuracy={result.accuracy:.3f})"
+        )
+        return
+
+    if args.command == "predict-trigger":
+        source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
+        model_path = Path(args.model_path).expanduser().resolve() if args.model_path else None
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="predict-trigger",
+            dimensions={
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+            },
+        ) as metric:
+            result = predict_trigger_signal(
+                settings=settings,
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe,
+                model_path=model_path,
+                input_file=source_file,
+                write_artifact=True,
+            )
+            metric["model_path"] = str(result.model_path)
+            metric["source_data_path"] = str(result.source_data_path)
+            metric["recommendation"] = result.recommendation
+            metric["confidence"] = result.confidence
+            metric["prediction_path"] = str(result.prediction_path) if result.prediction_path else None
+        print(
+            "Trigger prediction -> "
+            f"{result.recommendation} "
+            f"(confidence={result.confidence:.3f}) "
+            f"path={result.prediction_path}"
+        )
+        for reason in result.top_reasons:
+            print(f"- {reason}")
         return
 
     if args.command == "report":
@@ -520,6 +716,56 @@ def main(argv: list[str] | None = None) -> None:
             "Visuals generated -> "
             f"{result.output_dir} "
             f"(buy_triggers={result.buy_trigger_count} sell_triggers={result.sell_trigger_count})"
+        )
+        return
+
+    if args.command == "monitor-triggers":
+        model_path = Path(args.model_path).expanduser().resolve() if args.model_path else None
+        poll_seconds = (
+            args.poll_seconds
+            if args.poll_seconds is not None
+            else settings.trigger_monitor_poll_seconds
+        )
+        confidence_threshold = (
+            args.confidence_threshold
+            if args.confidence_threshold is not None
+            else settings.trigger_monitor_signal_confidence
+        )
+        webhook_url = args.webhook_url or settings.trigger_monitor_webhook_url
+        notify_on_hold = bool(args.notify_on_hold or settings.trigger_monitor_notify_on_hold)
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="monitor-triggers",
+            dimensions={
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+            },
+        ) as metric:
+            result = monitor_trigger_signals(
+                settings=settings,
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe,
+                model_path=model_path,
+                limit=max(50, int(args.limit)),
+                poll_seconds=max(5.0, float(poll_seconds)),
+                confidence_threshold=float(confidence_threshold),
+                webhook_url=webhook_url,
+                notify_on_hold=notify_on_hold,
+                max_cycles=args.max_cycles,
+            )
+            metric["cycles_completed"] = result.cycles_completed
+            metric["alerts_emitted"] = result.alerts_emitted
+            metric["latest_alert_path"] = (
+                str(result.latest_alert_path) if result.latest_alert_path else None
+            )
+            metric["state_path"] = str(result.state_path)
+        print(
+            "Trigger monitor complete -> "
+            f"cycles={result.cycles_completed} "
+            f"alerts={result.alerts_emitted} "
+            f"state={result.state_path}"
         )
         return
 

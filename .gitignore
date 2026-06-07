@@ -8,4 +8,8 @@ __pycache__/
 .env
 doc/Improving crypto trading strategy confidence calibration - Claude.html
 doc/Improving crypto trading strategy confidence calibration - Claude_files/
+apps/quant-dashboard/node_modules/
+apps/quant-dashboard/.next/
+apps/quant-dashboard/out/
+apps/quant-dashboard/.env.local
 

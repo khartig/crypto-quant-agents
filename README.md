@@ -7,9 +7,13 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
 - Ingests OHLCV market data from exchanges via `ccxt`.
 - Runs deterministic SMA-crossover backtests.
 - Produces model-assisted strategy proposals (`buy` / `sell` / `hold`) with confidence and rationale.
+- Trains a deterministic trigger model (`buy` / `sell` / `hold`) from historical OHLCV features.
+- Produces explainable trigger predictions with class probabilities and top feature reasons.
+- Monitors the market continuously and emits trigger notifications (local log + optional webhook).
 - Applies deterministic risk thresholds before any execution.
 - Emits and executes paper-trade intents in a local ledger.
 - Generates ops reports and structured run artifacts.
+- Ships a Next.js dashboard project for interactive prediction/alert review.
 - Supports OpenClaw-native orchestration with async job supervision and strict verification gating.
 
 ## End-to-end process flow
@@ -107,6 +111,16 @@ Key environment variables (see `.env.example`):
   - `OLLAMA_OPS_MODEL`
   - `AGENT_STEP_RETRIES`
   - `AGENT_MINIMUM_BARS`
+- Trigger model:
+  - `TRIGGER_MODEL_HORIZON_BARS`
+  - `TRIGGER_MODEL_BUY_THRESHOLD`
+  - `TRIGGER_MODEL_SELL_THRESHOLD`
+  - `TRIGGER_MODEL_MIN_TRAIN_SAMPLES`
+- Trigger monitor:
+  - `TRIGGER_MONITOR_POLL_SECONDS`
+  - `TRIGGER_MONITOR_SIGNAL_CONFIDENCE`
+  - `TRIGGER_MONITOR_WEBHOOK_URL`
+  - `TRIGGER_MONITOR_NOTIFY_ON_HOLD`
 - Risk thresholds:
   - `RISK_MIN_TOTAL_RETURN`
   - `RISK_MIN_SHARPE`
@@ -165,6 +179,14 @@ quant-phase1 visualize-run
 quant-phase1 visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z --output-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z/visuals
 ```
 
+### Trigger model and continuous monitoring
+```bash path=null start=null
+quant-phase1 train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-phase1 predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-phase1 monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 300 --confidence-threshold 0.65
+quant-phase1 monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
+```
+
 ### OpenClaw-native orchestration commands
 ```bash path=null start=null
 quant-openclaw-entrypoint --job-mode submit --request-json '{"exchange":"kraken","symbol":"BTC/USDT","timeframe":"1h","strategy_model":"llama3.1:8b","ops_model":"llama3.1:8b"}' --print-json
@@ -172,6 +194,15 @@ quant-openclaw-entrypoint --job-mode status --job-id {{JOB_ID}} --print-json
 quant-openclaw-entrypoint --job-mode wait --job-id {{JOB_ID}} --print-json
 quant-openclaw-entrypoint --job-mode run-sync --request-json '{"exchange":"kraken","symbol":"BTC/USDT","timeframe":"1h","strategy_model":"llama3.1:8b","ops_model":"llama3.1:8b"}' --print-json
 ```
+
+### Next.js dashboard project
+The repository now includes a dashboard project under `apps/quant-dashboard` that reads trigger prediction and alert artifacts from `QUANT_DATA_ROOT`.
+```bash path=null start=null
+cd apps/quant-dashboard
+npm install
+QUANT_DATA_ROOT=/mnt/quant-data npm run dev
+```
+Then open `http://localhost:3000` and use the dashboard filters to inspect recent predictions, confidence, and reason details.
 
 ## Output layout
 All paths below are relative to `QUANT_DATA_ROOT`.
@@ -198,6 +229,14 @@ All paths below are relative to `QUANT_DATA_ROOT`.
 - Metrics:
   - `logs/metrics/<yyyy-mm-dd>/pipeline_metrics.jsonl`
   - `logs/metrics/summary.json`
+- Trigger models:
+  - `models/trigger-models/exchange=<exchange>/symbol=<pair>/interval=<tf>/<run_id>/model.json`
+  - `models/trigger-models/exchange=<exchange>/symbol=<pair>/interval=<tf>/<run_id>/train_dataset.parquet`
+  - `models/trigger-models/exchange=<exchange>/symbol=<pair>/interval=<tf>/<run_id>/test_dataset.parquet`
+- Trigger predictions and alerts:
+  - `logs/agents/model-predictor/<yyyy-mm-dd>/prediction_<timestamp>.json`
+  - `logs/agents/trigger-monitor/<yyyy-mm-dd>/alerts.jsonl`
+  - `logs/agents/trigger-monitor/state.json`
 - Archives:
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz`
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz.sha256`
