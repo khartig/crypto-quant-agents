@@ -79,6 +79,65 @@ button {
   cursor: pointer;
 }
 
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 12px;
+  align-items: center;
+}
+
+.button-row.compact {
+  margin-top: -2px;
+  margin-bottom: 16px;
+}
+
+.chart-controls {
+  margin-top: -8px;
+}
+
+.range-control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 240px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.range-control input[type="range"] {
+  width: 100%;
+}
+
+.toggle-btn {
+  border-radius: 10px;
+  border: 1px solid #2f3b63;
+  background: #121935;
+  color: #b9c4e8;
+  transition: all 0.15s ease;
+}
+
+.toggle-btn:hover {
+  border-color: #4f649b;
+  color: #dce5ff;
+}
+
+.toggle-btn.active {
+  background: color-mix(in srgb, var(--accent) 22%, #121935);
+  border-color: color-mix(in srgb, var(--accent) 70%, #2f3b63);
+  color: #e8eeff;
+}
+
+.toggle-btn.large {
+  font-weight: 600;
+  padding: 10px 14px;
+}
+
+.stats-inline {
+  font-size: 13px;
+  margin-left: 4px;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -115,6 +174,29 @@ button {
 .section h2 {
   margin-bottom: 10px;
   font-size: 18px;
+}
+
+.chart-stack {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chart-panel {
+  width: 100%;
+  border: 1px solid #273155;
+  border-radius: 10px;
+  background: #111830;
+  padding: 8px;
+}
+
+.chart-panel.price {
+  height: 330px;
+}
+
+.chart-panel.oscillator {
+  height: 220px;
 }
 
 table {
@@ -166,4 +248,8 @@ th {
 
 .reason-list li {
   margin-bottom: 4px;
+}
+
+.detail-panel p {
+  margin: 8px 0;
 }

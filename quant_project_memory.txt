@@ -1,5 +1,5 @@
 QUANT PROJECT MEMORY
-Last updated: 2026-06-06
+Last updated: 2026-06-07
 
 External storage identity
 - Disk: /dev/sdb (Seagate ST4000LM024-2U817V, ~3.6T)
@@ -186,3 +186,42 @@ Latest project updates (2026-06-05 to 2026-06-06)
     - OpenClaw usage and async supervision behavior
     - orchestration and signal-generation explanation
     - updated command and output layout sections
+
+Latest project updates (2026-06-07)
+- Trigger dashboard visual polish (apps/quant-dashboard):
+  - Added chart panel height controls (price and oscillator sliders).
+  - Added explicit axis labels:
+    - Price panel y-axis: Price (USD)
+    - Oscillator panel y-axes: MACD / Vol and RSI
+    - Shared x-axis label: Time (UTC)
+  - Added optional MACD histogram bars toggle in oscillator panel.
+  - Marker detail panel now includes `macdHist` values in prediction and alert details.
+  - Trigger artifact type parsing updated for `macdHist` in:
+    - apps/quant-dashboard/lib/types.ts
+    - apps/quant-dashboard/lib/quant-data.ts
+
+- Trigger artifact payload enrichment:
+  - `src/quant_agents/trigger_model.py` now writes `macd_hist` in:
+    - prediction artifacts (`trigger_prediction.v1`)
+    - monitor alert artifacts (`trigger_alert.v1`)
+
+- Clustered data remediation + fresh dataset regeneration:
+  - Stopped user service and reset BTC trigger-specific raw/model/log artifacts under `/mnt/quant-data`.
+  - Pulled fresh 1h dataset:
+    - quant-phase1 ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1500
+    - observed 721 rows written in latest ingest artifact.
+  - Retrained 1h trigger model:
+    - /mnt/quant-data/models/trigger-models/exchange=kraken/symbol=BTC-USDT/interval=1h/20260608T001754Z/model.json
+  - Added reusable utility script:
+    - scripts/backfill_trigger_history.py
+    - backfilled 480 historical predictions and 45 alerts to spread chart markers across time.
+  - Verified timestamp spread after refresh:
+    - predictions: 480 unique timestamps (2026-05-19T01:00:00Z to 2026-06-08T00:00:00Z)
+    - alerts: 45 unique timestamps (2026-05-19T14:00:00Z to 2026-06-07T22:00:00Z)
+
+- Monitor service update:
+  - Updated `~/.config/systemd/user/quant-trigger-monitor.service` to 1h cadence:
+    - timeframe=1h
+    - poll-seconds=3600
+    - confidence-threshold=0.60
+  - Service status validated active after daemon reload + restart.

@@ -1,4 +1,11 @@
 export type Recommendation = "buy" | "sell" | "hold";
+export interface ReasonDetail {
+  feature: string;
+  impact: number;
+  supports: string;
+  value: number;
+  vsAlternative: string;
+}
 
 export interface TriggerPredictionRow {
   id: string;
@@ -14,7 +21,15 @@ export interface TriggerPredictionRow {
     hold: number;
     sell: number;
   };
+  closePrice: number | null;
+  smaFast: number | null;
+  smaSlow: number | null;
+  macd: number | null;
+  macdHist: number | null;
+  rsi14: number | null;
+  volatility24: number | null;
   topReasons: string[];
+  reasonDetails: ReasonDetail[];
   modelPath: string | null;
   sourceDataPath: string | null;
   predictionPath: string;
@@ -23,6 +38,7 @@ export interface TriggerPredictionRow {
 export interface TriggerAlertRow {
   id: string;
   createdAtUtc: string;
+  predictionTimestampUtc: string;
   exchange: string;
   symbol: string;
   timeframe: string;
@@ -33,7 +49,15 @@ export interface TriggerAlertRow {
     hold: number;
     sell: number;
   };
+  closePrice: number | null;
+  smaFast: number | null;
+  smaSlow: number | null;
+  macd: number | null;
+  macdHist: number | null;
+  rsi14: number | null;
+  volatility24: number | null;
   topReasons: string[];
+  reasonDetails: ReasonDetail[];
   predictionPath: string | null;
   alertPath: string;
 }

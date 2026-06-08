@@ -3,6 +3,7 @@ import path from "path";
 import type {
   AgentPlaneSummary,
   DashboardOverview,
+  ReasonDetail,
   TriggerAlertRow,
   TriggerPredictionRow
 } from "@/lib/types";
@@ -11,6 +12,31 @@ const DEFAULT_QUANT_ROOT = "/mnt/quant-data";
 
 function quantDataRoot(): string {
   return process.env.QUANT_DATA_ROOT || DEFAULT_QUANT_ROOT;
+}
+
+function normalizeReasonDetails(value: unknown): ReasonDetail[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const rows: ReasonDetail[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const payload = item as Record<string, unknown>;
+    const feature = String(payload.feature || "").trim();
+    if (!feature) {
+      continue;
+    }
+    rows.push({
+      feature,
+      impact: asNumber(payload.impact, 0),
+      supports: String(payload.supports || ""),
+      value: asNumber(payload.value, 0),
+      vsAlternative: String(payload.vs_alternative || "")
+    });
+  }
+  return rows.slice(0, 8);
 }
 
 async function pathExists(target: string): Promise<boolean> {
@@ -76,6 +102,11 @@ function asNumber(value: unknown, fallback = 0): number {
   return fallback;
 }
 
+
+function asNullableNumber(value: unknown): number | null {
+  const parsed = asNumber(value, Number.NaN);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 function normalizeProbabilities(value: unknown): { buy: number; hold: number; sell: number } {
   const payload = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
   return {
@@ -109,6 +140,25 @@ async function loadPredictions(root: string, limit = 200): Promise<TriggerPredic
       .map((reason) => String(reason))
       .filter((reason) => reason.length > 0)
       .slice(0, 5);
+    const featureValues =
+      typeof payload.feature_values === "object" && payload.feature_values !== null
+        ? (payload.feature_values as Record<string, unknown>)
+        : {};
+    const closePrice = asNullableNumber(payload.close_price ?? featureValues.close);
+    const smaFastSpread = asNullableNumber(featureValues.sma_fast_spread);
+    const smaSlowSpread = asNullableNumber(featureValues.sma_slow_spread);
+    const inferredSmaFast =
+      closePrice !== null &&
+      smaFastSpread !== null &&
+      Math.abs(1 + smaFastSpread) > 1e-9
+        ? closePrice / (1 + smaFastSpread)
+        : null;
+    const inferredSmaSlow =
+      closePrice !== null &&
+      smaSlowSpread !== null &&
+      Math.abs(1 + smaSlowSpread) > 1e-9
+        ? closePrice / (1 + smaSlowSpread)
+        : null;
 
     rows.push({
       id: filePath,
@@ -120,7 +170,15 @@ async function loadPredictions(root: string, limit = 200): Promise<TriggerPredic
       recommendation,
       confidence: asNumber(payload.confidence, 0),
       probabilities: normalizeProbabilities(payload.probabilities),
+      closePrice,
+      smaFast: asNullableNumber(payload.sma_fast) ?? inferredSmaFast,
+      smaSlow: asNullableNumber(payload.sma_slow) ?? inferredSmaSlow,
+      macd: asNullableNumber(payload.macd ?? featureValues.macd),
+      macdHist: asNullableNumber(payload.macd_hist ?? featureValues.macd_hist),
+      rsi14: asNullableNumber(payload.rsi_14 ?? featureValues.rsi_14),
+      volatility24: asNullableNumber(payload.volatility_24 ?? featureValues.volatility_24),
       topReasons,
+      reasonDetails: normalizeReasonDetails(payload.reason_details),
       modelPath: payload.model_path ? String(payload.model_path) : null,
       sourceDataPath: payload.source_data_path ? String(payload.source_data_path) : null,
       predictionPath: filePath
@@ -178,13 +236,22 @@ async function loadAlerts(root: string, limit = 200): Promise<TriggerAlertRow[]>
       rows.push({
         id: `${alertPath}:${rows.length}`,
         createdAtUtc: String(payload.created_at_utc || ""),
+        predictionTimestampUtc: String(payload.prediction_timestamp_utc || ""),
         exchange: String(payload.exchange || ""),
         symbol: String(payload.symbol || ""),
         timeframe: String(payload.timeframe || ""),
         recommendation,
         confidence: asNumber(payload.confidence, 0),
         probabilities: normalizeProbabilities(payload.probabilities),
+        closePrice: asNullableNumber(payload.close_price),
+        smaFast: asNullableNumber(payload.sma_fast),
+        smaSlow: asNullableNumber(payload.sma_slow),
+        macd: asNullableNumber(payload.macd),
+        macdHist: asNullableNumber(payload.macd_hist),
+        rsi14: asNullableNumber(payload.rsi_14),
+        volatility24: asNullableNumber(payload.volatility_24),
         topReasons,
+        reasonDetails: normalizeReasonDetails(payload.reason_details),
         predictionPath: payload.prediction_path ? String(payload.prediction_path) : null,
         alertPath
       });

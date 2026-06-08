@@ -60,8 +60,16 @@ class TriggerPredictionResult:
     recommendation: str
     confidence: float
     probabilities: dict[str, float]
+    close_price: float
+    sma_fast: float
+    sma_slow: float
+    macd: float
+    macd_hist: float
+    rsi_14: float
+    volatility_24: float
     feature_values: dict[str, float]
     top_reasons: list[str]
+    reason_details: list[dict[str, Any]]
     prediction_path: Path | None
 
 
@@ -528,6 +536,13 @@ def predict_trigger_signal(
     confidence = float(probabilities[recommendation])
     top_reasons, reason_details = _feature_reasons(model_payload, vector, recommendation, probabilities)
     feature_values = {feature: float(latest_row[feature]) for feature in FEATURE_COLUMNS}
+    close_price = float(latest_row["close"])
+    sma_fast = close_price / (1.0 + float(latest_row["sma_fast_spread"]))
+    sma_slow = close_price / (1.0 + float(latest_row["sma_slow_spread"]))
+    macd = float(latest_row["macd"])
+    macd_hist = float(latest_row["macd_hist"])
+    rsi_14 = float(latest_row["rsi_14"])
+    volatility_24 = float(latest_row["volatility_24"])
     timestamp_utc = pd.Timestamp(latest_row["timestamp"]).tz_convert("UTC").isoformat()
 
     prediction_path: Path | None = None
@@ -547,6 +562,13 @@ def predict_trigger_signal(
                 "recommendation": recommendation,
                 "confidence": confidence,
                 "probabilities": probabilities,
+                "close_price": close_price,
+                "sma_fast": sma_fast,
+                "sma_slow": sma_slow,
+                "macd": macd,
+                "macd_hist": macd_hist,
+                "rsi_14": rsi_14,
+                "volatility_24": volatility_24,
                 "feature_values": feature_values,
                 "top_reasons": top_reasons,
                 "reason_details": reason_details,
@@ -566,8 +588,16 @@ def predict_trigger_signal(
         recommendation=recommendation,
         confidence=confidence,
         probabilities=probabilities,
+        close_price=close_price,
+        sma_fast=sma_fast,
+        sma_slow=sma_slow,
+        macd=macd,
+        macd_hist=macd_hist,
+        rsi_14=rsi_14,
+        volatility_24=volatility_24,
         feature_values=feature_values,
         top_reasons=top_reasons,
+        reason_details=reason_details,
         prediction_path=prediction_path,
     )
 
@@ -697,7 +727,15 @@ def monitor_trigger_signals(
                 "confidence": prediction.confidence,
                 "probabilities": prediction.probabilities,
                 "prediction_timestamp_utc": prediction.timestamp_utc,
+                "close_price": prediction.close_price,
+                "sma_fast": prediction.sma_fast,
+                "sma_slow": prediction.sma_slow,
+                "macd": prediction.macd,
+                "macd_hist": prediction.macd_hist,
+                "rsi_14": prediction.rsi_14,
+                "volatility_24": prediction.volatility_24,
                 "top_reasons": prediction.top_reasons,
+                "reason_details": prediction.reason_details,
                 "prediction_path": str(prediction.prediction_path) if prediction.prediction_path else None,
                 "model_path": str(prediction.model_path),
                 "source_data_path": str(prediction.source_data_path),

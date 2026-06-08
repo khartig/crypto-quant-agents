@@ -183,8 +183,9 @@ quant-phase1 visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orches
 ```bash path=null start=null
 quant-phase1 train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-phase1 predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
-quant-phase1 monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 300 --confidence-threshold 0.65
+quant-phase1 monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
 quant-phase1 monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
+python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
 ```
 
 ### OpenClaw-native orchestration commands
@@ -202,7 +203,24 @@ cd apps/quant-dashboard
 npm install
 QUANT_DATA_ROOT=/mnt/quant-data npm run dev
 ```
-Then open `http://localhost:3000` and use the dashboard filters to inspect recent predictions, confidence, and reason details.
+Then open `http://localhost:3000` and use the dashboard to:
+- view stacked synchronized panels (price/SMA panel + oscillator panel),
+- toggle BTC/SMA/MACD/RSI/volatility/MACD histogram overlays,
+- adjust panel heights with slider controls,
+- toggle prediction/alert markers directly on the chart,
+- click markers to inspect confidence/probabilities/reason details below the chart.
+
+### Refreshing clustered development artifacts
+If chart markers are clustered from old development data, use this refresh sequence:
+```bash path=null start=null
+systemctl --user stop quant-trigger-monitor.service
+quant-phase1 ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1500
+quant-phase1 train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
+python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60 --clear-existing
+systemctl --user daemon-reload
+systemctl --user restart quant-trigger-monitor.service
+systemctl --user --no-pager status quant-trigger-monitor.service
+```
 
 ## Output layout
 All paths below are relative to `QUANT_DATA_ROOT`.
