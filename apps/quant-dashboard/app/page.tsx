@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   CartesianGrid,
@@ -49,6 +49,58 @@ type SelectedDatum =
   | { kind: "prediction"; row: TriggerPredictionRow }
   | { kind: "alert"; row: TriggerAlertRow }
   | null;
+
+interface DragPanState {
+  startClientX: number;
+  initialDomain: [number, number];
+  hasPanned: boolean;
+}
+
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+function clampDomainToBounds(
+  start: number,
+  end: number,
+  bounds: [number, number]
+): [number, number] {
+  const [boundStart, boundEnd] = bounds;
+  const boundSpan = Math.max(0, boundEnd - boundStart);
+  let nextStart = start;
+  let nextEnd = end;
+  if (boundSpan <= 0) {
+    return [boundStart, boundEnd];
+  }
+  if (nextEnd - nextStart >= boundSpan) {
+    return [boundStart, boundEnd];
+  }
+  if (nextStart < boundStart) {
+    const shift = boundStart - nextStart;
+    nextStart += shift;
+    nextEnd += shift;
+  }
+  if (nextEnd > boundEnd) {
+    const shift = nextEnd - boundEnd;
+    nextStart -= shift;
+    nextEnd -= shift;
+  }
+  nextStart = Math.max(boundStart, nextStart);
+  nextEnd = Math.min(boundEnd, nextEnd);
+  if (nextEnd <= nextStart) {
+    return [boundStart, boundEnd];
+  }
+  return [nextStart, nextEnd];
+}
+
+function formatSpanLabel(spanMs: number): string {
+  if (!Number.isFinite(spanMs) || spanMs <= 0) {
+    return "n/a";
+  }
+  const hours = spanMs / ONE_HOUR_MS;
+  if (hours < 48) {
+    return `${hours.toFixed(1)}h`;
+  }
+  return `${(hours / 24).toFixed(1)}d`;
+}
 
 function formatTimeTick(value: number): string {
   if (!Number.isFinite(value)) {
@@ -116,6 +168,10 @@ export default function HomePage() {
   const [pricePanelHeight, setPricePanelHeight] = useState(330);
   const [oscillatorPanelHeight, setOscillatorPanelHeight] = useState(220);
   const [selectedDatum, setSelectedDatum] = useState<SelectedDatum>(null);
+  const [zoomDomain, setZoomDomain] = useState<[number, number] | null>(null);
+  const [isDragPanning, setIsDragPanning] = useState(false);
+  const chartStackRef = useRef<HTMLDivElement | null>(null);
+  const dragPanRef = useRef<DragPanState | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -202,6 +258,40 @@ export default function HomePage() {
       .sort((a, b) => a.timeMs - b.timeMs);
   }, [filteredPredictions]);
 
+  const fullDomain = useMemo<[number, number] | null>(() => {
+    if (!chartPoints.length) {
+      return null;
+    }
+    return [chartPoints[0].timeMs, chartPoints[chartPoints.length - 1].timeMs];
+  }, [chartPoints]);
+
+  const minimumZoomSpanMs = useMemo(() => {
+    if (chartPoints.length < 2) {
+      return ONE_HOUR_MS;
+    }
+    let minStep = Number.POSITIVE_INFINITY;
+    for (let index = 1; index < chartPoints.length; index += 1) {
+      const delta = chartPoints[index].timeMs - chartPoints[index - 1].timeMs;
+      if (delta > 0) {
+        minStep = Math.min(minStep, delta);
+      }
+    }
+    if (!Number.isFinite(minStep)) {
+      return ONE_HOUR_MS;
+    }
+    return Math.max(ONE_HOUR_MS, minStep * 2);
+  }, [chartPoints]);
+
+  const visibleDomain = useMemo<[number, number] | null>(() => {
+    if (!fullDomain) {
+      return null;
+    }
+    if (!zoomDomain) {
+      return fullDomain;
+    }
+    return clampDomainToBounds(zoomDomain[0], zoomDomain[1], fullDomain);
+  }, [zoomDomain, fullDomain]);
+
   const predictionByPath = useMemo(() => {
     const map = new Map<string, TriggerPredictionRow>();
     for (const row of filteredPredictions) {
@@ -258,6 +348,145 @@ export default function HomePage() {
     }
     return rows;
   }, [filteredAlerts, predictionByPath]);
+  const markerFocusDomain = useMemo<[number, number] | null>(() => {
+    if (!fullDomain) {
+      return null;
+    }
+    const markerTimes = [...predictionMarkers, ...alertMarkers]
+      .map((marker) => marker.timeMs)
+      .sort((a, b) => a - b);
+    if (!markerTimes.length) {
+      return null;
+    }
+    let start = markerTimes[0];
+    let end = markerTimes[markerTimes.length - 1];
+    if (end <= start) {
+      start -= minimumZoomSpanMs / 2;
+      end += minimumZoomSpanMs / 2;
+    } else {
+      const padding = Math.max(ONE_HOUR_MS, (end - start) * 0.08);
+      start -= padding;
+      end += padding;
+    }
+    return clampDomainToBounds(start, end, fullDomain);
+  }, [predictionMarkers, alertMarkers, minimumZoomSpanMs, fullDomain]);
+
+  const fullSpanMs = useMemo(() => {
+    if (!fullDomain) {
+      return 0;
+    }
+    return Math.max(0, fullDomain[1] - fullDomain[0]);
+  }, [fullDomain]);
+
+  const visibleSpanMs = useMemo(() => {
+    if (!visibleDomain) {
+      return 0;
+    }
+    return Math.max(0, visibleDomain[1] - visibleDomain[0]);
+  }, [visibleDomain]);
+
+  const xDomain = useMemo<[number, number] | ["dataMin", "dataMax"]>(() => {
+    if (!visibleDomain) {
+      return ["dataMin", "dataMax"];
+    }
+    return [visibleDomain[0], visibleDomain[1]];
+  }, [visibleDomain]);
+
+  const canZoomIn = fullDomain !== null && visibleSpanMs > minimumZoomSpanMs + 1;
+  const canZoomOut = fullDomain !== null && visibleSpanMs < fullSpanMs - 1;
+  const canDragPan = canZoomOut;
+  const fullDomainStart = fullDomain ? fullDomain[0] : null;
+  const fullDomainEnd = fullDomain ? fullDomain[1] : null;
+
+  const beginDragPan = useCallback(
+    (event: { button: number; clientX: number }) => {
+      if (!canDragPan || !visibleDomain) {
+        return;
+      }
+      if (event.button !== 0) {
+        return;
+      }
+      dragPanRef.current = {
+        startClientX: event.clientX,
+        initialDomain: visibleDomain,
+        hasPanned: false
+      };
+    },
+    [canDragPan, visibleDomain]
+  );
+
+  const applyZoomFactor = useCallback(
+    (factor: number) => {
+      if (!fullDomain || factor <= 0) {
+        return;
+      }
+      const baseDomain = visibleDomain ?? fullDomain;
+      const currentSpan = Math.max(1, baseDomain[1] - baseDomain[0]);
+      const targetSpan = Math.min(fullSpanMs, Math.max(minimumZoomSpanMs, currentSpan * factor));
+      const center = (baseDomain[0] + baseDomain[1]) / 2;
+      const targetStart = center - targetSpan / 2;
+      const targetEnd = center + targetSpan / 2;
+      const nextDomain = clampDomainToBounds(targetStart, targetEnd, fullDomain);
+      setZoomDomain(nextDomain);
+    },
+    [fullDomain, fullSpanMs, minimumZoomSpanMs, visibleDomain]
+  );
+
+  useEffect(() => {
+    setZoomDomain(null);
+  }, [fullDomainStart, fullDomainEnd]);
+
+  useEffect(() => {
+    if (canDragPan) {
+      return;
+    }
+    dragPanRef.current = null;
+    setIsDragPanning(false);
+  }, [canDragPan]);
+
+  useEffect(() => {
+    const handleWindowMouseMove = (event: MouseEvent) => {
+      const dragState = dragPanRef.current;
+      if (!dragState || !fullDomain) {
+        return;
+      }
+      const chartWidth = chartStackRef.current?.clientWidth ?? 0;
+      if (chartWidth <= 0) {
+        return;
+      }
+      const deltaPx = event.clientX - dragState.startClientX;
+      if (!dragState.hasPanned && Math.abs(deltaPx) < 3) {
+        return;
+      }
+      if (!dragState.hasPanned) {
+        dragState.hasPanned = true;
+        setIsDragPanning(true);
+      }
+      event.preventDefault();
+      const spanMs = Math.max(1, dragState.initialDomain[1] - dragState.initialDomain[0]);
+      const shiftMs = -(deltaPx / chartWidth) * spanMs;
+      const nextDomain = clampDomainToBounds(
+        dragState.initialDomain[0] + shiftMs,
+        dragState.initialDomain[1] + shiftMs,
+        fullDomain
+      );
+      setZoomDomain(nextDomain);
+    };
+
+    const stopDragPan = () => {
+      dragPanRef.current = null;
+      setIsDragPanning(false);
+    };
+
+    window.addEventListener("mousemove", handleWindowMouseMove);
+    window.addEventListener("mouseup", stopDragPan);
+    window.addEventListener("mouseleave", stopDragPan);
+    return () => {
+      window.removeEventListener("mousemove", handleWindowMouseMove);
+      window.removeEventListener("mouseup", stopDragPan);
+      window.removeEventListener("mouseleave", stopDragPan);
+    };
+  }, [fullDomain]);
 
   const hasChartData = chartPoints.length > 0;
 
@@ -383,6 +612,42 @@ export default function HomePage() {
           Volatility
         </button>
       </section>
+      <section className="button-row compact chart-zoom-controls">
+        <button
+          type="button"
+          className="toggle-btn"
+          onClick={() => applyZoomFactor(0.5)}
+          disabled={!canZoomIn}
+        >
+          Zoom In
+        </button>
+        <button
+          type="button"
+          className="toggle-btn"
+          onClick={() => applyZoomFactor(2)}
+          disabled={!canZoomOut}
+        >
+          Zoom Out
+        </button>
+        <button
+          type="button"
+          className="toggle-btn"
+          onClick={() => setZoomDomain(markerFocusDomain)}
+          disabled={!markerFocusDomain}
+        >
+          Focus Markers
+        </button>
+        <button
+          type="button"
+          className="toggle-btn"
+          onClick={() => setZoomDomain(null)}
+          disabled={!zoomDomain}
+        >
+          Reset Zoom
+        </button>
+        <span className="muted zoom-state">Window: {formatSpanLabel(visibleSpanMs)}</span>
+        {canDragPan ? <span className="muted zoom-state">Drag chart left/right to pan</span> : null}
+      </section>
       <section className="button-row compact chart-controls">
         <label className="range-control">
           Price panel height
@@ -434,7 +699,11 @@ export default function HomePage() {
             and indicator values.
           </p>
         ) : (
-          <div className="chart-stack">
+          <div
+            className={`chart-stack ${canDragPan ? "pan-enabled" : ""} ${isDragPanning ? "is-panning" : ""}`}
+            ref={chartStackRef}
+            onMouseDown={beginDragPan}
+          >
             <div className="chart-panel price" style={{ height: `${pricePanelHeight}px` }}>
               <ResponsiveContainer width="100%" height="100%">
                 <ComposedChart
@@ -443,7 +712,13 @@ export default function HomePage() {
                   margin={{ top: 18, right: 24, bottom: 8, left: 8 }}
                 >
                   <CartesianGrid stroke="#273155" strokeDasharray="3 3" />
-                  <XAxis type="number" dataKey="timeMs" domain={["dataMin", "dataMax"]} hide />
+                  <XAxis
+                    type="number"
+                    dataKey="timeMs"
+                    domain={xDomain}
+                    allowDataOverflow
+                    hide
+                  />
                   <YAxis
                     yAxisId="price"
                     orientation="left"
@@ -541,7 +816,8 @@ export default function HomePage() {
                   <XAxis
                     type="number"
                     dataKey="timeMs"
-                    domain={["dataMin", "dataMax"]}
+                    domain={xDomain}
+                    allowDataOverflow
                     tickFormatter={formatTimeTick}
                     tick={{ fill: "#a6b0cf", fontSize: 11 }}
                     label={{

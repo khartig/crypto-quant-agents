@@ -96,6 +96,15 @@ button {
   margin-top: -8px;
 }
 
+.chart-zoom-controls {
+  margin-top: -8px;
+}
+
+.zoom-state {
+  font-size: 13px;
+  margin-left: 6px;
+}
+
 .range-control {
   display: flex;
   flex-direction: column;
@@ -181,6 +190,15 @@ button {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.chart-stack.pan-enabled .chart-panel {
+  cursor: grab;
+}
+
+.chart-stack.is-panning .chart-panel {
+  cursor: grabbing;
+  user-select: none;
 }
 
 .chart-panel {
