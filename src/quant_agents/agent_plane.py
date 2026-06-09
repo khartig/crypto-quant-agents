@@ -64,6 +64,9 @@ class AgentPlaneConfig:
     calibration_confidence_floor: float = 0.05
     calibration_confidence_ceiling: float = 0.95
     calibration_max_contradictions: int = 0
+    self_critique_min_score: float = 0.55
+    self_critique_max_findings: int = 6
+    ops_report_verbosity: str = "standard"
     source_data_path: Path | None = None
 
 
@@ -90,6 +93,7 @@ class AgentPlaneRunResult:
     phase1_feature_context_path: Path
     walkforward_evaluation_path: Path
     confidence_calibration_path: Path
+    self_critique_signal_path: Path
     risk_decision_path: Path
     paper_trade_intent_path: Path
     paper_trade_execution_path: Path
@@ -750,6 +754,193 @@ def _run_walkforward_evaluation(
         "windows": rows,
         "diagnostics": diagnostics,
     }
+def _run_self_critique(
+    *,
+    run_id: str,
+    strategy_signal: StrategyProposalSignal,
+    data_quality_signal: DataQualitySignal,
+    market_frame: pd.DataFrame,
+    confidence_calibration: dict[str, Any],
+    min_score: float,
+    max_findings: int,
+    timeframe: str,
+) -> dict[str, Any]:
+    severity_rank = {"fail": 0, "block": 1}
+    findings: list[dict[str, Any]] = []
+
+    def add_finding(
+        *,
+        code: str,
+        severity: Literal["block", "fail"],
+        category: str,
+        message: str,
+        observed: Any,
+        expected: Any,
+    ) -> None:
+        findings.append(
+            {
+                "code": code,
+                "severity": severity,
+                "category": category,
+                "message": message,
+                "observed": observed,
+                "expected": expected,
+            }
+        )
+
+    recommendation = strategy_signal.recommendation
+    rationale = strategy_signal.rationale.lower()
+    bullish_keywords = ("buy", "bull", "uptrend", "upside", "long", "breakout")
+    bearish_keywords = ("sell", "bear", "downtrend", "downside", "short", "breakdown")
+    bullish_score = sum(1 for token in bullish_keywords if token in rationale)
+    bearish_score = sum(1 for token in bearish_keywords if token in rationale)
+
+    if recommendation == "buy" and bearish_score > bullish_score:
+        add_finding(
+            code="contradiction_rationale_direction",
+            severity="fail",
+            category="rationale",
+            message="Rationale language trends bearish while recommendation is buy.",
+            observed={"bullish_score": bullish_score, "bearish_score": bearish_score},
+            expected="bullish_score >= bearish_score",
+        )
+    if recommendation == "sell" and bullish_score > bearish_score:
+        add_finding(
+            code="contradiction_rationale_direction",
+            severity="fail",
+            category="rationale",
+            message="Rationale language trends bullish while recommendation is sell.",
+            observed={"bullish_score": bullish_score, "bearish_score": bearish_score},
+            expected="bearish_score >= bullish_score",
+        )
+
+    regime = strategy_signal.regime.strip().lower()
+    if recommendation == "buy" and ("bear" in regime or "downtrend" in regime):
+        add_finding(
+            code="contradiction_regime_recommendation",
+            severity="block",
+            category="regime",
+            message="Recommendation buy is inconsistent with detected bearish regime.",
+            observed=regime,
+            expected="bull/uptrend or neutral regime",
+        )
+    if recommendation == "sell" and ("bull" in regime or "uptrend" in regime):
+        add_finding(
+            code="contradiction_regime_recommendation",
+            severity="block",
+            category="regime",
+            message="Recommendation sell is inconsistent with detected bullish regime.",
+            observed=regime,
+            expected="bear/downtrend or neutral regime",
+        )
+
+    votes = _normalize_probability_votes(strategy_signal.indicator_votes)
+    alignment = float(votes.get(recommendation, 0.0))
+    if recommendation in {"buy", "sell"} and alignment < 0.34:
+        add_finding(
+            code="downgrade_indicator_alignment_low",
+            severity="block",
+            category="indicator_alignment",
+            message="Indicator vote alignment is weak for the recommended direction.",
+            observed=alignment,
+            expected=">= 0.34",
+        )
+
+    if bool(confidence_calibration.get("contradiction_detected", False)):
+        contradiction_severity = str(confidence_calibration.get("contradiction_severity", "block")).lower()
+        severity: Literal["block", "fail"] = "fail" if contradiction_severity == "fail" else "block"
+        add_finding(
+            code="contradiction_confidence_walkforward",
+            severity=severity,
+            category="confidence_calibration",
+            message="Confidence calibration detected a walk-forward contradiction.",
+            observed={
+                "quality_band": confidence_calibration.get("walkforward_quality_band"),
+                "walkforward_sharpe": confidence_calibration.get("walkforward_sharpe"),
+                "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
+            },
+            expected="no contradiction between actionable direction and walk-forward evidence",
+        )
+
+    frame_timestamps = pd.to_datetime(market_frame["timestamp"], utc=True, errors="coerce").dropna()
+    if not frame_timestamps.empty:
+        latest_bar = frame_timestamps.max().to_pydatetime()
+        interval_seconds = _timeframe_delta(timeframe).total_seconds()
+        stale_after_seconds = max(interval_seconds * 2.5, 3600)
+        historical_replay_cutoff_seconds = 30 * 24 * 3600
+        age_seconds = max(0.0, (datetime.now(timezone.utc) - latest_bar).total_seconds())
+        if age_seconds <= historical_replay_cutoff_seconds and age_seconds > stale_after_seconds:
+            add_finding(
+                code="data_freshness_stale",
+                severity="block",
+                category="data_freshness",
+                message="Latest market bar is older than the freshness threshold.",
+                observed={"age_seconds": age_seconds, "latest_bar_utc": latest_bar.isoformat()},
+                expected={"max_age_seconds": stale_after_seconds},
+            )
+
+    if not data_quality_signal.is_valid:
+        add_finding(
+            code="data_quality_invalid",
+            severity="fail",
+            category="data_quality",
+            message="Data quality stage reported invalid input.",
+            observed=data_quality_signal.anomalies,
+            expected="no data quality anomalies",
+        )
+
+    penalty = 0.0
+    for finding in findings:
+        penalty += 0.35 if finding["severity"] == "fail" else 0.20
+    score = float(np.clip(1.0 - penalty, 0.0, 1.0))
+
+    if score < min_score:
+        add_finding(
+            code="self_critique_score_below_threshold",
+            severity="block",
+            category="self_critique",
+            message="Aggregated self-critique score fell below configured threshold.",
+            observed=score,
+            expected=f">= {min_score}",
+        )
+
+    findings = sorted(findings, key=lambda item: (severity_rank.get(item["severity"], 99), item["code"]))
+    if len(findings) > max_findings:
+        findings = findings[:max_findings]
+
+    reason_codes = [str(item["code"]) for item in findings]
+    reason_code_details = {str(item["code"]): str(item["message"]) for item in findings}
+    highest_severity: Literal["none", "block", "fail"]
+    if any(item["severity"] == "fail" for item in findings):
+        highest_severity = "fail"
+    elif findings:
+        highest_severity = "block"
+    else:
+        highest_severity = "none"
+
+    passed = bool(score >= min_score and highest_severity != "fail")
+    summary = (
+        "No contradictions detected."
+        if passed and not findings
+        else f"{len(findings)} findings, highest_severity={highest_severity}, score={score:.3f}"
+    )
+    return {
+        "contract": "self_critique_signal.v1",
+        "run_id": run_id,
+        "created_at_utc": _utc_now_iso(),
+        "recommendation": recommendation,
+        "strictness": {
+            "min_score": min_score,
+            "max_findings": max_findings,
+        },
+        "score": score,
+        "pass": passed,
+        "highest_severity": highest_severity,
+        "reason_codes": reason_codes,
+        "reason_code_details": reason_code_details,
+        "findings": findings,
+        "summary": summary,
+    }
 
 
 def _indicator_alignment_score(indicator_votes: dict[str, float], recommendation: Recommendation) -> float:
@@ -957,13 +1148,28 @@ def _strategy_prompt(
     )
 
 
+def _normalize_report_verbosity(value: Any) -> Literal["compact", "standard", "verbose"]:
+    if not isinstance(value, str):
+        return "standard"
+    lowered = value.strip().lower()
+    if lowered == "compact":
+        return "compact"
+    if lowered == "verbose":
+        return "verbose"
+    if lowered == "standard":
+        return "standard"
+    return "standard"
+
+
 def _ops_prompt(context: dict[str, Any]) -> str:
     return "\n".join(
         [
             "You are ops-report-agent for a deterministic crypto quant pipeline.",
             "Write concise markdown with sections:",
             "## Run summary",
+            "## Self-critique",
             "## Deterministic gate outcome",
+            "## Decision trace",
             "## Paper intent",
             "## Paper execution",
             "## Follow-ups",
@@ -974,23 +1180,62 @@ def _ops_prompt(context: dict[str, Any]) -> str:
 
 
 def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
+    verbosity = _normalize_report_verbosity(context.get("report_verbosity"))
     risk_approved = bool(context["risk"]["approved"])
     intent_status = str(context["intent"]["status"])
     execution_status = str(context["execution"]["status"])
-    return "\n".join(
+    self_critique = context.get("self_critique", {})
+    decision_trace = list(context.get("risk", {}).get("decision_trace", []))
+    gate_transitions = list(context.get("risk", {}).get("gate_transition_sequence", []))
+    reason_code_details = dict(context.get("risk", {}).get("reason_code_details", {}))
+
+    lines = [
+        f"# Agent Plane Ops Report ({context['run_id']})",
+        "",
+        "## Run summary",
+        f"- Exchange: `{context['scope']['exchange']}`",
+        f"- Symbol: `{context['scope']['symbol']}`",
+        f"- Timeframe: `{context['scope']['timeframe']}`",
+        f"- Strategy recommendation: `{context['proposal']['recommendation']}`",
+        f"- Backtest status: `{context['backtest']['status']}`",
+        "",
+        "## Self-critique",
+        f"- Pass: `{self_critique.get('pass')}`",
+        f"- Score: `{self_critique.get('score')}`",
+        f"- Highest severity: `{self_critique.get('highest_severity')}`",
+        f"- Reason codes: `{self_critique.get('reason_codes', [])}`",
+        "",
+        "## Deterministic gate outcome",
+        f"- Approved: `{risk_approved}`",
+        f"- Deterministic gate: `{context['risk'].get('deterministic_gate')}`",
+        f"- Reason codes: `{context['risk']['reason_codes']}`",
+    ]
+    if verbosity in {"standard", "verbose"} and reason_code_details:
+        lines.append("- Reason-code details:")
+        for code in sorted(reason_code_details):
+            lines.append(f"  - `{code}`: {reason_code_details[code]}")
+
+    lines.extend(
         [
-            f"# Agent Plane Ops Report ({context['run_id']})",
             "",
-            "## Run summary",
-            f"- Exchange: `{context['scope']['exchange']}`",
-            f"- Symbol: `{context['scope']['symbol']}`",
-            f"- Timeframe: `{context['scope']['timeframe']}`",
-            f"- Strategy recommendation: `{context['proposal']['recommendation']}`",
-            f"- Backtest status: `{context['backtest']['status']}`",
-            "",
-            "## Deterministic gate outcome",
-            f"- Approved: `{risk_approved}`",
-            f"- Reason codes: `{context['risk']['reason_codes']}`",
+            "## Decision trace",
+            f"- Gate transition sequence: `{gate_transitions}`",
+        ]
+    )
+    trace_rows = decision_trace if verbosity == "verbose" else decision_trace[:6]
+    if trace_rows:
+        for row in trace_rows:
+            lines.append(
+                "- "
+                + f"`{row.get('gate')}` `{row.get('metric')}` observed=`{row.get('observed')}` "
+                + f"threshold=`{row.get('threshold')}` pass=`{row.get('pass')}` "
+                + f"reason=`{row.get('reason_code')}`"
+            )
+    if verbosity != "verbose" and len(decision_trace) > len(trace_rows):
+        lines.append(f"- ... truncated `{len(decision_trace) - len(trace_rows)}` trace rows")
+
+    lines.extend(
+        [
             "",
             "## Paper intent",
             f"- Status: `{intent_status}`",
@@ -1010,6 +1255,7 @@ def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
             "- Review deterministic risk thresholds for false positives/negatives.",
         ]
     )
+    return "\n".join(lines)
 
 
 def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneRunResult:
@@ -1036,6 +1282,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     backtest_evaluation_path = run_dir / "backtest_evaluation.json"
     walkforward_evaluation_path = run_dir / "walkforward_evaluation.json"
     confidence_calibration_path = run_dir / "confidence_calibration.json"
+    self_critique_signal_path = run_dir / "self_critique_signal.json"
     risk_decision_path = run_dir / "risk_decision.json"
     paper_trade_intent_path = run_dir / "paper_trade_intent.json"
     paper_trade_execution_path = run_dir / "paper_trade_execution.json"
@@ -1419,9 +1666,64 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     _write_json(confidence_calibration_path, confidence_calibration)
     step_records.append(calibration_step)
 
+    def self_critique_runner() -> dict[str, Any]:
+        return _run_self_critique(
+            run_id=run_id,
+            strategy_signal=strategy_signal,
+            data_quality_signal=data_quality_signal,
+            market_frame=market_frame,
+            confidence_calibration=confidence_calibration,
+            min_score=config.self_critique_min_score,
+            max_findings=max(1, config.self_critique_max_findings),
+            timeframe=config.timeframe,
+        )
+
+    def self_critique_fallback(errors: list[str]) -> dict[str, Any]:
+        return {
+            "contract": "self_critique_signal.v1",
+            "run_id": run_id,
+            "created_at_utc": _utc_now_iso(),
+            "recommendation": strategy_signal.recommendation,
+            "strictness": {
+                "min_score": config.self_critique_min_score,
+                "max_findings": max(1, config.self_critique_max_findings),
+            },
+            "score": 0.0,
+            "pass": False,
+            "highest_severity": "fail",
+            "reason_codes": ["self_critique_unavailable", *errors],
+            "reason_code_details": {
+                "self_critique_unavailable": "Self-critique stage failed and fallback was used.",
+            },
+            "findings": [
+                {
+                    "code": "self_critique_unavailable",
+                    "severity": "fail",
+                    "category": "self_critique",
+                    "message": "Self-critique stage failed and fallback was used.",
+                    "observed": errors,
+                    "expected": "self-critique stage execution success",
+                }
+            ],
+            "summary": "Self-critique fallback triggered.",
+        }
+
+    self_critique_signal, self_critique_step = _run_step_with_retries(
+        run_dir=run_dir,
+        step_name="self-critique-agent",
+        max_retries=config.step_retries,
+        runner=self_critique_runner,
+        fallback=self_critique_fallback,
+    )
+    _write_json(self_critique_signal_path, self_critique_signal)
+    step_records.append(self_critique_step)
+
     def risk_runner() -> RiskDecision:
         fail_reasons: list[str] = []
         block_reasons: list[str] = []
+        reason_code_details: dict[str, str] = {}
+        decision_trace: list[dict[str, Any]] = []
+        gate_transition_sequence: list[str] = ["start"]
         calibration_reason_codes = [str(code) for code in confidence_calibration.get("reason_codes", [])]
         walkforward_quality_score = float(confidence_calibration.get("walkforward_quality_score", 0.0))
         walkforward_quality_band = str(
@@ -1434,7 +1736,65 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             .get("contradiction_counts", {})
             .get("current_run", 0)
         )
+        self_critique_pass = bool(self_critique_signal.get("pass", False))
+        self_critique_score = float(self_critique_signal.get("score", 0.0))
+        self_critique_highest = str(self_critique_signal.get("highest_severity", "none")).lower()
+        self_critique_reason_codes = [str(code) for code in self_critique_signal.get("reason_codes", [])]
+        self_critique_reason_details = {
+            str(code): str(detail)
+            for code, detail in dict(self_critique_signal.get("reason_code_details", {})).items()
+        }
+        self_critique_severity_by_code = {
+            str(item.get("code")): str(item.get("severity", "block")).lower()
+            for item in list(self_critique_signal.get("findings", []))
+            if item.get("code")
+        }
         action = strategy_signal.recommendation
+
+        def register_reason(reason_code: str, severity: Literal["block", "fail"], detail: str) -> None:
+            if severity == "fail":
+                fail_reasons.append(reason_code)
+            else:
+                block_reasons.append(reason_code)
+            reason_code_details.setdefault(reason_code, detail)
+
+        def append_transition(marker: str) -> None:
+            if not gate_transition_sequence or gate_transition_sequence[-1] != marker:
+                gate_transition_sequence.append(marker)
+
+        def trace_check(
+            *,
+            gate: str,
+            metric: str,
+            observed_value: Any,
+            threshold: Any,
+            passed: bool,
+            failure_reason_code: str | None = None,
+            failure_severity: Literal["block", "fail"] = "block",
+            failure_detail: str = "",
+        ) -> None:
+            decision_trace.append(
+                {
+                    "gate": gate,
+                    "metric": metric,
+                    "observed": observed_value,
+                    "threshold": threshold,
+                    "pass": passed,
+                    "severity": "none" if passed else failure_severity,
+                    "reason_code": failure_reason_code if not passed else None,
+                }
+            )
+            if passed:
+                append_transition(f"{gate}:pass")
+                return
+            append_transition(f"{gate}:{failure_severity}")
+            if failure_reason_code:
+                register_reason(
+                    reason_code=failure_reason_code,
+                    severity=failure_severity,
+                    detail=failure_detail or f"Gate `{gate}` failed metric `{metric}`.",
+                )
+
         observed: dict[str, Any] = {
             "data_quality_valid": data_quality_signal.is_valid,
             "backtest_status": backtest_evaluation.backtest_status,
@@ -1454,6 +1814,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "phase1_regime": strategy_signal.regime,
             "phase1_indicator_votes": strategy_signal.indicator_votes,
             "phase1_feature_snapshot": strategy_signal.feature_snapshot,
+            "self_critique_pass": self_critique_pass,
+            "self_critique_score": self_critique_score,
+            "self_critique_highest_severity": self_critique_highest,
+            "self_critique_reason_codes": self_critique_reason_codes,
         }
         thresholds = {
             "min_total_return": config.thresholds.min_total_return,
@@ -1465,66 +1829,254 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "walkforward_quality_low_cutoff": 0.40,
             "walkforward_quality_medium_cutoff": 0.55,
             "walkforward_quality_high_cutoff": 0.70,
+            "self_critique_min_score": config.self_critique_min_score,
         }
 
-        if not data_quality_signal.is_valid:
-            fail_reasons.append("data_quality_invalid")
-        if backtest_evaluation.backtest_status != "success":
-            fail_reasons.append("backtest_failed")
-        else:
-            total_return = backtest_evaluation.total_return
-            sharpe = backtest_evaluation.sharpe
-            max_drawdown = backtest_evaluation.max_drawdown
-            if total_return is None or total_return < config.thresholds.min_total_return:
-                fail_reasons.append("total_return_below_threshold")
-            if sharpe is None or sharpe < config.thresholds.min_sharpe:
-                fail_reasons.append("sharpe_below_threshold")
-            if max_drawdown is None or max_drawdown < config.thresholds.max_drawdown:
-                fail_reasons.append("max_drawdown_exceeded")
+        trace_check(
+            gate="data_quality",
+            metric="is_valid",
+            observed_value=data_quality_signal.is_valid,
+            threshold=True,
+            passed=data_quality_signal.is_valid,
+            failure_reason_code="data_quality_invalid",
+            failure_severity="fail",
+            failure_detail="Data quality stage reported invalid source data.",
+        )
 
-        if action not in {"buy", "sell"}:
-            block_reasons.append("non_actionable_recommendation")
-        else:
-            if walkforward_quality_band == "very_low":
-                fail_reasons.append(f"risk_fail_{action}_walkforward_quality_very_low")
-            elif walkforward_quality_band == "low":
-                block_reasons.append(f"risk_block_{action}_walkforward_quality_low")
+        backtest_success = backtest_evaluation.backtest_status == "success"
+        trace_check(
+            gate="backtest",
+            metric="status",
+            observed_value=backtest_evaluation.backtest_status,
+            threshold="success",
+            passed=backtest_success,
+            failure_reason_code="backtest_failed",
+            failure_severity="fail",
+            failure_detail="Backtest stage did not complete successfully.",
+        )
+        total_return = backtest_evaluation.total_return
+        trace_check(
+            gate="backtest",
+            metric="total_return",
+            observed_value=total_return,
+            threshold=f">= {config.thresholds.min_total_return}",
+            passed=backtest_success and total_return is not None and total_return >= config.thresholds.min_total_return,
+            failure_reason_code="total_return_below_threshold",
+            failure_severity="fail",
+            failure_detail="Backtest total return fell below the configured threshold.",
+        )
+        sharpe = backtest_evaluation.sharpe
+        trace_check(
+            gate="backtest",
+            metric="sharpe",
+            observed_value=sharpe,
+            threshold=f">= {config.thresholds.min_sharpe}",
+            passed=backtest_success and sharpe is not None and sharpe >= config.thresholds.min_sharpe,
+            failure_reason_code="sharpe_below_threshold",
+            failure_severity="fail",
+            failure_detail="Backtest Sharpe ratio fell below the configured threshold.",
+        )
+        max_drawdown = backtest_evaluation.max_drawdown
+        trace_check(
+            gate="backtest",
+            metric="max_drawdown",
+            observed_value=max_drawdown,
+            threshold=f">= {config.thresholds.max_drawdown}",
+            passed=backtest_success and max_drawdown is not None and max_drawdown >= config.thresholds.max_drawdown,
+            failure_reason_code="max_drawdown_exceeded",
+            failure_severity="fail",
+            failure_detail="Backtest max drawdown exceeded allowable bounds.",
+        )
 
-            if contradiction_detected:
-                if contradiction_severity == "fail":
-                    fail_reasons.append(
-                        f"risk_fail_{action}_walkforward_contradiction_{walkforward_quality_band}"
-                    )
-                else:
-                    block_reasons.append(
-                        f"risk_block_{action}_walkforward_contradiction_{walkforward_quality_band}"
-                    )
+        actionable = action in {"buy", "sell"}
+        trace_check(
+            gate="recommendation",
+            metric="actionable_direction",
+            observed_value=action,
+            threshold="buy|sell",
+            passed=actionable,
+            failure_reason_code="non_actionable_recommendation",
+            failure_severity="block",
+            failure_detail="Recommendation was hold and cannot emit a trade intent.",
+        )
+
+        if actionable:
+            quality_very_low = walkforward_quality_band == "very_low"
+            trace_check(
+                gate="calibration",
+                metric="walkforward_quality_band",
+                observed_value=walkforward_quality_band,
+                threshold="not very_low",
+                passed=not quality_very_low,
+                failure_reason_code=f"risk_fail_{action}_walkforward_quality_very_low",
+                failure_severity="fail",
+                failure_detail="Walk-forward quality band is very_low for an actionable recommendation.",
+            )
+
+            quality_low = walkforward_quality_band == "low"
+            trace_check(
+                gate="calibration",
+                metric="walkforward_quality_low_block",
+                observed_value=walkforward_quality_band,
+                threshold="not low",
+                passed=not quality_low,
+                failure_reason_code=f"risk_block_{action}_walkforward_quality_low",
+                failure_severity="block",
+                failure_detail="Walk-forward quality band is low and requires blocking execution.",
+            )
+
+            contradiction_failure_reason = (
+                f"risk_fail_{action}_walkforward_contradiction_{walkforward_quality_band}"
+                if contradiction_severity == "fail"
+                else f"risk_block_{action}_walkforward_contradiction_{walkforward_quality_band}"
+            )
+            contradiction_failure_severity: Literal["block", "fail"] = (
+                "fail" if contradiction_severity == "fail" else "block"
+            )
+            trace_check(
+                gate="calibration",
+                metric="walkforward_contradiction",
+                observed_value={
+                    "contradiction_detected": contradiction_detected,
+                    "contradiction_severity": contradiction_severity,
+                },
+                threshold={"contradiction_detected": False},
+                passed=not contradiction_detected,
+                failure_reason_code=contradiction_failure_reason,
+                failure_severity=contradiction_failure_severity,
+                failure_detail=(
+                    "Confidence calibration detected an actionable contradiction against walk-forward evidence."
+                ),
+            )
+
         calibrated_confidence = float(confidence_calibration.get("calibrated_confidence", 0.0))
-        if calibrated_confidence < config.thresholds.min_signal_confidence:
-            block_reasons.append("calibrated_confidence_below_threshold")
-        if (
-            float(confidence_calibration.get("raw_confidence", 0.0)) >= config.thresholds.min_signal_confidence
-            and calibrated_confidence < config.thresholds.min_signal_confidence
-        ):
-            block_reasons.append("confidence_downgraded_by_calibration")
-        if contradiction_count > config.calibration_max_contradictions:
-            fail_reasons.append("calibration_contradiction_limit_exceeded")
-            if action in {"buy", "sell"}:
-                fail_reasons.append(f"risk_fail_{action}_calibration_contradiction_limit_exceeded")
+        trace_check(
+            gate="calibration",
+            metric="calibrated_confidence",
+            observed_value=calibrated_confidence,
+            threshold=f">= {config.thresholds.min_signal_confidence}",
+            passed=calibrated_confidence >= config.thresholds.min_signal_confidence,
+            failure_reason_code="calibrated_confidence_below_threshold",
+            failure_severity="block",
+            failure_detail="Calibrated confidence is below deterministic minimum confidence.",
+        )
+        raw_confidence = float(confidence_calibration.get("raw_confidence", 0.0))
+        trace_check(
+            gate="calibration",
+            metric="confidence_downgrade_guard",
+            observed_value={"raw_confidence": raw_confidence, "calibrated_confidence": calibrated_confidence},
+            threshold="raw >= min_signal_confidence implies calibrated >= min_signal_confidence",
+            passed=not (
+                raw_confidence >= config.thresholds.min_signal_confidence
+                and calibrated_confidence < config.thresholds.min_signal_confidence
+            ),
+            failure_reason_code="confidence_downgraded_by_calibration",
+            failure_severity="block",
+            failure_detail="Calibration downgraded confidence below executable threshold.",
+        )
+        trace_check(
+            gate="calibration",
+            metric="contradiction_count",
+            observed_value=contradiction_count,
+            threshold=f"<= {config.calibration_max_contradictions}",
+            passed=contradiction_count <= config.calibration_max_contradictions,
+            failure_reason_code="calibration_contradiction_limit_exceeded",
+            failure_severity="fail",
+            failure_detail="Current run contradiction count exceeded configured limit.",
+        )
+        if contradiction_count > config.calibration_max_contradictions and actionable:
+            register_reason(
+                reason_code=f"risk_fail_{action}_calibration_contradiction_limit_exceeded",
+                severity="fail",
+                detail="Actionable recommendation exceeded calibration contradiction limit.",
+            )
 
-        reasons = sorted(set([*fail_reasons, *block_reasons, *calibration_reason_codes]))
+        trace_check(
+            gate="self_critique",
+            metric="pass",
+            observed_value={"pass": self_critique_pass, "highest_severity": self_critique_highest},
+            threshold={"pass": True},
+            passed=self_critique_pass,
+            failure_reason_code=(
+                "self_critique_failed" if self_critique_highest == "fail" else "self_critique_blocked"
+            ),
+            failure_severity="fail" if self_critique_highest == "fail" else "block",
+            failure_detail="Self-critique stage flagged contradictions requiring gate intervention.",
+        )
+        trace_check(
+            gate="self_critique",
+            metric="score",
+            observed_value=self_critique_score,
+            threshold=f">= {config.self_critique_min_score}",
+            passed=self_critique_score >= config.self_critique_min_score,
+            failure_reason_code="self_critique_score_below_threshold",
+            failure_severity="block",
+            failure_detail="Self-critique score is below configured minimum threshold.",
+        )
+
+        for reason_code in self_critique_reason_codes:
+            severity = self_critique_severity_by_code.get(reason_code, "block")
+            failure_severity: Literal["block", "fail"] = "fail" if severity == "fail" else "block"
+            should_gate = failure_severity == "fail" or not self_critique_pass
+            if should_gate:
+                register_reason(
+                    reason_code=reason_code,
+                    severity=failure_severity,
+                    detail=self_critique_reason_details.get(
+                        reason_code,
+                        "Self-critique stage generated this reason code.",
+                    ),
+                )
+            decision_trace.append(
+                {
+                    "gate": "self_critique_reason",
+                    "metric": reason_code,
+                    "observed": severity,
+                    "threshold": "none",
+                    "pass": not should_gate,
+                    "severity": failure_severity if should_gate else "advisory",
+                    "reason_code": reason_code if should_gate else None,
+                }
+            )
+
+        for reason_code in calibration_reason_codes:
+            severity: Literal["block", "fail"] = (
+                "fail" if "very_low" in reason_code or "contradiction_fail" in reason_code else "block"
+            )
+            register_reason(
+                reason_code=reason_code,
+                severity=severity,
+                detail=f"Confidence calibration propagated reason code `{reason_code}`.",
+            )
+            decision_trace.append(
+                {
+                    "gate": "calibration_reason",
+                    "metric": reason_code,
+                    "observed": severity,
+                    "threshold": "none",
+                    "pass": False,
+                    "severity": severity,
+                    "reason_code": reason_code,
+                }
+            )
+
+        reasons = sorted(set([*fail_reasons, *block_reasons]))
         approved = len(reasons) == 0
+        append_transition("deterministic_gate:pass" if approved else "deterministic_gate:fail")
         return RiskDecision(
             contract="risk_decision.v1",
             run_id=run_id,
             created_at_utc=_utc_now_iso(),
             approved=approved,
-            reason_codes=sorted(set(reasons)),
+            reason_codes=reasons,
             thresholds=thresholds,
             observed=observed,
             recommendation=strategy_signal.recommendation,
             recommendation_confidence=calibrated_confidence,
             deterministic_gate="pass" if approved else "fail",
+            decision_trace=decision_trace,
+            reason_code_details=reason_code_details,
+            gate_transition_sequence=gate_transition_sequence,
         )
 
     risk_decision, risk_step = _run_step_with_retries(
@@ -1612,6 +2164,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
 
     ops_context = {
         "run_id": run_id,
+        "report_verbosity": _normalize_report_verbosity(config.ops_report_verbosity),
         "scope": {
             "exchange": config.exchange,
             "symbol": config.symbol,
@@ -1641,10 +2194,15 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         },
         "walkforward": walkforward_evaluation,
         "calibration": confidence_calibration,
+        "self_critique": self_critique_signal,
         "risk": {
             "approved": risk_decision.approved,
             "reason_codes": risk_decision.reason_codes,
             "thresholds": risk_decision.thresholds,
+            "deterministic_gate": risk_decision.deterministic_gate,
+            "decision_trace": risk_decision.decision_trace,
+            "reason_code_details": risk_decision.reason_code_details,
+            "gate_transition_sequence": risk_decision.gate_transition_sequence,
         },
         "intent": {
             "status": paper_trade_intent.status,
@@ -1730,6 +2288,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "backtest_evaluation": str(backtest_evaluation_path),
             "walkforward_evaluation": str(walkforward_evaluation_path),
             "confidence_calibration": str(confidence_calibration_path),
+            "self_critique_signal": str(self_critique_signal_path),
             "risk_decision": str(risk_decision_path),
             "paper_trade_intent": str(paper_trade_intent_path),
             "paper_trade_execution": str(paper_trade_execution_path),
@@ -1738,6 +2297,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "paper_fills_log": paper_trade_execution.fills_log_path or "",
             "paper_execution_record": paper_trade_execution.execution_record_path or "",
         },
+        decision_trace=list(risk_decision.decision_trace),
+        reason_code_details=dict(risk_decision.reason_code_details),
+        gate_transition_sequence=list(risk_decision.gate_transition_sequence),
+        report_verbosity=_normalize_report_verbosity(config.ops_report_verbosity),
         warnings=list(report_payload.get("warnings", [])),
     )
     write_contract(ops_report_contract_path, ops_report_contract)
@@ -1766,6 +2329,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "calibration_confidence_floor": config.calibration_confidence_floor,
             "calibration_confidence_ceiling": config.calibration_confidence_ceiling,
             "calibration_max_contradictions": config.calibration_max_contradictions,
+            "self_critique_min_score": config.self_critique_min_score,
+            "self_critique_max_findings": config.self_critique_max_findings,
+            "ops_report_verbosity": _normalize_report_verbosity(config.ops_report_verbosity),
             "paper_notional_usd": config.paper_notional_usd,
             "paper_starting_cash_usd": config.paper_starting_cash_usd,
             "paper_fee_bps": config.paper_fee_bps,
@@ -1780,6 +2346,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "backtest_evaluation": str(backtest_evaluation_path),
             "walkforward_evaluation": str(walkforward_evaluation_path),
             "confidence_calibration": str(confidence_calibration_path),
+            "self_critique_signal": str(self_critique_signal_path),
             "risk_decision": str(risk_decision_path),
             "paper_trade_intent": str(paper_trade_intent_path),
             "paper_trade_execution": str(paper_trade_execution_path),
@@ -1797,6 +2364,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "deterministic_gate": risk_decision.deterministic_gate,
             "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
             "walkforward_quality_score": confidence_calibration.get("walkforward_quality_score"),
+            "self_critique_score": self_critique_signal.get("score"),
+            "self_critique_pass": self_critique_signal.get("pass"),
+            "decision_trace_entries": len(risk_decision.decision_trace),
         },
     }
     _write_json(run_manifest_path, run_manifest)
@@ -1818,6 +2388,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         phase1_feature_context_path=phase1_feature_context_path,
         walkforward_evaluation_path=walkforward_evaluation_path,
         confidence_calibration_path=confidence_calibration_path,
+        self_critique_signal_path=self_critique_signal_path,
         risk_decision_path=risk_decision_path,
         paper_trade_intent_path=paper_trade_intent_path,
         paper_trade_execution_path=paper_trade_execution_path,

@@ -105,6 +105,9 @@ class RiskDecision:
     recommendation: Recommendation
     recommendation_confidence: float
     deterministic_gate: Literal["pass", "fail"]
+    decision_trace: list[dict[str, Any]] = field(default_factory=list)
+    reason_code_details: dict[str, str] = field(default_factory=dict)
+    gate_transition_sequence: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -161,4 +164,8 @@ class OpsReportContract:
     summary_markdown_path: str
     summary_markdown: str
     artifact_paths: dict[str, str]
+    decision_trace: list[dict[str, Any]] = field(default_factory=list)
+    reason_code_details: dict[str, str] = field(default_factory=dict)
+    gate_transition_sequence: list[str] = field(default_factory=list)
+    report_verbosity: str = "standard"
     warnings: list[str] = field(default_factory=list)

@@ -19,6 +19,9 @@ JobStatus = Literal["queued", "running", "succeeded", "blocked", "failed"]
 TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"succeeded", "blocked", "failed"})
 REQUIRED_ARTIFACT_KEYS: tuple[str, ...] = (
     "data_quality_signal",
+    "walkforward_evaluation",
+    "confidence_calibration",
+    "self_critique_signal",
     "strategy_proposal_signal",
     "backtest_evaluation",
     "risk_decision",
@@ -78,6 +81,9 @@ class OpenClawOrchestrationRequest:
     calibration_confidence_floor: float
     calibration_confidence_ceiling: float
     calibration_max_contradictions: int
+    self_critique_min_score: float
+    self_critique_max_findings: int
+    ops_report_verbosity: str
     paper_notional_usd: float
     paper_starting_cash_usd: float
     paper_fee_bps: float
@@ -136,6 +142,16 @@ class OpenClawOrchestrationRequest:
                     )
                 ),
             ),
+            self_critique_min_score=float(
+                payload.get("self_critique_min_score", settings.self_critique_min_score)
+            ),
+            self_critique_max_findings=max(
+                1,
+                int(payload.get("self_critique_max_findings", settings.self_critique_max_findings)),
+            ),
+            ops_report_verbosity=str(
+                payload.get("ops_report_verbosity", settings.ops_report_verbosity)
+            ).strip().lower(),
             paper_notional_usd=float(payload.get("paper_notional_usd", settings.paper_trade_notional_usd)),
             paper_starting_cash_usd=float(
                 payload.get("paper_starting_cash_usd", settings.paper_trade_starting_cash_usd)
@@ -171,6 +187,9 @@ class OpenClawOrchestrationRequest:
             calibration_confidence_floor=self.calibration_confidence_floor,
             calibration_confidence_ceiling=self.calibration_confidence_ceiling,
             calibration_max_contradictions=self.calibration_max_contradictions,
+            self_critique_min_score=self.self_critique_min_score,
+            self_critique_max_findings=self.self_critique_max_findings,
+            ops_report_verbosity=self.ops_report_verbosity,
             source_data_path=Path(self.source_data_path).expanduser().resolve()
             if self.source_data_path
             else None,
@@ -200,6 +219,7 @@ def run_openclaw_orchestration(
             "backtest_evaluation": str(result.backtest_evaluation_path),
             "walkforward_evaluation": str(result.walkforward_evaluation_path),
             "confidence_calibration": str(result.confidence_calibration_path),
+            "self_critique_signal": str(result.self_critique_signal_path),
             "risk_decision": str(result.risk_decision_path),
             "paper_trade_intent": str(result.paper_trade_intent_path),
             "paper_trade_execution": str(result.paper_trade_execution_path),
@@ -259,10 +279,13 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             return None
 
     data_quality = _load_contract("data_quality_signal")
+    confidence_calibration = _load_contract("confidence_calibration")
+    self_critique = _load_contract("self_critique_signal")
     backtest = _load_contract("backtest_evaluation")
     risk = _load_contract("risk_decision")
     intent = _load_contract("paper_trade_intent")
     execution = _load_contract("paper_trade_execution")
+    ops_report_contract = _load_contract("ops_report_contract")
     run_manifest = _load_contract("run_manifest")
 
     if data_quality is not None:
@@ -277,15 +300,66 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
         if not backtest_success:
             errors.append("backtest_not_success")
 
+    if confidence_calibration is not None:
+        calibrated_confidence_present = isinstance(
+            confidence_calibration.get("calibrated_confidence"),
+            (int, float),
+        )
+        reason_codes_list = isinstance(confidence_calibration.get("reason_codes"), list)
+        contradiction_field_present = isinstance(confidence_calibration.get("contradiction_detected"), bool)
+        checks["confidence_calibration:calibrated_confidence_present"] = calibrated_confidence_present
+        checks["confidence_calibration:reason_codes_list"] = reason_codes_list
+        checks["confidence_calibration:contradiction_field_present"] = contradiction_field_present
+        if not calibrated_confidence_present:
+            errors.append("confidence_calibration_missing_calibrated_confidence")
+        if not reason_codes_list:
+            errors.append("confidence_calibration_reason_codes_invalid")
+        if not contradiction_field_present:
+            errors.append("confidence_calibration_contradiction_flag_invalid")
+
+    if self_critique is not None:
+        self_critique_pass = self_critique.get("pass") is True
+        self_critique_score_present = isinstance(self_critique.get("score"), (int, float))
+        self_critique_reasons_present = isinstance(self_critique.get("reason_codes"), list)
+        self_critique_findings_present = isinstance(self_critique.get("findings"), list)
+        checks["self_critique:pass"] = self_critique_pass
+        checks["self_critique:score_present"] = self_critique_score_present
+        checks["self_critique:reason_codes_present"] = self_critique_reasons_present
+        checks["self_critique:findings_present"] = self_critique_findings_present
+        if not self_critique_pass:
+            errors.append("self_critique_not_pass")
+        if not self_critique_score_present:
+            errors.append("self_critique_score_missing")
+        if not self_critique_reasons_present:
+            errors.append("self_critique_reason_codes_invalid")
+        if not self_critique_findings_present:
+            errors.append("self_critique_findings_invalid")
+
     if risk is not None:
         risk_approved = risk.get("approved") is True
         gate_pass = str(risk.get("deterministic_gate")) == "pass"
+        decision_trace_present = isinstance(risk.get("decision_trace"), list) and len(
+            list(risk.get("decision_trace") or [])
+        ) > 0
+        reason_code_details_present = isinstance(risk.get("reason_code_details"), dict)
+        gate_transition_present = isinstance(risk.get("gate_transition_sequence"), list) and len(
+            list(risk.get("gate_transition_sequence") or [])
+        ) > 0
         checks["risk:approved"] = risk_approved
         checks["risk:deterministic_gate_pass"] = gate_pass
+        checks["risk:decision_trace_present"] = decision_trace_present
+        checks["risk:reason_code_details_present"] = reason_code_details_present
+        checks["risk:gate_transition_present"] = gate_transition_present
         if not risk_approved:
             errors.append("risk_not_approved")
         if not gate_pass:
             errors.append("risk_gate_not_pass")
+        if not decision_trace_present:
+            errors.append("risk_decision_trace_missing")
+        if not reason_code_details_present:
+            errors.append("risk_reason_code_details_missing")
+        if not gate_transition_present:
+            errors.append("risk_gate_transition_sequence_missing")
 
     if intent is not None:
         intent_emitted = str(intent.get("status")) == "emitted"
@@ -319,17 +393,73 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
         if not executed_notional_positive:
             errors.append("execution_notional_not_positive")
 
+    if ops_report_contract is not None:
+        report_trace_present = isinstance(ops_report_contract.get("decision_trace"), list)
+        report_reason_details_present = isinstance(ops_report_contract.get("reason_code_details"), dict)
+        report_gate_sequence_present = isinstance(ops_report_contract.get("gate_transition_sequence"), list)
+        report_verbosity = str(ops_report_contract.get("report_verbosity", "")).lower()
+        report_verbosity_valid = report_verbosity in {"compact", "standard", "verbose"}
+        checks["ops_report_contract:decision_trace_present"] = report_trace_present
+        checks["ops_report_contract:reason_code_details_present"] = report_reason_details_present
+        checks["ops_report_contract:gate_transition_present"] = report_gate_sequence_present
+        checks["ops_report_contract:report_verbosity_valid"] = report_verbosity_valid
+        if not report_trace_present:
+            errors.append("ops_report_contract_decision_trace_missing")
+        if not report_reason_details_present:
+            errors.append("ops_report_contract_reason_code_details_missing")
+        if not report_gate_sequence_present:
+            errors.append("ops_report_contract_gate_transition_sequence_missing")
+        if not report_verbosity_valid:
+            errors.append("ops_report_contract_report_verbosity_invalid")
+
     if run_manifest is not None:
+        artifacts_obj = run_manifest.get("artifacts")
+        if isinstance(artifacts_obj, dict):
+            manifest_self_critique_present = isinstance(artifacts_obj.get("self_critique_signal"), str) and bool(
+                str(artifacts_obj.get("self_critique_signal"))
+            )
+            checks["manifest:self_critique_artifact_present"] = manifest_self_critique_present
+            if not manifest_self_critique_present:
+                errors.append("manifest_self_critique_artifact_missing")
+        else:
+            checks["manifest:artifacts_present"] = False
+            errors.append("manifest_artifacts_missing")
+
+        manifest_config = run_manifest.get("config")
+        if isinstance(manifest_config, dict):
+            config_has_min_score = "self_critique_min_score" in manifest_config
+            config_has_max_findings = "self_critique_max_findings" in manifest_config
+            config_has_report_verbosity = "ops_report_verbosity" in manifest_config
+            checks["manifest:config_self_critique_min_score_present"] = config_has_min_score
+            checks["manifest:config_self_critique_max_findings_present"] = config_has_max_findings
+            checks["manifest:config_ops_report_verbosity_present"] = config_has_report_verbosity
+            if not config_has_min_score:
+                errors.append("manifest_config_self_critique_min_score_missing")
+            if not config_has_max_findings:
+                errors.append("manifest_config_self_critique_max_findings_missing")
+            if not config_has_report_verbosity:
+                errors.append("manifest_config_ops_report_verbosity_missing")
+        else:
+            checks["manifest:config_present"] = False
+            errors.append("manifest_config_missing")
+
         outcome = run_manifest.get("outcome")
         if isinstance(outcome, dict):
             manifest_gate_pass = str(outcome.get("deterministic_gate")) == "pass"
             manifest_risk_approved = outcome.get("risk_approved") is True
             manifest_intent_emitted = str(outcome.get("intent_status")) == "emitted"
             manifest_executed = str(outcome.get("paper_trade_execution_status")) == "executed"
+            manifest_self_critique_pass = outcome.get("self_critique_pass") is True
+            try:
+                manifest_decision_trace_entries = int(outcome.get("decision_trace_entries", 0))
+            except (TypeError, ValueError):
+                manifest_decision_trace_entries = 0
             checks["manifest:deterministic_gate_pass"] = manifest_gate_pass
             checks["manifest:risk_approved"] = manifest_risk_approved
             checks["manifest:intent_emitted"] = manifest_intent_emitted
             checks["manifest:execution_executed"] = manifest_executed
+            checks["manifest:self_critique_pass"] = manifest_self_critique_pass
+            checks["manifest:decision_trace_entries_positive"] = manifest_decision_trace_entries > 0
             if not manifest_gate_pass:
                 errors.append("manifest_gate_not_pass")
             if not manifest_risk_approved:
@@ -338,6 +468,10 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_intent_not_emitted")
             if not manifest_executed:
                 errors.append("manifest_execution_not_executed")
+            if not manifest_self_critique_pass:
+                errors.append("manifest_self_critique_not_pass")
+            if manifest_decision_trace_entries <= 0:
+                errors.append("manifest_decision_trace_entries_missing")
         else:
             checks["manifest:outcome_present"] = False
             errors.append("manifest_outcome_missing")

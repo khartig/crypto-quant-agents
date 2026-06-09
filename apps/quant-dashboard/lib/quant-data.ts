@@ -3,6 +3,10 @@ import path from "path";
 import type {
   AgentPlaneSummary,
   DashboardOverview,
+  ModelPerformanceSummary,
+  ModelTrainingRunSummary,
+  PaperTradeExecutionRow,
+  PaperTradePerformanceSummary,
   ReasonDetail,
   TriggerAlertRow,
   TriggerPredictionRow
@@ -106,6 +110,14 @@ function asNumber(value: unknown, fallback = 0): number {
 function asNullableNumber(value: unknown): number | null {
   const parsed = asNumber(value, Number.NaN);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeRecommendation(value: unknown): "buy" | "sell" | "hold" {
+  const normalized = String(value || "").toLowerCase();
+  if (normalized === "buy" || normalized === "sell" || normalized === "hold") {
+    return normalized;
+  }
+  return "hold";
 }
 function normalizeProbabilities(value: unknown): { buy: number; hold: number; sell: number } {
   const payload = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
@@ -292,12 +304,158 @@ async function loadLatestAgentPlane(root: string): Promise<AgentPlaneSummary | n
   };
 }
 
+async function loadModelPerformance(root: string, limit = 40): Promise<ModelPerformanceSummary> {
+  const base = path.join(root, "models", "trigger-models");
+  if (!(await pathExists(base))) {
+    return {
+      runCount: 0,
+      latestAccuracy: null,
+      rollingAccuracy: null,
+      latestModelPath: null,
+      runs: []
+    };
+  }
+
+  const files = await listFilesRecursive(base, (name) => name === "model.json", limit * 4);
+  const sorted = files.sort().reverse().slice(0, limit);
+  const runs: ModelTrainingRunSummary[] = [];
+
+  for (const modelPath of sorted) {
+    const parsed = await readJson(modelPath);
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const payload = parsed as Record<string, unknown>;
+    const metrics =
+      typeof payload.training_metrics === "object" && payload.training_metrics !== null
+        ? (payload.training_metrics as Record<string, unknown>)
+        : {};
+    runs.push({
+      id: modelPath,
+      createdAtUtc: String(payload.created_at_utc || ""),
+      exchange: String(payload.exchange || ""),
+      symbol: String(payload.symbol || ""),
+      timeframe: String(payload.timeframe || ""),
+      sampleCount: asNumber(metrics.sample_count, 0),
+      trainCount: asNumber(metrics.train_count, 0),
+      testCount: asNumber(metrics.test_count, 0),
+      accuracy: asNullableNumber(metrics.accuracy),
+      modelPath
+    });
+  }
+
+  runs.sort(
+    (left, right) => Date.parse(right.createdAtUtc || "") - Date.parse(left.createdAtUtc || "")
+  );
+
+  const accuracyValues = runs
+    .map((row) => row.accuracy)
+    .filter((value): value is number => value !== null && Number.isFinite(value));
+  const rollingAccuracy =
+    accuracyValues.length > 0
+      ? accuracyValues.reduce((total, value) => total + value, 0) / accuracyValues.length
+      : null;
+
+  return {
+    runCount: runs.length,
+    latestAccuracy: runs[0]?.accuracy ?? null,
+    rollingAccuracy,
+    latestModelPath: runs[0]?.modelPath ?? null,
+    runs
+  };
+}
+
+async function loadPaperTradingPerformance(
+  root: string,
+  limit = 240
+): Promise<PaperTradePerformanceSummary> {
+  const base = path.join(root, "paper-trading");
+  if (!(await pathExists(base))) {
+    return {
+      totalExecutions: 0,
+      executedCount: 0,
+      skippedCount: 0,
+      rejectedCount: 0,
+      totalNotionalUsd: 0,
+      totalFeesUsd: 0,
+      totalRealizedPnlDeltaUsd: 0,
+      winRate: null,
+      executions: []
+    };
+  }
+
+  const files = await listFilesRecursive(
+    base,
+    (name) => name.startsWith("paper_trade_execution_") && name.endsWith(".json"),
+    limit * 3
+  );
+  const sorted = files.sort().reverse().slice(0, limit);
+  const executions: PaperTradeExecutionRow[] = [];
+
+  for (const executionRecordPath of sorted) {
+    const parsed = await readJson(executionRecordPath);
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const payload = parsed as Record<string, unknown>;
+    const executionStatusRaw = String(payload.execution_status || "skipped").toLowerCase();
+    const executionStatus: "executed" | "rejected" | "skipped" =
+      executionStatusRaw === "executed" || executionStatusRaw === "rejected" || executionStatusRaw === "skipped"
+        ? (executionStatusRaw as "executed" | "rejected" | "skipped")
+        : "skipped";
+    executions.push({
+      id: executionRecordPath,
+      createdAtUtc: String(payload.created_at_utc || ""),
+      exchange: String(payload.exchange || ""),
+      symbol: String(payload.symbol || ""),
+      timeframe: String(payload.timeframe || ""),
+      intentAction: normalizeRecommendation(payload.intent_action),
+      executedAction: normalizeRecommendation(payload.executed_action),
+      executionStatus,
+      executedNotionalUsd: asNumber(payload.executed_notional_usd, 0),
+      feeUsd: asNumber(payload.fee_usd, 0),
+      realizedPnlDeltaUsd: asNumber(payload.realized_pnl_delta_usd, 0),
+      cashAfterUsd: asNullableNumber(payload.cash_after_usd),
+      reason: String(payload.reason || ""),
+      executionRecordPath
+    });
+  }
+
+  executions.sort(
+    (left, right) => Date.parse(right.createdAtUtc || "") - Date.parse(left.createdAtUtc || "")
+  );
+
+  const executedRows = executions.filter((row) => row.executionStatus === "executed");
+  const totalNotionalUsd = executedRows.reduce((total, row) => total + row.executedNotionalUsd, 0);
+  const totalFeesUsd = executedRows.reduce((total, row) => total + row.feeUsd, 0);
+  const totalRealizedPnlDeltaUsd = executedRows.reduce(
+    (total, row) => total + row.realizedPnlDeltaUsd,
+    0
+  );
+  const winningRows = executedRows.filter((row) => row.realizedPnlDeltaUsd > 0).length;
+  const winRate = executedRows.length > 0 ? winningRows / executedRows.length : null;
+
+  return {
+    totalExecutions: executions.length,
+    executedCount: executedRows.length,
+    skippedCount: executions.filter((row) => row.executionStatus === "skipped").length,
+    rejectedCount: executions.filter((row) => row.executionStatus === "rejected").length,
+    totalNotionalUsd,
+    totalFeesUsd,
+    totalRealizedPnlDeltaUsd,
+    winRate,
+    executions
+  };
+}
+
 export async function loadDashboardOverview(): Promise<DashboardOverview> {
   const root = quantDataRoot();
-  const [predictions, alerts, latestAgentPlane] = await Promise.all([
+  const [predictions, alerts, latestAgentPlane, modelPerformance, paperTradingPerformance] = await Promise.all([
     loadPredictions(root, 200),
     loadAlerts(root, 200),
-    loadLatestAgentPlane(root)
+    loadLatestAgentPlane(root),
+    loadModelPerformance(root, 40),
+    loadPaperTradingPerformance(root, 240)
   ]);
 
   return {
@@ -305,6 +463,10 @@ export async function loadDashboardOverview(): Promise<DashboardOverview> {
     quantDataRoot: root,
     predictions,
     alerts,
-    latestAgentPlane
+    latestAgentPlane,
+    performance: {
+      model: modelPerformance,
+      paperTrading: paperTradingPerformance
+    }
   };
 }

@@ -43,6 +43,9 @@ class Settings:
     calibration_confidence_floor: float
     calibration_confidence_ceiling: float
     calibration_max_contradictions: int
+    self_critique_min_score: float
+    self_critique_max_findings: int
+    ops_report_verbosity: str
     paper_trade_notional_usd: float
     paper_trade_starting_cash_usd: float
     paper_trade_fee_bps: float
@@ -77,6 +80,14 @@ def _as_int(value: str | None, default: int) -> int:
         return int(value.strip())
     except ValueError:
         return default
+
+def _as_report_verbosity(value: str | None, default: str = "standard") -> str:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"compact", "standard", "verbose"}:
+        return normalized
+    return default
 
 
 def _as_float(value: str | None, default: float) -> float:
@@ -147,6 +158,21 @@ def load_settings() -> Settings:
         calibration_max_contradictions=max(
             0,
             _as_int(os.getenv("CALIBRATION_MAX_CONTRADICTIONS"), default=0),
+        ),
+        self_critique_min_score=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("SELF_CRITIQUE_MIN_SCORE"), default=0.55),
+            ),
+        ),
+        self_critique_max_findings=max(
+            1,
+            _as_int(os.getenv("SELF_CRITIQUE_MAX_FINDINGS"), default=6),
+        ),
+        ops_report_verbosity=_as_report_verbosity(
+            os.getenv("OPS_REPORT_VERBOSITY"),
+            default="standard",
         ),
         paper_trade_notional_usd=_as_float(os.getenv("PAPER_TRADE_NOTIONAL_USD"), default=100.0),
         paper_trade_starting_cash_usd=max(

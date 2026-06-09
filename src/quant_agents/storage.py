@@ -60,10 +60,17 @@ def latest_raw_dataset(root: Path, exchange: str, symbol: str, timeframe: str) -
 
 
 def new_backtest_run_dir(root: Path, strategy_name: str) -> Path:
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = root / "backtests" / strategy_name / run_id
-    path.mkdir(parents=True, exist_ok=False)
-    return path
+    base_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base_dir = root / "backtests" / strategy_name
+    base_dir.mkdir(parents=True, exist_ok=True)
+    for suffix in range(100):
+        run_id = base_run_id if suffix == 0 else f"{base_run_id}_{suffix:02d}"
+        path = base_dir / run_id
+        if path.exists():
+            continue
+        path.mkdir(parents=True, exist_ok=False)
+        return path
+    raise RuntimeError(f"Unable to allocate unique backtest run directory under {base_dir}")
 
 
 def latest_backtest_run_dir(root: Path, strategy_name: str) -> Path:

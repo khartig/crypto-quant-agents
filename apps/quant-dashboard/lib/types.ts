@@ -73,6 +73,60 @@ export interface AgentPlaneSummary {
   paperExecutionStatus: string;
   runManifestPath: string;
 }
+export interface ModelTrainingRunSummary {
+  id: string;
+  createdAtUtc: string;
+  exchange: string;
+  symbol: string;
+  timeframe: string;
+  sampleCount: number;
+  trainCount: number;
+  testCount: number;
+  accuracy: number | null;
+  modelPath: string;
+}
+
+export interface ModelPerformanceSummary {
+  runCount: number;
+  latestAccuracy: number | null;
+  rollingAccuracy: number | null;
+  latestModelPath: string | null;
+  runs: ModelTrainingRunSummary[];
+}
+
+export interface PaperTradeExecutionRow {
+  id: string;
+  createdAtUtc: string;
+  exchange: string;
+  symbol: string;
+  timeframe: string;
+  intentAction: Recommendation;
+  executedAction: Recommendation;
+  executionStatus: "executed" | "skipped" | "rejected";
+  executedNotionalUsd: number;
+  feeUsd: number;
+  realizedPnlDeltaUsd: number;
+  cashAfterUsd: number | null;
+  reason: string;
+  executionRecordPath: string;
+}
+
+export interface PaperTradePerformanceSummary {
+  totalExecutions: number;
+  executedCount: number;
+  skippedCount: number;
+  rejectedCount: number;
+  totalNotionalUsd: number;
+  totalFeesUsd: number;
+  totalRealizedPnlDeltaUsd: number;
+  winRate: number | null;
+  executions: PaperTradeExecutionRow[];
+}
+
+export interface PerformanceOverview {
+  model: ModelPerformanceSummary;
+  paperTrading: PaperTradePerformanceSummary;
+}
 
 export interface DashboardOverview {
   generatedAtUtc: string;
@@ -80,4 +134,5 @@ export interface DashboardOverview {
   predictions: TriggerPredictionRow[];
   alerts: TriggerAlertRow[];
   latestAgentPlane: AgentPlaneSummary | null;
+  performance: PerformanceOverview;
 }

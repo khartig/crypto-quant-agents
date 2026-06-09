@@ -204,6 +204,24 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Phase 2: maximum allowed contradiction events before risk block.",
     )
     agent_plane.add_argument(
+        "--self-critique-min-score",
+        type=float,
+        default=None,
+        help="Phase 3: minimum self-critique score required before final risk approval.",
+    )
+    agent_plane.add_argument(
+        "--self-critique-max-findings",
+        type=int,
+        default=None,
+        help="Phase 3: maximum findings retained in the self-critique artifact.",
+    )
+    agent_plane.add_argument(
+        "--ops-report-verbosity",
+        choices=["compact", "standard", "verbose"],
+        default=None,
+        help="Phase 3: deterministic ops report detail level.",
+    )
+    agent_plane.add_argument(
         "--paper-notional-usd",
         type=float,
         default=None,
@@ -713,6 +731,26 @@ def main(argv: list[str] | None = None) -> None:
                 args.calibration_max_contradictions
                 if args.calibration_max_contradictions is not None
                 else settings.calibration_max_contradictions,
+            ),
+            self_critique_min_score=min(
+                1.0,
+                max(
+                    0.0,
+                    args.self_critique_min_score
+                    if args.self_critique_min_score is not None
+                    else settings.self_critique_min_score,
+                ),
+            ),
+            self_critique_max_findings=max(
+                1,
+                args.self_critique_max_findings
+                if args.self_critique_max_findings is not None
+                else settings.self_critique_max_findings,
+            ),
+            ops_report_verbosity=(
+                args.ops_report_verbosity
+                if args.ops_report_verbosity is not None
+                else settings.ops_report_verbosity
             ),
             source_data_path=source_file,
         )

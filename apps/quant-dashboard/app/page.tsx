@@ -117,6 +117,13 @@ function formatNumber(value: number | null | undefined, digits = 4): string {
   return value.toFixed(digits);
 }
 
+function formatPercent(value: number | null | undefined, digits = 2): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "n/a";
+  }
+  return `${(value * 100).toFixed(digits)}%`;
+}
+
 function renderPredictionShape(props: any) {
   const { cx, cy, payload } = props;
   if (typeof cx !== "number" || typeof cy !== "number" || !payload) {
@@ -168,6 +175,7 @@ export default function HomePage() {
   const [pricePanelHeight, setPricePanelHeight] = useState(330);
   const [oscillatorPanelHeight, setOscillatorPanelHeight] = useState(220);
   const [selectedDatum, setSelectedDatum] = useState<SelectedDatum>(null);
+  const [activeTab, setActiveTab] = useState<"signals" | "performance">("signals");
   const [zoomDomain, setZoomDomain] = useState<[number, number] | null>(null);
   const [isDragPanning, setIsDragPanning] = useState(false);
   const chartStackRef = useRef<HTMLDivElement | null>(null);
@@ -232,6 +240,10 @@ export default function HomePage() {
     (row) => row.recommendation === "buy" || row.recommendation === "sell"
   );
   const highConfidence = filteredPredictions.filter((row) => row.confidence >= 0.7);
+  const modelPerformance = data?.performance.model;
+  const paperTradingPerformance = data?.performance.paperTrading;
+  const recentModelRuns = modelPerformance?.runs.slice(0, 12) || [];
+  const recentExecutions = paperTradingPerformance?.executions.slice(0, 20) || [];
 
   const chartPoints = useMemo<ChartPoint[]>(() => {
     return filteredPredictions
@@ -540,6 +552,26 @@ export default function HomePage() {
           <p>{error}</p>
         </section>
       ) : null}
+
+      <section className="button-row tab-row">
+        <button
+          type="button"
+          className={`toggle-btn large ${activeTab === "signals" ? "active" : ""}`}
+          onClick={() => setActiveTab("signals")}
+        >
+          Signals & Markers
+        </button>
+        <button
+          type="button"
+          className={`toggle-btn large ${activeTab === "performance" ? "active" : ""}`}
+          onClick={() => setActiveTab("performance")}
+        >
+          Model & Trade Performance
+        </button>
+      </section>
+
+      {activeTab === "signals" ? (
+        <>
 
       <section className="button-row">
         <button
@@ -982,6 +1014,127 @@ export default function HomePage() {
           </div>
         )}
       </section>
+        </>
+      ) : (
+        <>
+          <section className="cards">
+            <article className="card">
+              <div className="label">Model runs tracked</div>
+              <div className="value">{modelPerformance?.runCount ?? 0}</div>
+            </article>
+            <article className="card">
+              <div className="label">Latest model accuracy</div>
+              <div className="value">{formatPercent(modelPerformance?.latestAccuracy, 2)}</div>
+            </article>
+            <article className="card">
+              <div className="label">Rolling model accuracy</div>
+              <div className="value">{formatPercent(modelPerformance?.rollingAccuracy, 2)}</div>
+            </article>
+            <article className="card">
+              <div className="label">Executed paper trades</div>
+              <div className="value">{paperTradingPerformance?.executedCount ?? 0}</div>
+            </article>
+            <article className="card">
+              <div className="label">Paper trade win rate</div>
+              <div className="value">{formatPercent(paperTradingPerformance?.winRate, 1)}</div>
+            </article>
+            <article className="card">
+              <div className="label">Realized PnL delta (USD)</div>
+              <div className="value">{formatNumber(paperTradingPerformance?.totalRealizedPnlDeltaUsd, 2)}</div>
+            </article>
+            <article className="card">
+              <div className="label">Executed notional (USD)</div>
+              <div className="value">{formatNumber(paperTradingPerformance?.totalNotionalUsd, 2)}</div>
+            </article>
+            <article className="card">
+              <div className="label">Fees paid (USD)</div>
+              <div className="value">{formatNumber(paperTradingPerformance?.totalFeesUsd, 2)}</div>
+            </article>
+          </section>
+
+          <section className="section">
+            <h2>Model training performance</h2>
+            {!recentModelRuns.length ? (
+              <p className="muted">
+                No model training artifacts found yet under the trigger-model output path.
+              </p>
+            ) : (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Created (UTC)</th>
+                    <th>Exchange</th>
+                    <th>Symbol</th>
+                    <th>Timeframe</th>
+                    <th>Samples</th>
+                    <th>Train/Test</th>
+                    <th>Accuracy</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recentModelRuns.map((row) => (
+                    <tr key={row.id}>
+                      <td>{row.createdAtUtc || "n/a"}</td>
+                      <td>{row.exchange || "n/a"}</td>
+                      <td>{row.symbol || "n/a"}</td>
+                      <td>{row.timeframe || "n/a"}</td>
+                      <td>{row.sampleCount}</td>
+                      <td>
+                        {row.trainCount}/{row.testCount}
+                      </td>
+                      <td>{formatPercent(row.accuracy, 2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
+
+          <section className="section">
+            <h2>Paper execution performance</h2>
+            {!recentExecutions.length ? (
+              <p className="muted">
+                No paper execution records found yet. Run `quant-agents agent-plane` to emit executions.
+              </p>
+            ) : (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Created (UTC)</th>
+                    <th>Status</th>
+                    <th>Intent</th>
+                    <th>Executed</th>
+                    <th>Notional USD</th>
+                    <th>Fee USD</th>
+                    <th>PnL Δ USD</th>
+                    <th>Cash After USD</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recentExecutions.map((row) => (
+                    <tr key={row.id}>
+                      <td>{row.createdAtUtc || "n/a"}</td>
+                      <td>{row.executionStatus}</td>
+                      <td>
+                        <span className={`pill ${row.intentAction}`}>{row.intentAction}</span>
+                      </td>
+                      <td>
+                        <span className={`pill ${row.executedAction}`}>{row.executedAction}</span>
+                      </td>
+                      <td>{formatNumber(row.executedNotionalUsd, 2)}</td>
+                      <td>{formatNumber(row.feeUsd, 4)}</td>
+                      <td>{formatNumber(row.realizedPnlDeltaUsd, 4)}</td>
+                      <td>{formatNumber(row.cashAfterUsd, 2)}</td>
+                      <td>{row.reason || "n/a"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
+        </>
+      )}
     </main>
   );
 }

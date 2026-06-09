@@ -19,3 +19,10 @@ Risk decision artifacts expose walk-forward metrics and penalized confidence as 
 Historical replays of the same input data produce identical calibration outputs and gating outcomes.
 ## Dependencies and sequencing
 Phase 1 feature outputs and regime labels are required inputs for robust calibration logic; Phase 2 should begin after Phase 1 contracts and feature snapshot formats are stable.
+## Completion verification status
+Phase 2 commitments are implemented and now verified by `scripts/verify_phase2_completion.py`, which runs deterministic synthetic scenarios and validates contradiction behavior, calibration payload semantics, and replay determinism.
+Walk-forward evaluation and aggregation artifacts are emitted from `src/quant_agents/agent_plane.py` (`walkforward_evaluation.v1`) and persisted in run manifests.
+Confidence calibration with walk-forward quality reconciliation is implemented in `_calibrate_confidence(...)` with quality-band policies, contradiction flags/severity, and calibrated confidence output.
+Risk gating consumes both aggregate backtest metrics and calibrated confidence / walk-forward diagnostics through `RiskDecision.observed` fields and reason-code mapping in `run_agent_plane(...)`.
+Configuration and CLI controls for walk-forward calibration strictness are available in `src/quant_agents/config.py` and `src/quant_agents/cli.py` under the `quant-agents agent-plane` command.
+Calibration diagnostics (`reliability_bins`, `confidence_deciles`, contradiction counters) are persisted in the `confidence_calibration` artifact and surfaced in run contracts/manifests.
