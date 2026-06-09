@@ -10,7 +10,7 @@ Implement a walk-forward backtest engine that runs rolling train/validate window
 Add a confidence-calibration module that computes posterior confidence from indicator agreement strength, detected regime, and walk-forward quality metrics rather than relying on model-native confidence alone.
 Define an explicit contradiction policy: if actionable direction is `buy`/`sell` while walk-forward Sharpe (or equivalent quality score) is below threshold, auto-downgrade confidence, add reason codes (for example `walkforward_sharpe_below_threshold`), and annotate rationale with the conflict.
 Refactor risk gating to evaluate both raw and penalized confidence, and to consume walk-forward metrics alongside aggregate backtest metrics (`src/quant_agents/agent_plane.py:624`).
-Extend configuration/CLI to include walk-forward calibration controls (window sizes, minimum walk-forward Sharpe, maximum contradiction allowance, calibration floor/ceiling), exposed through `quant-phase1 agent-plane` (`src/quant_agents/cli.py:95`, `src/quant_agents/cli.py:395`).
+Extend configuration/CLI to include walk-forward calibration controls (window sizes, minimum walk-forward Sharpe, maximum contradiction allowance, calibration floor/ceiling), exposed through `quant-agents agent-plane` (`src/quant_agents/cli.py:95`, `src/quant_agents/cli.py:395`).
 Persist calibration diagnostics (reliability bins, confidence deciles vs realized return, contradiction counts) as run artifacts so ops can audit confidence behavior over time.
 ## Validation and exit criteria
 When walk-forward quality is below threshold, actionable signals are either downgraded to low confidence or blocked, and reason codes clearly identify the downgrade path.

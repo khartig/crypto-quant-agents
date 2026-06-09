@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 def _base_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="quant-phase1",
-        description="Phase 1 deterministic crypto quant pipeline.",
+        prog="quant-agents",
+        description="Deterministic crypto quant pipeline.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -88,7 +88,7 @@ def run_doctor(settings: Settings, require_secrets: bool = False) -> DoctorRepor
 
 def format_doctor_report(report: DoctorReport, settings: Settings) -> str:
     lines = [
-        "quant-phase1 doctor",
+        "quant-agents doctor",
         f"overall={'PASS' if report.ok else 'FAIL'}",
         "",
         "checks:",

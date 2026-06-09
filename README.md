@@ -137,54 +137,54 @@ Key environment variables (see `.env.example`):
   - `PAPER_ACCOUNT_API_KEY`, `PAPER_ACCOUNT_API_SECRET`, `PAPER_ACCOUNT_API_PASSPHRASE`
 
 ## Commands
-Note: the main CLI command name is currently `quant-phase1` for compatibility.
+The main CLI command is `quant-agents`.
 
 ### Health and preflight
 ```bash path=null start=null
-quant-phase1 doctor
-quant-phase1 doctor --require-secrets
+quant-agents doctor
+quant-agents doctor --require-secrets
 ```
 
 ### Data and backtesting
 ```bash path=null start=null
-quant-phase1 ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000
-quant-phase1 backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --fast-window 20 --slow-window 50
-quant-phase1 backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --input-file /mnt/quant-data/raw/exchange=kraken/symbol=BTC-USDT/interval=1h/year=2026/month=06/ohlcv_YYYYMMDDTHHMMSSZ.parquet
-quant-phase1 archive-backtest --strategy sma_crossover
+quant-agents ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000
+quant-agents backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --fast-window 20 --slow-window 50
+quant-agents backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --input-file /mnt/quant-data/raw/exchange=kraken/symbol=BTC-USDT/interval=1h/year=2026/month=06/ohlcv_YYYYMMDDTHHMMSSZ.parquet
+quant-agents archive-backtest --strategy sma_crossover
 ```
 
 ### Reporting and daily workflow
 ```bash path=null start=null
-quant-phase1 report --exchange kraken --symbol BTC/USDT --timeframe 1h
-quant-phase1 run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000
-quant-phase1 run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000 --archive-backtest
+quant-agents report --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000
+quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000 --archive-backtest
 ```
 
 ### Full orchestration run
 ```bash path=null start=null
-quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
-quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
-quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5
 ```
 
 ### Paper-account connectivity checks
 ```bash path=null start=null
-quant-phase1 paper-account-check
-PAPER_ACCOUNT_PROVIDER=ccxt PAPER_ACCOUNT_EXCHANGE=binance PAPER_ACCOUNT_SANDBOX=1 PAPER_ACCOUNT_API_KEY={{PAPER_ACCOUNT_API_KEY}} PAPER_ACCOUNT_API_SECRET={{PAPER_ACCOUNT_API_SECRET}} quant-phase1 paper-account-check
+quant-agents paper-account-check
+PAPER_ACCOUNT_PROVIDER=ccxt PAPER_ACCOUNT_EXCHANGE=binance PAPER_ACCOUNT_SANDBOX=1 PAPER_ACCOUNT_API_KEY={{PAPER_ACCOUNT_API_KEY}} PAPER_ACCOUNT_API_SECRET={{PAPER_ACCOUNT_API_SECRET}} quant-agents paper-account-check
 ```
 
 ### Visualization
 ```bash path=null start=null
-quant-phase1 visualize-run
-quant-phase1 visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z --output-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z/visuals
+quant-agents visualize-run
+quant-agents visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z --output-dir /mnt/quant-data/logs/agents/openclaw-orchestrator/2026-06-05/20260605T024447Z/visuals
 ```
 
 ### Trigger model and continuous monitoring
 ```bash path=null start=null
-quant-phase1 train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
-quant-phase1 predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
-quant-phase1 monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
-quant-phase1 monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
+quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
+quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
 ```
 
@@ -214,8 +214,8 @@ Then open `http://localhost:3000` and use the dashboard to:
 If chart markers are clustered from old development data, use this refresh sequence:
 ```bash path=null start=null
 systemctl --user stop quant-trigger-monitor.service
-quant-phase1 ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1500
-quant-phase1 train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-agents ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1500
+quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60 --clear-existing
 systemctl --user daemon-reload
 systemctl --user restart quant-trigger-monitor.service

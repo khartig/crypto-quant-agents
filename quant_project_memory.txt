@@ -57,7 +57,7 @@ Milestone 4 memory (agent plane)
   - src/quant_agents/cli.py
   - src/quant_agents/backtest.py
 - New command:
-  - quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
+  - quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 - Deterministic contract artifacts written per run:
   - data_quality_signal.json
   - strategy_proposal_signal.json
@@ -94,7 +94,7 @@ Operational updates (2026-06-05)
 
 - Visual evaluation command added:
   - New CLI command:
-    - quant-phase1 visualize-run
+    - quant-agents visualize-run
   - Optional flags:
     - --run-dir <agent-plane run path>
     - --output-dir <custom output path>
@@ -114,11 +114,11 @@ Quick start checklist (daily/operator use)
    - ollama list
    - confirm llama3.1:8b is present
 4) Ingest fresh market data (example)
-   - quant-phase1 ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 300
+   - quant-agents ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 300
 5) Run agent plane with stable timeout (example)
-   - OLLAMA_TIMEOUT_SECONDS=180 quant-phase1 agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --strategy-model llama3.1:8b --ops-model llama3.1:8b
+   - OLLAMA_TIMEOUT_SECONDS=180 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --strategy-model llama3.1:8b --ops-model llama3.1:8b
 6) Generate visual diagnostics
-   - quant-phase1 visualize-run
+   - quant-agents visualize-run
 7) Review outputs in the latest run directory
    - strategy_proposal_signal.json
    - backtest_evaluation.json
@@ -163,7 +163,7 @@ Latest project updates (2026-06-05 to 2026-06-06)
   - New module:
     - src/quant_agents/paper_account.py
   - New CLI command:
-    - quant-phase1 paper-account-check
+    - quant-agents paper-account-check
   - Supported providers:
     - tradingview (reachability + explicit unsupported direct paper-account API note)
     - ccxt (authenticated exchange/testnet probe path)
@@ -208,7 +208,7 @@ Latest project updates (2026-06-07)
 - Clustered data remediation + fresh dataset regeneration:
   - Stopped user service and reset BTC trigger-specific raw/model/log artifacts under `/mnt/quant-data`.
   - Pulled fresh 1h dataset:
-    - quant-phase1 ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1500
+    - quant-agents ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1500
     - observed 721 rows written in latest ingest artifact.
   - Retrained 1h trigger model:
     - /mnt/quant-data/models/trigger-models/exchange=kraken/symbol=BTC-USDT/interval=1h/20260608T001754Z/model.json

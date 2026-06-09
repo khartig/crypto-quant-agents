@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-quant-phase1 = "quant_agents.cli:main"
+quant-agents = "quant_agents.cli:main"
 quant-openclaw-entrypoint = "quant_agents.openclaw_native:main"
 
 [tool.setuptools]
