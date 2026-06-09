@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Literal, TypeVar
+import numpy as np
 
 import pandas as pd
 
@@ -54,6 +56,14 @@ class AgentPlaneConfig:
     paper_starting_cash_usd: float
     paper_fee_bps: float
     minimum_bars: int
+    walk_forward_train_bars: int = 240
+    walk_forward_validate_bars: int = 72
+    walk_forward_step_bars: int = 72
+    walk_forward_min_windows: int = 3
+    calibration_min_walkforward_sharpe: float = 0.10
+    calibration_confidence_floor: float = 0.05
+    calibration_confidence_ceiling: float = 0.95
+    calibration_max_contradictions: int = 0
     source_data_path: Path | None = None
 
 
@@ -77,6 +87,9 @@ class AgentPlaneRunResult:
     data_quality_path: Path
     strategy_signal_path: Path
     backtest_evaluation_path: Path
+    phase1_feature_context_path: Path
+    walkforward_evaluation_path: Path
+    confidence_calibration_path: Path
     risk_decision_path: Path
     paper_trade_intent_path: Path
     paper_trade_execution_path: Path
@@ -306,12 +319,621 @@ def _market_snapshot(frame: pd.DataFrame) -> dict[str, float | int | str]:
     }
 
 
+def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
+def _normalize_probability_votes(votes: dict[str, float]) -> dict[str, float]:
+    clean = {
+        "buy": max(0.0, float(votes.get("buy", 0.0))),
+        "sell": max(0.0, float(votes.get("sell", 0.0))),
+        "hold": max(0.0, float(votes.get("hold", 0.0))),
+    }
+    total = clean["buy"] + clean["sell"] + clean["hold"]
+    if total <= 0:
+        return {"buy": 0.0, "sell": 0.0, "hold": 1.0}
+    return {key: float(value / total) for key, value in clean.items()}
+
+
+def _compute_phase1_feature_context(frame: pd.DataFrame) -> dict[str, Any]:
+    close = pd.to_numeric(frame.get("close"), errors="coerce").ffill().bfill()
+    high = pd.to_numeric(frame.get("high"), errors="coerce").ffill().bfill()
+    low = pd.to_numeric(frame.get("low"), errors="coerce").ffill().bfill()
+    volume = pd.to_numeric(frame.get("volume"), errors="coerce").ffill().bfill()
+    if close.empty or close.isna().all():
+        raise RuntimeError("Cannot compute phase-1 feature context without usable close prices.")
+
+    returns = close.pct_change()
+    sma_fast = close.rolling(window=20, min_periods=5).mean()
+    sma_slow = close.rolling(window=50, min_periods=10).mean()
+    ema_fast = close.ewm(span=12, adjust=False).mean()
+    ema_slow = close.ewm(span=26, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    volatility_48 = returns.rolling(window=48, min_periods=10).std(ddof=0)
+    rsi_14 = _compute_rsi(close, period=14)
+    bb_mid = close.rolling(window=20, min_periods=5).mean()
+    bb_std = close.rolling(window=20, min_periods=5).std(ddof=0).fillna(0.0)
+    bb_upper = bb_mid + (2.0 * bb_std)
+    bb_lower = bb_mid - (2.0 * bb_std)
+    hl_range_14 = ((high - low) / close.replace(0.0, np.nan)).rolling(window=14, min_periods=5).mean()
+    volume_mean = volume.rolling(window=24, min_periods=5).mean().replace(0.0, np.nan)
+    volume_zscore_24 = ((volume - volume_mean) / volume_mean).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    latest_close = float(close.iloc[-1])
+    latest_sma_fast = float(sma_fast.iloc[-1]) if pd.notna(sma_fast.iloc[-1]) else latest_close
+    latest_sma_slow = float(sma_slow.iloc[-1]) if pd.notna(sma_slow.iloc[-1]) else latest_close
+    latest_macd = float(macd.iloc[-1]) if pd.notna(macd.iloc[-1]) else 0.0
+    latest_macd_signal = float(macd_signal.iloc[-1]) if pd.notna(macd_signal.iloc[-1]) else 0.0
+    latest_macd_hist = float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else 0.0
+    latest_rsi = float(rsi_14.iloc[-1]) if pd.notna(rsi_14.iloc[-1]) else 50.0
+    latest_volatility = float(volatility_48.iloc[-1]) if pd.notna(volatility_48.iloc[-1]) else 0.0
+    latest_bb_upper = float(bb_upper.iloc[-1]) if pd.notna(bb_upper.iloc[-1]) else latest_close
+    latest_bb_lower = float(bb_lower.iloc[-1]) if pd.notna(bb_lower.iloc[-1]) else latest_close
+    latest_hl_range = float(hl_range_14.iloc[-1]) if pd.notna(hl_range_14.iloc[-1]) else 0.0
+    latest_volume_zscore = (
+        float(volume_zscore_24.iloc[-1]) if pd.notna(volume_zscore_24.iloc[-1]) else 0.0
+    )
+
+    trend_spread = abs((latest_sma_fast / max(latest_sma_slow, 1e-9)) - 1.0)
+    if latest_volatility >= 0.03:
+        regime = "volatile"
+    elif trend_spread >= 0.01 and latest_macd >= 0:
+        regime = "bull_trend"
+    elif trend_spread >= 0.01 and latest_macd < 0:
+        regime = "bear_trend"
+    else:
+        regime = "range_bound"
+
+    vote_counts = {"buy": 0.0, "sell": 0.0, "hold": 0.0}
+    reason_codes: list[str] = []
+    if latest_rsi <= 35:
+        vote_counts["buy"] += 1.0
+        reason_codes.append("rsi_supports_buy")
+    elif latest_rsi >= 65:
+        vote_counts["sell"] += 1.0
+        reason_codes.append("rsi_supports_sell")
+    else:
+        vote_counts["hold"] += 0.5
+        reason_codes.append("rsi_neutral")
+
+    if latest_macd_hist > 0:
+        vote_counts["buy"] += 1.0
+        reason_codes.append("macd_hist_positive")
+    elif latest_macd_hist < 0:
+        vote_counts["sell"] += 1.0
+        reason_codes.append("macd_hist_negative")
+    else:
+        vote_counts["hold"] += 0.5
+        reason_codes.append("macd_hist_flat")
+
+    if latest_sma_fast > latest_sma_slow:
+        vote_counts["buy"] += 1.0
+        reason_codes.append("sma_fast_above_slow")
+    elif latest_sma_fast < latest_sma_slow:
+        vote_counts["sell"] += 1.0
+        reason_codes.append("sma_fast_below_slow")
+    else:
+        vote_counts["hold"] += 0.5
+        reason_codes.append("sma_spread_flat")
+
+    if latest_close >= latest_bb_upper:
+        vote_counts["sell"] += 0.75
+        reason_codes.append("price_above_upper_band")
+    elif latest_close <= latest_bb_lower:
+        vote_counts["buy"] += 0.75
+        reason_codes.append("price_below_lower_band")
+    else:
+        vote_counts["hold"] += 0.5
+        reason_codes.append("price_inside_bands")
+
+    if regime == "volatile":
+        vote_counts["hold"] += 0.75
+        reason_codes.append("regime_volatile")
+    else:
+        reason_codes.append(f"regime_{regime}")
+
+    indicator_votes = _normalize_probability_votes(vote_counts)
+    feature_snapshot: dict[str, float | int | str | bool] = {
+        "close": latest_close,
+        "sma_fast": latest_sma_fast,
+        "sma_slow": latest_sma_slow,
+        "sma_fast_spread": (latest_close / max(latest_sma_fast, 1e-9)) - 1.0,
+        "sma_slow_spread": (latest_close / max(latest_sma_slow, 1e-9)) - 1.0,
+        "macd": latest_macd,
+        "macd_signal": latest_macd_signal,
+        "macd_hist": latest_macd_hist,
+        "rsi_14": latest_rsi,
+        "volatility_48": latest_volatility,
+        "bb_upper": latest_bb_upper,
+        "bb_lower": latest_bb_lower,
+        "hl_range_14": latest_hl_range,
+        "volume_zscore_24": latest_volume_zscore,
+    }
+    return {
+        "regime": regime,
+        "indicator_votes": indicator_votes,
+        "feature_snapshot": feature_snapshot,
+        "reason_codes": sorted(set(reason_codes)),
+    }
+
+
+def _normalize_indicator_votes(value: Any, fallback: dict[str, float]) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return fallback
+    parsed: dict[str, float] = {}
+    for key in ("buy", "sell", "hold"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        try:
+            parsed[key] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return fallback
+    return _normalize_probability_votes(parsed)
+
+
+def _normalize_regime(value: Any, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    normalized = value.strip().lower().replace(" ", "_")
+    if not normalized:
+        return fallback
+    return normalized
+
+
+def _normalize_feature_snapshot(
+    value: Any,
+    fallback: dict[str, float | int | str | bool],
+) -> dict[str, float | int | str | bool]:
+    if not isinstance(value, dict):
+        return fallback
+    normalized: dict[str, float | int | str | bool] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(raw, bool):
+            normalized[key] = raw
+            continue
+        if isinstance(raw, (int, float)):
+            normalized[key] = float(raw)
+            continue
+        if isinstance(raw, str):
+            trimmed = raw.strip()
+            if not trimmed:
+                continue
+            try:
+                normalized[key] = float(trimmed)
+            except ValueError:
+                normalized[key] = trimmed
+    return normalized or fallback
+
+
+def _normalize_reason_codes(value: Any, fallback: list[str]) -> list[str]:
+    if not isinstance(value, list):
+        return sorted(set(fallback))
+    codes = [str(item).strip().lower().replace(" ", "_") for item in value if str(item).strip()]
+    merged = sorted(set([*fallback, *codes]))
+    return merged
+
+
+def _periods_per_year(timeframe: str) -> int:
+    mapping = {
+        "1m": 525600,
+        "5m": 105120,
+        "15m": 35040,
+        "1h": 8760,
+        "4h": 2190,
+        "1d": 365,
+    }
+    return mapping.get(timeframe, 365)
+
+
+def _walkforward_quality_score(
+    *,
+    total_return: float,
+    sharpe: float,
+    max_drawdown: float,
+    hit_rate: float,
+) -> float:
+    sharpe_score = (math.tanh(sharpe / 2.0) + 1.0) / 2.0
+    return_score = float(np.clip((total_return + 0.05) / 0.20, 0.0, 1.0))
+    drawdown_score = float(np.clip(1.0 - abs(min(0.0, max_drawdown)) / 0.40, 0.0, 1.0))
+    hit_rate_score = float(np.clip(hit_rate, 0.0, 1.0))
+    quality = (
+        (0.35 * sharpe_score)
+        + (0.30 * return_score)
+        + (0.20 * drawdown_score)
+        + (0.15 * hit_rate_score)
+    )
+    return float(np.clip(quality, 0.0, 1.0))
+
+
+def _build_walkforward_diagnostics(window_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    confidence_rows = [
+        (
+            float(np.clip(row.get("quality_score", 0.0), 0.0, 1.0)),
+            float(row.get("total_return", 0.0)),
+        )
+        for row in window_rows
+    ]
+    reliability_bins: list[dict[str, Any]] = []
+    for index in range(5):
+        lower = index / 5.0
+        upper = (index + 1) / 5.0
+        if index == 4:
+            selected = [pair for pair in confidence_rows if lower <= pair[0] <= upper]
+        else:
+            selected = [pair for pair in confidence_rows if lower <= pair[0] < upper]
+        if selected:
+            avg_conf = float(np.mean([pair[0] for pair in selected]))
+            avg_return = float(np.mean([pair[1] for pair in selected]))
+            positive_rate = float(np.mean([1.0 if pair[1] > 0 else 0.0 for pair in selected]))
+        else:
+            avg_conf = 0.0
+            avg_return = 0.0
+            positive_rate = 0.0
+        reliability_bins.append(
+            {
+                "bin": f"{lower:.1f}-{upper:.1f}",
+                "count": len(selected),
+                "avg_confidence": avg_conf,
+                "avg_return": avg_return,
+                "positive_rate": positive_rate,
+            }
+        )
+
+    sorted_rows = sorted(confidence_rows, key=lambda pair: pair[0])
+    deciles: list[dict[str, Any]] = []
+    if sorted_rows:
+        step = max(1, math.ceil(len(sorted_rows) / 10))
+        for decile in range(10):
+            start = decile * step
+            end = min(len(sorted_rows), (decile + 1) * step)
+            chunk = sorted_rows[start:end]
+            if not chunk:
+                deciles.append(
+                    {
+                        "decile": decile + 1,
+                        "count": 0,
+                        "avg_confidence": 0.0,
+                        "avg_return": 0.0,
+                    }
+                )
+                continue
+            deciles.append(
+                {
+                    "decile": decile + 1,
+                    "count": len(chunk),
+                    "avg_confidence": float(np.mean([item[0] for item in chunk])),
+                    "avg_return": float(np.mean([item[1] for item in chunk])),
+                }
+            )
+    return {
+        "reliability_bins": reliability_bins,
+        "confidence_deciles": deciles,
+    }
+
+
+def _run_walkforward_evaluation(
+    *,
+    frame: pd.DataFrame,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    source_data_path: Path,
+    source_data_sha256: str,
+    fast_window: int,
+    slow_window: int,
+    train_bars: int,
+    validate_bars: int,
+    step_bars: int,
+    min_windows: int,
+) -> dict[str, Any]:
+    close_frame = frame[["timestamp", "close"]].copy()
+    close_frame["close"] = pd.to_numeric(close_frame["close"], errors="coerce")
+    close_frame = close_frame.dropna(subset=["timestamp", "close"]).reset_index(drop=True)
+    required_bars = train_bars + validate_bars + slow_window
+    if len(close_frame) < required_bars:
+        raise RuntimeError(
+            f"Insufficient bars for walk-forward evaluation: {len(close_frame)} < {required_bars}"
+        )
+
+    periods_per_year = _periods_per_year(timeframe)
+    rows: list[dict[str, Any]] = []
+    total_bars = len(close_frame)
+    window_span = train_bars + validate_bars
+    next_start = 0
+    window_index = 0
+    while next_start + window_span <= total_bars:
+        window_index += 1
+        segment = close_frame.iloc[next_start : next_start + window_span].copy().reset_index(drop=True)
+        segment["returns"] = segment["close"].pct_change().fillna(0.0)
+        segment["ma_fast"] = segment["close"].rolling(window=fast_window).mean()
+        segment["ma_slow"] = segment["close"].rolling(window=slow_window).mean()
+        segment["signal"] = (segment["ma_fast"] > segment["ma_slow"]).astype(float)
+        segment["position"] = segment["signal"].shift(1).fillna(0.0)
+
+        validation = segment.iloc[train_bars:].copy().reset_index(drop=True)
+        validation["strategy_returns"] = validation["position"] * validation["returns"]
+        validation["equity_curve"] = (1.0 + validation["strategy_returns"]).cumprod()
+        if validation.empty:
+            next_start += step_bars
+            continue
+
+        total_return = float(validation["equity_curve"].iloc[-1] - 1.0)
+        mean_ret = float(validation["strategy_returns"].mean())
+        std_ret = float(validation["strategy_returns"].std(ddof=0))
+        sharpe = float(np.sqrt(periods_per_year) * mean_ret / std_ret) if std_ret > 0 else 0.0
+        rolling_peak = validation["equity_curve"].cummax()
+        drawdown = (validation["equity_curve"] / rolling_peak) - 1.0
+        max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
+        hit_rate = float((validation["strategy_returns"] > 0).mean()) if len(validation) else 0.0
+        signal_flips = int(validation["signal"].diff().abs().fillna(0.0).sum())
+        quality_score = _walkforward_quality_score(
+            total_return=total_return,
+            sharpe=sharpe,
+            max_drawdown=max_drawdown,
+            hit_rate=hit_rate,
+        )
+
+        rows.append(
+            {
+                "window_index": window_index,
+                "train_start_utc": str(segment["timestamp"].iloc[0]),
+                "train_end_utc": str(segment["timestamp"].iloc[train_bars - 1]),
+                "validate_start_utc": str(validation["timestamp"].iloc[0]),
+                "validate_end_utc": str(validation["timestamp"].iloc[-1]),
+                "bars": int(len(validation)),
+                "total_return": total_return,
+                "annualized_return": float((1.0 + total_return) ** (periods_per_year / len(validation)) - 1.0),
+                "sharpe": sharpe,
+                "max_drawdown": max_drawdown,
+                "hit_rate": hit_rate,
+                "signal_flips": signal_flips,
+                "quality_score": quality_score,
+            }
+        )
+        next_start += step_bars
+
+    if len(rows) < min_windows:
+        raise RuntimeError(
+            f"Walk-forward produced {len(rows)} windows; need at least {min_windows}"
+        )
+
+    total_returns = np.asarray([row["total_return"] for row in rows], dtype=float)
+    sharpes = np.asarray([row["sharpe"] for row in rows], dtype=float)
+    drawdowns = np.asarray([row["max_drawdown"] for row in rows], dtype=float)
+    hit_rates = np.asarray([row["hit_rate"] for row in rows], dtype=float)
+    quality_scores = np.asarray([row["quality_score"] for row in rows], dtype=float)
+
+    avg_return = float(np.mean(total_returns))
+    avg_sharpe = float(np.mean(sharpes))
+    worst_drawdown = float(np.min(drawdowns))
+    avg_hit_rate = float(np.mean(hit_rates))
+    return_variance = float(np.std(total_returns))
+    stability_score = float(np.clip(1.0 - min(1.0, return_variance / 0.08), 0.0, 1.0))
+    quality_score = float(np.clip(float(np.mean(quality_scores)) * (0.7 + 0.3 * stability_score), 0.0, 1.0))
+    diagnostics = _build_walkforward_diagnostics(rows)
+
+    return {
+        "contract": "walkforward_evaluation.v1",
+        "created_at_utc": _utc_now_iso(),
+        "exchange": exchange,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "source_data_path": str(source_data_path),
+        "source_data_sha256": source_data_sha256,
+        "strategy": STRATEGY_NAME,
+        "fast_window": fast_window,
+        "slow_window": slow_window,
+        "train_bars": train_bars,
+        "validate_bars": validate_bars,
+        "step_bars": step_bars,
+        "window_count": len(rows),
+        "aggregate_total_return": avg_return,
+        "aggregate_sharpe": avg_sharpe,
+        "aggregate_max_drawdown": worst_drawdown,
+        "aggregate_hit_rate": avg_hit_rate,
+        "stability_score": stability_score,
+        "quality_score": quality_score,
+        "windows": rows,
+        "diagnostics": diagnostics,
+    }
+
+
+def _indicator_alignment_score(indicator_votes: dict[str, float], recommendation: Recommendation) -> float:
+    if not indicator_votes:
+        return 0.5
+    votes = _normalize_probability_votes(indicator_votes)
+    return float(np.clip(votes.get(recommendation, 0.0), 0.0, 1.0))
+
+
+def _regime_alignment_adjustment(regime: str, recommendation: Recommendation) -> float:
+    normalized = regime.strip().lower()
+    if recommendation == "hold":
+        return 0.05 if "range" in normalized or "sideways" in normalized else 0.0
+    if "volatile" in normalized:
+        return -0.05
+    if recommendation == "buy":
+        if "bull" in normalized or "uptrend" in normalized:
+            return 0.07
+        if "bear" in normalized or "downtrend" in normalized:
+            return -0.10
+    if recommendation == "sell":
+        if "bear" in normalized or "downtrend" in normalized:
+            return 0.07
+        if "bull" in normalized or "uptrend" in normalized:
+            return -0.10
+    return 0.0
+
+def _walkforward_quality_band(quality_score: float) -> Literal["high", "medium", "low", "very_low"]:
+    score = float(np.clip(quality_score, 0.0, 1.0))
+    if score >= 0.70:
+        return "high"
+    if score >= 0.55:
+        return "medium"
+    if score >= 0.40:
+        return "low"
+    return "very_low"
+
+
+def _quality_band_sharpe_buffer(quality_band: Literal["high", "medium", "low", "very_low"]) -> float:
+    if quality_band == "high":
+        return 0.00
+    if quality_band == "medium":
+        return 0.05
+    if quality_band == "low":
+        return 0.10
+    return 0.20
+
+
+def _quality_band_contradiction_penalty(
+    quality_band: Literal["high", "medium", "low", "very_low"],
+) -> float:
+    if quality_band == "high":
+        return 0.85
+    if quality_band == "medium":
+        return 0.75
+    if quality_band == "low":
+        return 0.60
+    return 0.45
+
+
+def _quality_band_contradiction_severity(
+    quality_band: Literal["high", "medium", "low", "very_low"],
+) -> Literal["none", "block", "fail"]:
+    if quality_band == "very_low":
+        return "fail"
+    return "block"
+
+
+def _calibrate_confidence(
+    *,
+    run_id: str,
+    strategy_signal: StrategyProposalSignal,
+    walkforward_evaluation: dict[str, Any],
+    min_walkforward_sharpe: float,
+    confidence_floor: float,
+    confidence_ceiling: float,
+) -> dict[str, Any]:
+    lower = min(confidence_floor, confidence_ceiling)
+    upper = max(confidence_floor, confidence_ceiling)
+    raw_confidence = float(np.clip(strategy_signal.confidence, 0.0, 1.0))
+    walkforward_quality = float(np.clip(walkforward_evaluation.get("quality_score", 0.0), 0.0, 1.0))
+    walkforward_quality_band = _walkforward_quality_band(walkforward_quality)
+    walkforward_sharpe = float(walkforward_evaluation.get("aggregate_sharpe", 0.0))
+    sharpe_buffer = _quality_band_sharpe_buffer(walkforward_quality_band)
+    required_sharpe = min_walkforward_sharpe + sharpe_buffer
+    contradiction_penalty = _quality_band_contradiction_penalty(walkforward_quality_band)
+    indicator_alignment = _indicator_alignment_score(
+        strategy_signal.indicator_votes,
+        strategy_signal.recommendation,
+    )
+    regime_adjustment = _regime_alignment_adjustment(
+        strategy_signal.regime,
+        strategy_signal.recommendation,
+    )
+
+    reason_codes: list[str] = []
+    calibrated_confidence = raw_confidence
+    calibrated_confidence += (indicator_alignment - 0.5) * 0.20
+    calibrated_confidence += (walkforward_quality - 0.5) * 0.35
+    calibrated_confidence += regime_adjustment
+
+    contradiction_detected = False
+    contradiction_count = 0
+    contradiction_severity: Literal["none", "block", "fail"] = "none"
+    recommendation = strategy_signal.recommendation
+    if recommendation in {"buy", "sell"}:
+        if walkforward_quality_band == "very_low":
+            contradiction_detected = True
+            contradiction_count += 1
+            contradiction_severity = "fail"
+            reason_codes.append(f"{recommendation}_walkforward_quality_very_low")
+        if walkforward_sharpe < required_sharpe:
+            contradiction_detected = True
+            contradiction_count += 1
+            contradiction_severity = _quality_band_contradiction_severity(walkforward_quality_band)
+            reason_codes.append("walkforward_sharpe_below_threshold")
+            reason_codes.append("walkforward_sharpe_below_quality_band_threshold")
+            reason_codes.append(
+                f"{recommendation}_walkforward_{walkforward_quality_band}_sharpe_contradiction"
+            )
+        if contradiction_detected:
+            calibrated_confidence *= contradiction_penalty
+            reason_codes.append(f"walkforward_contradiction_{contradiction_severity}")
+
+    if not strategy_signal.feature_snapshot:
+        calibrated_confidence *= 0.95
+        reason_codes.append("phase1_feature_snapshot_missing")
+    if not strategy_signal.indicator_votes:
+        calibrated_confidence *= 0.95
+        reason_codes.append("phase1_indicator_votes_missing")
+    if strategy_signal.regime in {"", "unknown"}:
+        calibrated_confidence *= 0.95
+        reason_codes.append("phase1_regime_missing")
+
+    calibrated_confidence = float(np.clip(calibrated_confidence, lower, upper))
+    diagnostics = {
+        "reliability_bins": walkforward_evaluation.get("diagnostics", {}).get("reliability_bins", []),
+        "confidence_deciles": walkforward_evaluation.get("diagnostics", {}).get("confidence_deciles", []),
+        "contradiction_counts": {
+            "current_run": contradiction_count,
+            "severity_block": 1 if contradiction_detected and contradiction_severity == "block" else 0,
+            "severity_fail": 1 if contradiction_detected and contradiction_severity == "fail" else 0,
+        },
+    }
+    return {
+        "contract": "confidence_calibration.v1",
+        "run_id": run_id,
+        "created_at_utc": _utc_now_iso(),
+        "recommendation": strategy_signal.recommendation,
+        "raw_confidence": raw_confidence,
+        "calibrated_confidence": calibrated_confidence,
+        "walkforward_quality_score": walkforward_quality,
+        "walkforward_quality_band": walkforward_quality_band,
+        "walkforward_sharpe": walkforward_sharpe,
+        "contradiction_detected": contradiction_detected,
+        "contradiction_severity": contradiction_severity,
+        "contradiction_policy": {
+            "required_walkforward_sharpe": required_sharpe,
+            "quality_band_sharpe_buffer": sharpe_buffer,
+            "quality_band_penalty_multiplier": contradiction_penalty,
+        },
+        "phase1_inputs": {
+            "regime": strategy_signal.regime,
+            "indicator_votes": strategy_signal.indicator_votes,
+            "feature_snapshot": strategy_signal.feature_snapshot,
+            "reason_codes": strategy_signal.reason_codes,
+        },
+        "components": {
+            "indicator_alignment": indicator_alignment,
+            "regime_adjustment": regime_adjustment,
+            "walkforward_quality": walkforward_quality,
+        },
+        "reason_codes": sorted(set(reason_codes)),
+        "diagnostics": diagnostics,
+    }
+
+
 def _strategy_prompt(
     *,
     exchange: str,
     symbol: str,
     timeframe: str,
     snapshot: dict[str, float | int | str],
+    phase1_context: dict[str, Any],
     source_data_path: Path,
     source_data_sha256: str,
 ) -> str:
@@ -319,7 +941,7 @@ def _strategy_prompt(
         [
             "You are strategy-agent for a deterministic crypto quant pipeline.",
             "Return STRICT JSON only with keys:",
-            '{"recommendation":"buy|sell|hold","confidence":0.0,"fast_window":20,"slow_window":50,"rationale":"..."}',
+            '{"recommendation":"buy|sell|hold","confidence":0.0,"fast_window":20,"slow_window":50,"rationale":"...","indicator_votes":{"buy":0.0,"sell":0.0,"hold":1.0},"regime":"...","feature_snapshot":{"key":"value"},"reason_codes":["..."]}',
             "Rules:",
             "- confidence must be between 0 and 1.",
             "- fast_window and slow_window must be positive integers with slow_window > fast_window.",
@@ -330,6 +952,7 @@ def _strategy_prompt(
             f"Source data path: {source_data_path}",
             f"Source data sha256: {source_data_sha256}",
             f"Market snapshot: {json.dumps(snapshot, sort_keys=True)}",
+            f"Phase-1 feature context (must be consumed): {json.dumps(phase1_context, sort_keys=True)}",
         ]
     )
 
@@ -408,8 +1031,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     step_records: list[StepExecutionRecord] = []
 
     data_quality_path = run_dir / "data_quality_signal.json"
+    phase1_feature_context_path = run_dir / "phase1_feature_context.json"
     strategy_signal_path = run_dir / "strategy_proposal_signal.json"
     backtest_evaluation_path = run_dir / "backtest_evaluation.json"
+    walkforward_evaluation_path = run_dir / "walkforward_evaluation.json"
+    confidence_calibration_path = run_dir / "confidence_calibration.json"
     risk_decision_path = run_dir / "risk_decision.json"
     paper_trade_intent_path = run_dir / "paper_trade_intent.json"
     paper_trade_execution_path = run_dir / "paper_trade_execution.json"
@@ -466,6 +1092,28 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     write_contract(data_quality_path, data_quality_signal)
     step_records.append(data_quality_step)
 
+    def phase1_feature_runner() -> dict[str, Any]:
+        return {
+            "contract": "phase1_feature_context.v1",
+            "run_id": run_id,
+            "created_at_utc": _utc_now_iso(),
+            "exchange": config.exchange,
+            "symbol": config.symbol,
+            "timeframe": config.timeframe,
+            "input_data_path": str(source_data_path),
+            "input_data_sha256": source_data_sha256,
+            **_compute_phase1_feature_context(market_frame),
+        }
+
+    phase1_feature_context, phase1_feature_step = _run_step_with_retries(
+        run_dir=run_dir,
+        step_name="phase1-feature-context",
+        max_retries=config.step_retries,
+        runner=phase1_feature_runner,
+    )
+    _write_json(phase1_feature_context_path, phase1_feature_context)
+    step_records.append(phase1_feature_step)
+
     def strategy_runner() -> StrategyProposalSignal:
         available_models = ollama.list_models()
         if available_models and config.strategy_model not in available_models:
@@ -478,6 +1126,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             symbol=config.symbol,
             timeframe=config.timeframe,
             snapshot=_market_snapshot(market_frame),
+            phase1_context=phase1_feature_context,
             source_data_path=source_data_path,
             source_data_sha256=source_data_sha256,
         )
@@ -501,6 +1150,22 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         rationale = str(payload.get("rationale", "")).strip()
         if not rationale:
             raise RuntimeError("Strategy model returned empty rationale.")
+        indicator_votes = _normalize_indicator_votes(
+            payload.get("indicator_votes"),
+            fallback=dict(phase1_feature_context.get("indicator_votes", {})),
+        )
+        regime = _normalize_regime(
+            payload.get("regime"),
+            fallback=str(phase1_feature_context.get("regime", "unknown")),
+        )
+        feature_snapshot = _normalize_feature_snapshot(
+            payload.get("feature_snapshot"),
+            fallback=dict(phase1_feature_context.get("feature_snapshot", {})),
+        )
+        reason_codes = _normalize_reason_codes(
+            payload.get("reason_codes"),
+            fallback=list(phase1_feature_context.get("reason_codes", [])),
+        )
 
         return StrategyProposalSignal(
             contract="strategy_proposal_signal.v1",
@@ -520,6 +1185,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             rationale=rationale,
             raw_model_response=raw_response,
             warnings=warnings,
+            indicator_votes=indicator_votes,
+            regime=regime,
+            feature_snapshot=feature_snapshot,
+            reason_codes=reason_codes,
         )
 
     def strategy_fallback(errors: list[str]) -> StrategyProposalSignal:
@@ -541,6 +1210,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             rationale="Fallback strategy due to model unavailability or invalid output.",
             raw_model_response=None,
             warnings=errors,
+            indicator_votes=dict(phase1_feature_context.get("indicator_votes", {})),
+            regime=str(phase1_feature_context.get("regime", "unknown")),
+            feature_snapshot=dict(phase1_feature_context.get("feature_snapshot", {})),
+            reason_codes=list(phase1_feature_context.get("reason_codes", [])),
         )
 
     strategy_signal, strategy_step = _run_step_with_retries(
@@ -621,44 +1294,225 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     write_contract(backtest_evaluation_path, backtest_evaluation)
     step_records.append(backtest_step)
 
+    def walkforward_runner() -> dict[str, Any]:
+        return _run_walkforward_evaluation(
+            frame=market_frame,
+            exchange=config.exchange,
+            symbol=config.symbol,
+            timeframe=config.timeframe,
+            source_data_path=source_data_path,
+            source_data_sha256=source_data_sha256,
+            fast_window=strategy_signal.fast_window,
+            slow_window=strategy_signal.slow_window,
+            train_bars=max(20, config.walk_forward_train_bars),
+            validate_bars=max(5, config.walk_forward_validate_bars),
+            step_bars=max(5, config.walk_forward_step_bars),
+            min_windows=max(1, config.walk_forward_min_windows),
+        )
+
+    def walkforward_fallback(errors: list[str]) -> dict[str, Any]:
+        return {
+            "contract": "walkforward_evaluation.v1",
+            "created_at_utc": _utc_now_iso(),
+            "exchange": config.exchange,
+            "symbol": config.symbol,
+            "timeframe": config.timeframe,
+            "source_data_path": str(source_data_path),
+            "source_data_sha256": source_data_sha256,
+            "strategy": STRATEGY_NAME,
+            "fast_window": strategy_signal.fast_window,
+            "slow_window": strategy_signal.slow_window,
+            "train_bars": max(20, config.walk_forward_train_bars),
+            "validate_bars": max(5, config.walk_forward_validate_bars),
+            "step_bars": max(5, config.walk_forward_step_bars),
+            "window_count": 0,
+            "aggregate_total_return": 0.0,
+            "aggregate_sharpe": 0.0,
+            "aggregate_max_drawdown": 0.0,
+            "aggregate_hit_rate": 0.0,
+            "stability_score": 0.0,
+            "quality_score": 0.0,
+            "windows": [],
+            "diagnostics": {
+                "reliability_bins": [],
+                "confidence_deciles": [],
+            },
+            "warnings": errors,
+        }
+
+    walkforward_evaluation, walkforward_step = _run_step_with_retries(
+        run_dir=run_dir,
+        step_name="walkforward-agent",
+        max_retries=config.step_retries,
+        runner=walkforward_runner,
+        fallback=walkforward_fallback,
+    )
+    _write_json(walkforward_evaluation_path, walkforward_evaluation)
+    step_records.append(walkforward_step)
+
+    def calibration_runner() -> dict[str, Any]:
+        return _calibrate_confidence(
+            run_id=run_id,
+            strategy_signal=strategy_signal,
+            walkforward_evaluation=walkforward_evaluation,
+            min_walkforward_sharpe=config.calibration_min_walkforward_sharpe,
+            confidence_floor=config.calibration_confidence_floor,
+            confidence_ceiling=config.calibration_confidence_ceiling,
+        )
+
+    def calibration_fallback(errors: list[str]) -> dict[str, Any]:
+        raw_confidence = float(np.clip(strategy_signal.confidence, 0.0, 1.0))
+        lower = min(config.calibration_confidence_floor, config.calibration_confidence_ceiling)
+        upper = max(config.calibration_confidence_floor, config.calibration_confidence_ceiling)
+        calibrated_confidence = float(np.clip(raw_confidence, lower, upper))
+        walkforward_quality = 0.0
+        walkforward_quality_band = _walkforward_quality_band(walkforward_quality)
+        return {
+            "contract": "confidence_calibration.v1",
+            "run_id": run_id,
+            "created_at_utc": _utc_now_iso(),
+            "recommendation": strategy_signal.recommendation,
+            "raw_confidence": raw_confidence,
+            "calibrated_confidence": calibrated_confidence,
+            "walkforward_quality_score": walkforward_quality,
+            "walkforward_quality_band": walkforward_quality_band,
+            "walkforward_sharpe": 0.0,
+            "contradiction_detected": False,
+            "contradiction_severity": "none",
+            "contradiction_policy": {
+                "required_walkforward_sharpe": config.calibration_min_walkforward_sharpe,
+                "quality_band_sharpe_buffer": _quality_band_sharpe_buffer(walkforward_quality_band),
+                "quality_band_penalty_multiplier": _quality_band_contradiction_penalty(
+                    walkforward_quality_band
+                ),
+            },
+            "phase1_inputs": {
+                "regime": strategy_signal.regime,
+                "indicator_votes": strategy_signal.indicator_votes,
+                "feature_snapshot": strategy_signal.feature_snapshot,
+                "reason_codes": strategy_signal.reason_codes,
+            },
+            "components": {
+                "indicator_alignment": 0.5,
+                "regime_adjustment": 0.0,
+                "walkforward_quality": 0.0,
+            },
+            "reason_codes": ["calibration_fallback", *errors],
+            "diagnostics": {
+                "reliability_bins": [],
+                "confidence_deciles": [],
+                "contradiction_counts": {
+                    "current_run": 0,
+                    "severity_block": 0,
+                    "severity_fail": 0,
+                },
+            },
+        }
+
+    confidence_calibration, calibration_step = _run_step_with_retries(
+        run_dir=run_dir,
+        step_name="confidence-calibration-agent",
+        max_retries=config.step_retries,
+        runner=calibration_runner,
+        fallback=calibration_fallback,
+    )
+    _write_json(confidence_calibration_path, confidence_calibration)
+    step_records.append(calibration_step)
+
     def risk_runner() -> RiskDecision:
-        reasons: list[str] = []
-        observed: dict[str, float | int | str | bool | None] = {
+        fail_reasons: list[str] = []
+        block_reasons: list[str] = []
+        calibration_reason_codes = [str(code) for code in confidence_calibration.get("reason_codes", [])]
+        walkforward_quality_score = float(confidence_calibration.get("walkforward_quality_score", 0.0))
+        walkforward_quality_band = str(
+            confidence_calibration.get("walkforward_quality_band", _walkforward_quality_band(walkforward_quality_score))
+        )
+        contradiction_detected = bool(confidence_calibration.get("contradiction_detected", False))
+        contradiction_severity = str(confidence_calibration.get("contradiction_severity", "none")).lower()
+        contradiction_count = int(
+            confidence_calibration.get("diagnostics", {})
+            .get("contradiction_counts", {})
+            .get("current_run", 0)
+        )
+        action = strategy_signal.recommendation
+        observed: dict[str, Any] = {
             "data_quality_valid": data_quality_signal.is_valid,
             "backtest_status": backtest_evaluation.backtest_status,
             "total_return": backtest_evaluation.total_return,
             "sharpe": backtest_evaluation.sharpe,
             "max_drawdown": backtest_evaluation.max_drawdown,
-            "recommendation": strategy_signal.recommendation,
-            "recommendation_confidence": strategy_signal.confidence,
+            "recommendation": action,
+            "raw_recommendation_confidence": confidence_calibration.get("raw_confidence"),
+            "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
+            "walkforward_quality_score": walkforward_quality_score,
+            "walkforward_quality_band": walkforward_quality_band,
+            "walkforward_sharpe": confidence_calibration.get("walkforward_sharpe"),
+            "walkforward_window_count": walkforward_evaluation.get("window_count", 0),
+            "contradiction_detected": contradiction_detected,
+            "contradiction_severity": contradiction_severity,
+            "contradiction_count": contradiction_count,
+            "phase1_regime": strategy_signal.regime,
+            "phase1_indicator_votes": strategy_signal.indicator_votes,
+            "phase1_feature_snapshot": strategy_signal.feature_snapshot,
         }
         thresholds = {
             "min_total_return": config.thresholds.min_total_return,
             "min_sharpe": config.thresholds.min_sharpe,
             "max_drawdown": config.thresholds.max_drawdown,
             "min_signal_confidence": config.thresholds.min_signal_confidence,
+            "min_walkforward_sharpe": config.calibration_min_walkforward_sharpe,
+            "max_contradictions": float(config.calibration_max_contradictions),
+            "walkforward_quality_low_cutoff": 0.40,
+            "walkforward_quality_medium_cutoff": 0.55,
+            "walkforward_quality_high_cutoff": 0.70,
         }
 
         if not data_quality_signal.is_valid:
-            reasons.append("data_quality_invalid")
+            fail_reasons.append("data_quality_invalid")
         if backtest_evaluation.backtest_status != "success":
-            reasons.append("backtest_failed")
+            fail_reasons.append("backtest_failed")
         else:
             total_return = backtest_evaluation.total_return
             sharpe = backtest_evaluation.sharpe
             max_drawdown = backtest_evaluation.max_drawdown
             if total_return is None or total_return < config.thresholds.min_total_return:
-                reasons.append("total_return_below_threshold")
+                fail_reasons.append("total_return_below_threshold")
             if sharpe is None or sharpe < config.thresholds.min_sharpe:
-                reasons.append("sharpe_below_threshold")
+                fail_reasons.append("sharpe_below_threshold")
             if max_drawdown is None or max_drawdown < config.thresholds.max_drawdown:
-                reasons.append("max_drawdown_exceeded")
+                fail_reasons.append("max_drawdown_exceeded")
 
-        if strategy_signal.recommendation not in {"buy", "sell"}:
-            reasons.append("non_actionable_recommendation")
-        if strategy_signal.confidence < config.thresholds.min_signal_confidence:
-            reasons.append("signal_confidence_below_threshold")
+        if action not in {"buy", "sell"}:
+            block_reasons.append("non_actionable_recommendation")
+        else:
+            if walkforward_quality_band == "very_low":
+                fail_reasons.append(f"risk_fail_{action}_walkforward_quality_very_low")
+            elif walkforward_quality_band == "low":
+                block_reasons.append(f"risk_block_{action}_walkforward_quality_low")
 
+            if contradiction_detected:
+                if contradiction_severity == "fail":
+                    fail_reasons.append(
+                        f"risk_fail_{action}_walkforward_contradiction_{walkforward_quality_band}"
+                    )
+                else:
+                    block_reasons.append(
+                        f"risk_block_{action}_walkforward_contradiction_{walkforward_quality_band}"
+                    )
+        calibrated_confidence = float(confidence_calibration.get("calibrated_confidence", 0.0))
+        if calibrated_confidence < config.thresholds.min_signal_confidence:
+            block_reasons.append("calibrated_confidence_below_threshold")
+        if (
+            float(confidence_calibration.get("raw_confidence", 0.0)) >= config.thresholds.min_signal_confidence
+            and calibrated_confidence < config.thresholds.min_signal_confidence
+        ):
+            block_reasons.append("confidence_downgraded_by_calibration")
+        if contradiction_count > config.calibration_max_contradictions:
+            fail_reasons.append("calibration_contradiction_limit_exceeded")
+            if action in {"buy", "sell"}:
+                fail_reasons.append(f"risk_fail_{action}_calibration_contradiction_limit_exceeded")
+
+        reasons = sorted(set([*fail_reasons, *block_reasons, *calibration_reason_codes]))
         approved = len(reasons) == 0
         return RiskDecision(
             contract="risk_decision.v1",
@@ -669,7 +1523,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             thresholds=thresholds,
             observed=observed,
             recommendation=strategy_signal.recommendation,
-            recommendation_confidence=strategy_signal.confidence,
+            recommendation_confidence=calibrated_confidence,
             deterministic_gate="pass" if approved else "fail",
         )
 
@@ -769,10 +1623,15 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "source": strategy_signal.source,
             "recommendation": strategy_signal.recommendation,
             "confidence": strategy_signal.confidence,
+            "regime": strategy_signal.regime,
+            "indicator_votes": strategy_signal.indicator_votes,
+            "feature_snapshot": strategy_signal.feature_snapshot,
+            "reason_codes": strategy_signal.reason_codes,
             "fast_window": strategy_signal.fast_window,
             "slow_window": strategy_signal.slow_window,
             "rationale": strategy_signal.rationale,
         },
+        "phase1": phase1_feature_context,
         "backtest": {
             "status": backtest_evaluation.backtest_status,
             "total_return": backtest_evaluation.total_return,
@@ -780,6 +1639,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "sharpe": backtest_evaluation.sharpe,
             "max_drawdown": backtest_evaluation.max_drawdown,
         },
+        "walkforward": walkforward_evaluation,
+        "calibration": confidence_calibration,
         "risk": {
             "approved": risk_decision.approved,
             "reason_codes": risk_decision.reason_codes,
@@ -864,8 +1725,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         summary_markdown=str(report_payload["markdown"]),
         artifact_paths={
             "data_quality_signal": str(data_quality_path),
+            "phase1_feature_context": str(phase1_feature_context_path),
             "strategy_proposal_signal": str(strategy_signal_path),
             "backtest_evaluation": str(backtest_evaluation_path),
+            "walkforward_evaluation": str(walkforward_evaluation_path),
+            "confidence_calibration": str(confidence_calibration_path),
             "risk_decision": str(risk_decision_path),
             "paper_trade_intent": str(paper_trade_intent_path),
             "paper_trade_execution": str(paper_trade_execution_path),
@@ -894,6 +1758,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "ops_model": config.ops_model,
             "step_retries": config.step_retries,
             "minimum_bars": config.minimum_bars,
+            "walk_forward_train_bars": config.walk_forward_train_bars,
+            "walk_forward_validate_bars": config.walk_forward_validate_bars,
+            "walk_forward_step_bars": config.walk_forward_step_bars,
+            "walk_forward_min_windows": config.walk_forward_min_windows,
+            "calibration_min_walkforward_sharpe": config.calibration_min_walkforward_sharpe,
+            "calibration_confidence_floor": config.calibration_confidence_floor,
+            "calibration_confidence_ceiling": config.calibration_confidence_ceiling,
+            "calibration_max_contradictions": config.calibration_max_contradictions,
             "paper_notional_usd": config.paper_notional_usd,
             "paper_starting_cash_usd": config.paper_starting_cash_usd,
             "paper_fee_bps": config.paper_fee_bps,
@@ -903,8 +1775,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         "artifacts": {
             "run_dir": str(run_dir),
             "data_quality_signal": str(data_quality_path),
+            "phase1_feature_context": str(phase1_feature_context_path),
             "strategy_proposal_signal": str(strategy_signal_path),
             "backtest_evaluation": str(backtest_evaluation_path),
+            "walkforward_evaluation": str(walkforward_evaluation_path),
+            "confidence_calibration": str(confidence_calibration_path),
             "risk_decision": str(risk_decision_path),
             "paper_trade_intent": str(paper_trade_intent_path),
             "paper_trade_execution": str(paper_trade_execution_path),
@@ -920,6 +1795,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "intent_status": paper_trade_intent.status,
             "paper_trade_execution_status": paper_trade_execution.execution_status,
             "deterministic_gate": risk_decision.deterministic_gate,
+            "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
+            "walkforward_quality_score": confidence_calibration.get("walkforward_quality_score"),
         },
     }
     _write_json(run_manifest_path, run_manifest)
@@ -938,6 +1815,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         data_quality_path=data_quality_path,
         strategy_signal_path=strategy_signal_path,
         backtest_evaluation_path=backtest_evaluation_path,
+        phase1_feature_context_path=phase1_feature_context_path,
+        walkforward_evaluation_path=walkforward_evaluation_path,
+        confidence_calibration_path=confidence_calibration_path,
         risk_decision_path=risk_decision_path,
         paper_trade_intent_path=paper_trade_intent_path,
         paper_trade_execution_path=paper_trade_execution_path,

@@ -70,6 +70,14 @@ class OpenClawOrchestrationRequest:
     min_sharpe: float
     max_drawdown: float
     min_signal_confidence: float
+    walk_forward_train_bars: int
+    walk_forward_validate_bars: int
+    walk_forward_step_bars: int
+    walk_forward_min_windows: int
+    calibration_min_walkforward_sharpe: float
+    calibration_confidence_floor: float
+    calibration_confidence_ceiling: float
+    calibration_max_contradictions: int
     paper_notional_usd: float
     paper_starting_cash_usd: float
     paper_fee_bps: float
@@ -90,6 +98,43 @@ class OpenClawOrchestrationRequest:
             max_drawdown=float(payload.get("max_drawdown", settings.risk_max_drawdown)),
             min_signal_confidence=float(
                 payload.get("min_signal_confidence", settings.risk_min_signal_confidence)
+            ),
+            walk_forward_train_bars=max(
+                50,
+                int(payload.get("walk_forward_train_bars", settings.walk_forward_train_bars)),
+            ),
+            walk_forward_validate_bars=max(
+                10,
+                int(payload.get("walk_forward_validate_bars", settings.walk_forward_validate_bars)),
+            ),
+            walk_forward_step_bars=max(
+                10,
+                int(payload.get("walk_forward_step_bars", settings.walk_forward_step_bars)),
+            ),
+            walk_forward_min_windows=max(
+                1,
+                int(payload.get("walk_forward_min_windows", settings.walk_forward_min_windows)),
+            ),
+            calibration_min_walkforward_sharpe=float(
+                payload.get(
+                    "calibration_min_walkforward_sharpe",
+                    settings.calibration_min_walkforward_sharpe,
+                )
+            ),
+            calibration_confidence_floor=float(
+                payload.get("calibration_confidence_floor", settings.calibration_confidence_floor)
+            ),
+            calibration_confidence_ceiling=float(
+                payload.get("calibration_confidence_ceiling", settings.calibration_confidence_ceiling)
+            ),
+            calibration_max_contradictions=max(
+                0,
+                int(
+                    payload.get(
+                        "calibration_max_contradictions",
+                        settings.calibration_max_contradictions,
+                    )
+                ),
             ),
             paper_notional_usd=float(payload.get("paper_notional_usd", settings.paper_trade_notional_usd)),
             paper_starting_cash_usd=float(
@@ -118,6 +163,14 @@ class OpenClawOrchestrationRequest:
             paper_starting_cash_usd=self.paper_starting_cash_usd,
             paper_fee_bps=self.paper_fee_bps,
             minimum_bars=self.minimum_bars,
+            walk_forward_train_bars=self.walk_forward_train_bars,
+            walk_forward_validate_bars=self.walk_forward_validate_bars,
+            walk_forward_step_bars=self.walk_forward_step_bars,
+            walk_forward_min_windows=self.walk_forward_min_windows,
+            calibration_min_walkforward_sharpe=self.calibration_min_walkforward_sharpe,
+            calibration_confidence_floor=self.calibration_confidence_floor,
+            calibration_confidence_ceiling=self.calibration_confidence_ceiling,
+            calibration_max_contradictions=self.calibration_max_contradictions,
             source_data_path=Path(self.source_data_path).expanduser().resolve()
             if self.source_data_path
             else None,
@@ -142,8 +195,11 @@ def run_openclaw_orchestration(
         "paper_trade_execution_status": result.paper_trade_execution_status,
         "artifacts": {
             "data_quality_signal": str(result.data_quality_path),
+            "phase1_feature_context": str(result.phase1_feature_context_path),
             "strategy_proposal_signal": str(result.strategy_signal_path),
             "backtest_evaluation": str(result.backtest_evaluation_path),
+            "walkforward_evaluation": str(result.walkforward_evaluation_path),
+            "confidence_calibration": str(result.confidence_calibration_path),
             "risk_decision": str(result.risk_decision_path),
             "paper_trade_intent": str(result.paper_trade_intent_path),
             "paper_trade_execution": str(result.paper_trade_execution_path),

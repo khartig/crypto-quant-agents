@@ -35,6 +35,14 @@ class Settings:
     risk_min_sharpe: float
     risk_max_drawdown: float
     risk_min_signal_confidence: float
+    walk_forward_train_bars: int
+    walk_forward_validate_bars: int
+    walk_forward_step_bars: int
+    walk_forward_min_windows: int
+    calibration_min_walkforward_sharpe: float
+    calibration_confidence_floor: float
+    calibration_confidence_ceiling: float
+    calibration_max_contradictions: int
     paper_trade_notional_usd: float
     paper_trade_starting_cash_usd: float
     paper_trade_fee_bps: float
@@ -102,6 +110,44 @@ def load_settings() -> Settings:
         risk_min_sharpe=_as_float(os.getenv("RISK_MIN_SHARPE"), default=0.0),
         risk_max_drawdown=_as_float(os.getenv("RISK_MAX_DRAWDOWN"), default=-0.20),
         risk_min_signal_confidence=_as_float(os.getenv("RISK_MIN_SIGNAL_CONFIDENCE"), default=0.55),
+        walk_forward_train_bars=max(
+            50,
+            _as_int(os.getenv("WALK_FORWARD_TRAIN_BARS"), default=240),
+        ),
+        walk_forward_validate_bars=max(
+            10,
+            _as_int(os.getenv("WALK_FORWARD_VALIDATE_BARS"), default=72),
+        ),
+        walk_forward_step_bars=max(
+            10,
+            _as_int(os.getenv("WALK_FORWARD_STEP_BARS"), default=72),
+        ),
+        walk_forward_min_windows=max(
+            1,
+            _as_int(os.getenv("WALK_FORWARD_MIN_WINDOWS"), default=3),
+        ),
+        calibration_min_walkforward_sharpe=_as_float(
+            os.getenv("CALIBRATION_MIN_WALKFORWARD_SHARPE"),
+            default=0.10,
+        ),
+        calibration_confidence_floor=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("CALIBRATION_CONFIDENCE_FLOOR"), default=0.05),
+            ),
+        ),
+        calibration_confidence_ceiling=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("CALIBRATION_CONFIDENCE_CEILING"), default=0.95),
+            ),
+        ),
+        calibration_max_contradictions=max(
+            0,
+            _as_int(os.getenv("CALIBRATION_MAX_CONTRADICTIONS"), default=0),
+        ),
         paper_trade_notional_usd=_as_float(os.getenv("PAPER_TRADE_NOTIONAL_USD"), default=100.0),
         paper_trade_starting_cash_usd=max(
             0.0,

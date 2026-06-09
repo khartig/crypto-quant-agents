@@ -156,6 +156,54 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Deterministic risk gate: minimum strategy confidence.",
     )
     agent_plane.add_argument(
+        "--walkforward-train-bars",
+        type=int,
+        default=None,
+        help="Phase 2: train bars per walk-forward window.",
+    )
+    agent_plane.add_argument(
+        "--walkforward-validate-bars",
+        type=int,
+        default=None,
+        help="Phase 2: validate bars per walk-forward window.",
+    )
+    agent_plane.add_argument(
+        "--walkforward-step-bars",
+        type=int,
+        default=None,
+        help="Phase 2: step size in bars between walk-forward windows.",
+    )
+    agent_plane.add_argument(
+        "--walkforward-min-windows",
+        type=int,
+        default=None,
+        help="Phase 2: minimum number of walk-forward windows required.",
+    )
+    agent_plane.add_argument(
+        "--calibration-min-walkforward-sharpe",
+        type=float,
+        default=None,
+        help="Phase 2: minimum walk-forward sharpe before contradiction penalty.",
+    )
+    agent_plane.add_argument(
+        "--calibration-confidence-floor",
+        type=float,
+        default=None,
+        help="Phase 2: lower clamp for calibrated confidence.",
+    )
+    agent_plane.add_argument(
+        "--calibration-confidence-ceiling",
+        type=float,
+        default=None,
+        help="Phase 2: upper clamp for calibrated confidence.",
+    )
+    agent_plane.add_argument(
+        "--calibration-max-contradictions",
+        type=int,
+        default=None,
+        help="Phase 2: maximum allowed contradiction events before risk block.",
+    )
+    agent_plane.add_argument(
         "--paper-notional-usd",
         type=float,
         default=None,
@@ -620,6 +668,51 @@ def main(argv: list[str] | None = None) -> None:
             minimum_bars=max(
                 10,
                 args.minimum_bars if args.minimum_bars is not None else settings.agent_minimum_bars,
+            ),
+            walk_forward_train_bars=max(
+                50,
+                args.walkforward_train_bars
+                if args.walkforward_train_bars is not None
+                else settings.walk_forward_train_bars,
+            ),
+            walk_forward_validate_bars=max(
+                10,
+                args.walkforward_validate_bars
+                if args.walkforward_validate_bars is not None
+                else settings.walk_forward_validate_bars,
+            ),
+            walk_forward_step_bars=max(
+                10,
+                args.walkforward_step_bars
+                if args.walkforward_step_bars is not None
+                else settings.walk_forward_step_bars,
+            ),
+            walk_forward_min_windows=max(
+                1,
+                args.walkforward_min_windows
+                if args.walkforward_min_windows is not None
+                else settings.walk_forward_min_windows,
+            ),
+            calibration_min_walkforward_sharpe=(
+                args.calibration_min_walkforward_sharpe
+                if args.calibration_min_walkforward_sharpe is not None
+                else settings.calibration_min_walkforward_sharpe
+            ),
+            calibration_confidence_floor=(
+                args.calibration_confidence_floor
+                if args.calibration_confidence_floor is not None
+                else settings.calibration_confidence_floor
+            ),
+            calibration_confidence_ceiling=(
+                args.calibration_confidence_ceiling
+                if args.calibration_confidence_ceiling is not None
+                else settings.calibration_confidence_ceiling
+            ),
+            calibration_max_contradictions=max(
+                0,
+                args.calibration_max_contradictions
+                if args.calibration_max_contradictions is not None
+                else settings.calibration_max_contradictions,
             ),
             source_data_path=source_file,
         )
