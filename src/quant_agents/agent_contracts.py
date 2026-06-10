@@ -67,6 +67,10 @@ class StrategyProposalSignal:
     regime: str = "unknown"
     feature_snapshot: dict[str, float | int | str | bool] = field(default_factory=dict)
     reason_codes: list[str] = field(default_factory=list)
+    arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    arm_weights: dict[str, float] = field(default_factory=dict)
+    selected_arms: list[str] = field(default_factory=list)
+    ensemble_reason_codes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,9 @@ class BacktestEvaluation:
     signal_flips: int | None
     bars: int | None
     error_message: str | None
+    arm_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
+    ensemble_metrics: dict[str, Any] = field(default_factory=dict)
+    arm_attribution_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -101,10 +108,14 @@ class RiskDecision:
     approved: bool
     reason_codes: list[str]
     thresholds: dict[str, float]
-    observed: dict[str, float | int | str | bool | None]
+    observed: dict[str, Any]
     recommendation: Recommendation
     recommendation_confidence: float
     deterministic_gate: Literal["pass", "fail"]
+    arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    arm_weights: dict[str, float] = field(default_factory=dict)
+    selected_arms: list[str] = field(default_factory=list)
+    ensemble_reason_codes: list[str] = field(default_factory=list)
     decision_trace: list[dict[str, Any]] = field(default_factory=list)
     reason_code_details: dict[str, str] = field(default_factory=dict)
     gate_transition_sequence: list[str] = field(default_factory=list)
@@ -125,6 +136,10 @@ class PaperTradeIntent:
     risk_approved: bool
     reason: str
     destination_path: str | None
+    arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    arm_weights: dict[str, float] = field(default_factory=dict)
+    selected_arms: list[str] = field(default_factory=list)
+    ensemble_reason_codes: list[str] = field(default_factory=list)
 
 @dataclass(frozen=True)
 class PaperTradeExecution:
@@ -152,6 +167,11 @@ class PaperTradeExecution:
     portfolio_state_path: str | None
     fills_log_path: str | None
     execution_record_path: str | None
+    arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    arm_weights: dict[str, float] = field(default_factory=dict)
+    selected_arms: list[str] = field(default_factory=list)
+    ensemble_reason_codes: list[str] = field(default_factory=list)
+    arm_attribution: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -164,6 +184,10 @@ class OpsReportContract:
     summary_markdown_path: str
     summary_markdown: str
     artifact_paths: dict[str, str]
+    arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    arm_weights: dict[str, float] = field(default_factory=dict)
+    selected_arms: list[str] = field(default_factory=list)
+    ensemble_reason_codes: list[str] = field(default_factory=list)
     decision_trace: list[dict[str, Any]] = field(default_factory=list)
     reason_code_details: dict[str, str] = field(default_factory=dict)
     gate_transition_sequence: list[str] = field(default_factory=list)

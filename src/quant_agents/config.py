@@ -46,6 +46,10 @@ class Settings:
     self_critique_min_score: float
     self_critique_max_findings: int
     ops_report_verbosity: str
+    ensemble_mode: str
+    ensemble_enabled_arms: tuple[str, ...]
+    ensemble_decay_horizon: int
+    ensemble_exploration_weight: float
     paper_trade_notional_usd: float
     paper_trade_starting_cash_usd: float
     paper_trade_fee_bps: float
@@ -88,6 +92,21 @@ def _as_report_verbosity(value: str | None, default: str = "standard") -> str:
     if normalized in {"compact", "standard", "verbose"}:
         return normalized
     return default
+
+def _as_ensemble_mode(value: str | None, default: str = "adaptive") -> str:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"single", "adaptive"}:
+        return normalized
+    return default
+
+
+def _as_csv_tuple(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if value is None:
+        return default
+    items = tuple(part.strip().lower() for part in value.split(",") if part.strip())
+    return items or default
 
 
 def _as_float(value: str | None, default: float) -> float:
@@ -173,6 +192,25 @@ def load_settings() -> Settings:
         ops_report_verbosity=_as_report_verbosity(
             os.getenv("OPS_REPORT_VERBOSITY"),
             default="standard",
+        ),
+        ensemble_mode=_as_ensemble_mode(
+            os.getenv("AGENT_ENSEMBLE_MODE"),
+            default="adaptive",
+        ),
+        ensemble_enabled_arms=_as_csv_tuple(
+            os.getenv("AGENT_ENSEMBLE_ARMS"),
+            default=("sma_baseline", "technical_composite", "llm_context"),
+        ),
+        ensemble_decay_horizon=max(
+            4,
+            _as_int(os.getenv("AGENT_ENSEMBLE_DECAY_HORIZON"), default=96),
+        ),
+        ensemble_exploration_weight=min(
+            0.50,
+            max(
+                0.0,
+                _as_float(os.getenv("AGENT_ENSEMBLE_EXPLORATION_WEIGHT"), default=0.08),
+            ),
         ),
         paper_trade_notional_usd=_as_float(os.getenv("PAPER_TRADE_NOTIONAL_USD"), default=100.0),
         paper_trade_starting_cash_usd=max(

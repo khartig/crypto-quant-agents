@@ -24,7 +24,12 @@ from quant_agents.agent_contracts import (
     StrategyProposalSignal,
     write_contract,
 )
-from quant_agents.backtest import STRATEGY_NAME, run_sma_backtest
+from quant_agents.backtest import (
+    ENSEMBLE_STRATEGY_NAME,
+    STRATEGY_NAME,
+    SUPPORTED_STRATEGY_ARMS,
+    run_ensemble_backtest,
+)
 from quant_agents.config import Settings
 from quant_agents.ollama_client import OllamaClient
 from quant_agents.paper_trading import execute_paper_trade_intent
@@ -67,6 +72,14 @@ class AgentPlaneConfig:
     self_critique_min_score: float = 0.55
     self_critique_max_findings: int = 6
     ops_report_verbosity: str = "standard"
+    ensemble_mode: Literal["single", "adaptive"] = "adaptive"
+    ensemble_enabled_arms: tuple[str, ...] = (
+        "sma_baseline",
+        "technical_composite",
+        "llm_context",
+    )
+    ensemble_decay_horizon: int = 96
+    ensemble_exploration_weight: float = 0.08
     source_data_path: Path | None = None
 
 
@@ -90,6 +103,7 @@ class AgentPlaneRunResult:
     data_quality_path: Path
     strategy_signal_path: Path
     backtest_evaluation_path: Path
+    backtest_arm_attribution_path: Path | None
     phase1_feature_context_path: Path
     walkforward_evaluation_path: Path
     confidence_calibration_path: Path
@@ -100,6 +114,7 @@ class AgentPlaneRunResult:
     ops_report_markdown_path: Path
     ops_report_contract_path: Path
     run_manifest_path: Path
+    ensemble_performance_update_path: Path | None
     risk_approved: bool
     intent_status: str
     paper_trade_execution_status: str
@@ -196,6 +211,392 @@ def _sanitize_windows(fast_window: Any, slow_window: Any) -> tuple[int, int, lis
         fast, slow = 20, 50
         warnings.append("fast_window >= slow_window; reset to 20/50")
     return fast, slow, warnings
+
+
+def _normalize_ensemble_mode(value: Any) -> Literal["single", "adaptive"]:
+    if not isinstance(value, str):
+        return "adaptive"
+    normalized = value.strip().lower()
+    if normalized == "single":
+        return "single"
+    if normalized == "adaptive":
+        return "adaptive"
+    return "adaptive"
+
+
+def _normalize_enabled_arms(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw = [part.strip().lower() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (tuple, list)):
+        raw = [str(part).strip().lower() for part in value if str(part).strip()]
+    else:
+        raw = []
+    deduped: list[str] = []
+    for arm in raw:
+        if arm in SUPPORTED_STRATEGY_ARMS and arm not in deduped:
+            deduped.append(arm)
+    if not deduped:
+        return ("sma_baseline", "technical_composite", "llm_context")
+    return tuple(deduped)
+
+
+def _load_ensemble_weight_state(
+    *,
+    path: Path,
+    enabled_arms: tuple[str, ...],
+    decay_horizon: int,
+    exploration_weight: float,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if path.exists():
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                payload = parsed
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    raw_stats = payload.get("arm_stats")
+    arm_stats_payload = raw_stats if isinstance(raw_stats, dict) else {}
+    arm_stats: dict[str, dict[str, Any]] = {}
+    equal_weight = 1.0 / max(1, len(enabled_arms))
+    for arm in enabled_arms:
+        raw = arm_stats_payload.get(arm)
+        entry = raw if isinstance(raw, dict) else {}
+        arm_stats[arm] = {
+            "ewma_pnl": float(entry.get("ewma_pnl", 0.0)),
+            "ewma_drawdown": float(entry.get("ewma_drawdown", 0.0)),
+            "ewma_stability": float(entry.get("ewma_stability", 0.5)),
+            "observations": max(0, int(entry.get("observations", 0))),
+            "last_weight": float(entry.get("last_weight", equal_weight)),
+        }
+    history = payload.get("history")
+    history_rows = list(history) if isinstance(history, list) else []
+    return {
+        "contract": "ensemble_weight_state.v1",
+        "updated_at_utc": str(payload.get("updated_at_utc") or _utc_now_iso()),
+        "decay_horizon": max(4, int(payload.get("decay_horizon", decay_horizon))),
+        "exploration_weight": max(
+            0.0,
+            float(payload.get("exploration_weight", exploration_weight)),
+        ),
+        "arm_stats": arm_stats,
+        "history": history_rows[-200:],
+    }
+
+
+def _build_sma_arm_vote(
+    market_frame: pd.DataFrame,
+    *,
+    fast_window: int,
+    slow_window: int,
+) -> dict[str, Any]:
+    close = pd.to_numeric(market_frame.get("close"), errors="coerce").ffill().bfill()
+    if close.empty:
+        return {
+            "source": "deterministic",
+            "recommendation": "hold",
+            "confidence": 0.34,
+            "action_scores": {"buy": 0.20, "sell": 0.20, "hold": 0.60},
+            "reason_codes": ["sma_close_unavailable"],
+            "metadata": {"fast_window": fast_window, "slow_window": slow_window},
+        }
+    ma_fast = close.rolling(window=max(2, fast_window), min_periods=max(2, fast_window // 2)).mean()
+    ma_slow = close.rolling(window=max(3, slow_window), min_periods=max(3, slow_window // 2)).mean()
+    fast_value = float(ma_fast.iloc[-1]) if pd.notna(ma_fast.iloc[-1]) else float(close.iloc[-1])
+    slow_value = float(ma_slow.iloc[-1]) if pd.notna(ma_slow.iloc[-1]) else float(close.iloc[-1])
+    spread = (fast_value / max(slow_value, 1e-9)) - 1.0
+    strength = float(np.clip(abs(spread) * 28.0, 0.0, 0.45))
+    if spread >= 0.001:
+        recommendation: Recommendation = "buy"
+        action_scores = _normalize_probability_votes(
+            {"buy": 0.50 + strength, "sell": 0.10, "hold": 0.40 - strength}
+        )
+        reason_codes = ["sma_fast_above_slow"]
+    elif spread <= -0.001:
+        recommendation = "sell"
+        action_scores = _normalize_probability_votes(
+            {"buy": 0.10, "sell": 0.50 + strength, "hold": 0.40 - strength}
+        )
+        reason_codes = ["sma_fast_below_slow"]
+    else:
+        recommendation = "hold"
+        action_scores = _normalize_probability_votes({"buy": 0.20, "sell": 0.20, "hold": 0.60})
+        reason_codes = ["sma_spread_neutral"]
+    confidence = float(action_scores.get(recommendation, 0.34))
+    return {
+        "source": "deterministic",
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "action_scores": action_scores,
+        "reason_codes": reason_codes,
+        "metadata": {
+            "fast_window": int(fast_window),
+            "slow_window": int(slow_window),
+            "spread": spread,
+        },
+    }
+
+
+def _build_technical_arm_vote(phase1_context: dict[str, Any]) -> dict[str, Any]:
+    indicator_votes = _normalize_probability_votes(
+        dict(phase1_context.get("indicator_votes", {}))
+    )
+    recommendation = max(indicator_votes, key=indicator_votes.get)
+    confidence = float(indicator_votes.get(recommendation, 0.0))
+    reason_codes = [str(code) for code in list(phase1_context.get("reason_codes", []))]
+    if not reason_codes:
+        reason_codes = ["technical_vote_fallback"]
+    return {
+        "source": "deterministic",
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "action_scores": indicator_votes,
+        "reason_codes": reason_codes,
+        "metadata": {
+            "regime": str(phase1_context.get("regime", "unknown")),
+        },
+    }
+
+
+def _build_llm_context_arm_vote(strategy_signal: StrategyProposalSignal) -> dict[str, Any]:
+    recommendation = strategy_signal.recommendation
+    confidence = float(np.clip(strategy_signal.confidence, 0.0, 1.0))
+    action_scores = _normalize_probability_votes(
+        dict(strategy_signal.indicator_votes)
+        if strategy_signal.indicator_votes
+        else {
+            recommendation: confidence,
+            "hold": max(0.0, 1.0 - confidence),
+        }
+    )
+    return {
+        "source": strategy_signal.source,
+        "model": strategy_signal.model,
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "action_scores": action_scores,
+        "reason_codes": list(strategy_signal.reason_codes),
+        "metadata": {
+            "regime": strategy_signal.regime,
+            "warnings": list(strategy_signal.warnings),
+        },
+    }
+
+
+def _build_strategy_arm_votes(
+    *,
+    market_frame: pd.DataFrame,
+    phase1_context: dict[str, Any],
+    llm_strategy_signal: StrategyProposalSignal,
+    fast_window: int,
+    slow_window: int,
+    enabled_arms: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    votes: dict[str, dict[str, Any]] = {}
+    for arm in enabled_arms:
+        if arm == "sma_baseline":
+            votes[arm] = _build_sma_arm_vote(
+                market_frame,
+                fast_window=fast_window,
+                slow_window=slow_window,
+            )
+            continue
+        if arm == "technical_composite":
+            votes[arm] = _build_technical_arm_vote(phase1_context)
+            continue
+        if arm == "llm_context":
+            votes[arm] = _build_llm_context_arm_vote(llm_strategy_signal)
+            continue
+    return votes
+
+
+def _normalize_arm_weight_map(
+    enabled_arms: tuple[str, ...],
+    arm_weights: dict[str, float],
+) -> dict[str, float]:
+    if not enabled_arms:
+        return {}
+    sanitized = {arm: max(0.0, float(arm_weights.get(arm, 0.0))) for arm in enabled_arms}
+    total = sum(sanitized.values())
+    if total <= 0:
+        equal = 1.0 / len(enabled_arms)
+        return {arm: equal for arm in enabled_arms}
+    return {arm: float(value / total) for arm, value in sanitized.items()}
+
+
+def _bounded_weight_projection(
+    weights: dict[str, float],
+    *,
+    floor: float,
+    cap: float,
+) -> dict[str, float]:
+    if not weights:
+        return {}
+    clipped = {
+        arm: min(max(floor, float(value)), cap)
+        for arm, value in weights.items()
+    }
+    total = sum(clipped.values())
+    if total <= 0:
+        equal = 1.0 / len(clipped)
+        return {arm: equal for arm in clipped}
+    return {arm: float(value / total) for arm, value in clipped.items()}
+
+
+def _compute_arm_weights(
+    *,
+    ensemble_mode: Literal["single", "adaptive"],
+    enabled_arms: tuple[str, ...],
+    arm_votes: dict[str, dict[str, Any]],
+    ensemble_state: dict[str, Any],
+    exploration_weight: float,
+) -> tuple[dict[str, float], list[str]]:
+    if not enabled_arms:
+        return {}, ["ensemble_no_enabled_arms"]
+    if ensemble_mode == "single":
+        winner = max(
+            enabled_arms,
+            key=lambda arm: float(dict(arm_votes.get(arm, {})).get("confidence", 0.0)),
+        )
+        return (
+            {arm: (1.0 if arm == winner else 0.0) for arm in enabled_arms},
+            [f"ensemble_single_mode_winner={winner}"],
+        )
+
+    arm_stats = dict(ensemble_state.get("arm_stats", {}))
+    raw_scores: dict[str, float] = {}
+    for arm in enabled_arms:
+        vote = dict(arm_votes.get(arm, {}))
+        vote_confidence = float(np.clip(vote.get("confidence", 0.0), 0.0, 1.0))
+        stats = dict(arm_stats.get(arm, {}))
+        ewma_pnl = float(stats.get("ewma_pnl", 0.0))
+        ewma_drawdown = float(stats.get("ewma_drawdown", 0.0))
+        ewma_stability = float(np.clip(stats.get("ewma_stability", 0.5), 0.0, 1.0))
+        performance_score = 0.5 + ewma_pnl - ewma_drawdown + ((ewma_stability - 0.5) * 0.2)
+        raw_scores[arm] = max(
+            0.0,
+            (0.60 * vote_confidence) + (0.40 * performance_score),
+        ) + max(0.0, exploration_weight)
+    normalized = _normalize_arm_weight_map(enabled_arms, raw_scores)
+    bounded = _bounded_weight_projection(normalized, floor=0.05, cap=0.80)
+    return bounded, ["ensemble_adaptive_weights_applied"]
+
+
+def _combine_arm_votes(
+    *,
+    arm_votes: dict[str, dict[str, Any]],
+    arm_weights: dict[str, float],
+) -> tuple[Recommendation, float, dict[str, float], list[str], list[str]]:
+    if not arm_votes:
+        return "hold", 0.0, {"buy": 0.0, "sell": 0.0, "hold": 1.0}, [], ["ensemble_no_arm_votes"]
+    normalized_weights = _normalize_arm_weight_map(tuple(arm_votes.keys()), arm_weights)
+    aggregate_scores = {"buy": 0.0, "sell": 0.0, "hold": 0.0}
+    for arm, vote in arm_votes.items():
+        vote_payload = dict(vote)
+        recommendation = str(vote_payload.get("recommendation", "hold")).lower()
+        confidence = float(np.clip(vote_payload.get("confidence", 0.0), 0.0, 1.0))
+        raw_scores = vote_payload.get("action_scores")
+        if isinstance(raw_scores, dict):
+            action_scores = _normalize_probability_votes(raw_scores)
+        else:
+            action_scores = _normalize_probability_votes(
+                {recommendation: confidence, "hold": max(0.0, 1.0 - confidence)}
+            )
+        weight = float(normalized_weights.get(arm, 0.0))
+        for action in ("buy", "sell", "hold"):
+            aggregate_scores[action] += weight * float(action_scores.get(action, 0.0))
+    aggregate_scores = _normalize_probability_votes(aggregate_scores)
+    recommendation = max(aggregate_scores, key=aggregate_scores.get)
+    confidence = float(aggregate_scores.get(recommendation, 0.0))
+    selected_arms = sorted(
+        [arm for arm in normalized_weights if normalized_weights[arm] > 0.0],
+        key=lambda arm: normalized_weights[arm],
+        reverse=True,
+    )
+    reason_codes = [f"ensemble_selected_{recommendation}"]
+    for arm in selected_arms[:3]:
+        reason_codes.append(f"arm_weight_{arm}_{normalized_weights[arm]:.3f}")
+    return recommendation, confidence, aggregate_scores, selected_arms, reason_codes
+
+
+def _update_ensemble_weight_state(
+    *,
+    state_path: Path,
+    ensemble_state: dict[str, Any],
+    selected_arms: list[str],
+    arm_weights: dict[str, float],
+    paper_trade_execution: PaperTradeExecution,
+    decay_horizon: int,
+    exploration_weight: float,
+    run_id: str,
+) -> dict[str, Any]:
+    alpha = 2.0 / (max(4, decay_horizon) + 1.0)
+    executed_notional = max(0.0, float(paper_trade_execution.executed_notional_usd))
+    realized_pnl = float(paper_trade_execution.realized_pnl_delta_usd)
+    pnl_ratio = realized_pnl / max(1.0, executed_notional) if executed_notional > 0 else 0.0
+    drawdown = max(0.0, -pnl_ratio)
+    executed = paper_trade_execution.execution_status == "executed"
+
+    before_state = _json_safe(dict(ensemble_state))
+    arm_stats = dict(ensemble_state.get("arm_stats", {}))
+    normalized_weights = _normalize_arm_weight_map(tuple(arm_stats.keys()), arm_weights)
+    for arm, raw_stats in arm_stats.items():
+        stats = dict(raw_stats)
+        participated = arm in selected_arms
+        attributed_weight = float(normalized_weights.get(arm, 0.0)) if participated else 0.0
+        pnl_signal = pnl_ratio * attributed_weight if participated and executed else 0.0
+        drawdown_signal = drawdown * attributed_weight if participated and executed else 0.0
+        stability_signal = 1.0 if participated and executed else 0.0
+        stats["ewma_pnl"] = float(((1.0 - alpha) * float(stats.get("ewma_pnl", 0.0))) + (alpha * pnl_signal))
+        stats["ewma_drawdown"] = float(
+            ((1.0 - alpha) * float(stats.get("ewma_drawdown", 0.0))) + (alpha * drawdown_signal)
+        )
+        stats["ewma_stability"] = float(
+            np.clip(
+                ((1.0 - alpha) * float(stats.get("ewma_stability", 0.5))) + (alpha * stability_signal),
+                0.0,
+                1.0,
+            )
+        )
+        stats["observations"] = int(max(0, int(stats.get("observations", 0)) + (1 if participated else 0)))
+        stats["last_weight"] = float(normalized_weights.get(arm, 0.0))
+        arm_stats[arm] = stats
+
+    history = list(ensemble_state.get("history", []))
+    history.append(
+        {
+            "run_id": run_id,
+            "created_at_utc": _utc_now_iso(),
+            "selected_arms": list(selected_arms),
+            "execution_status": paper_trade_execution.execution_status,
+            "executed_action": paper_trade_execution.executed_action,
+            "pnl_ratio": pnl_ratio,
+            "drawdown": drawdown,
+        }
+    )
+    ensemble_state["contract"] = "ensemble_weight_state.v1"
+    ensemble_state["updated_at_utc"] = _utc_now_iso()
+    ensemble_state["decay_horizon"] = max(4, int(decay_horizon))
+    ensemble_state["exploration_weight"] = max(0.0, float(exploration_weight))
+    ensemble_state["arm_stats"] = arm_stats
+    ensemble_state["history"] = history[-200:]
+    _write_json(state_path, ensemble_state)
+    return {
+        "contract": "ensemble_weight_update.v1",
+        "run_id": run_id,
+        "created_at_utc": _utc_now_iso(),
+        "state_path": str(state_path),
+        "alpha": alpha,
+        "selected_arms": list(selected_arms),
+        "execution_status": paper_trade_execution.execution_status,
+        "executed_action": paper_trade_execution.executed_action,
+        "executed_notional_usd": executed_notional,
+        "realized_pnl_delta_usd": realized_pnl,
+        "pnl_ratio": pnl_ratio,
+        "drawdown": drawdown,
+        "before": before_state,
+        "after": _json_safe(dict(ensemble_state)),
+    }
 
 
 def _run_step_with_retries(
@@ -1170,6 +1571,7 @@ def _ops_prompt(context: dict[str, Any]) -> str:
             "## Self-critique",
             "## Deterministic gate outcome",
             "## Decision trace",
+            "## Ensemble evidence",
             "## Paper intent",
             "## Paper execution",
             "## Follow-ups",
@@ -1198,6 +1600,8 @@ def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
         f"- Timeframe: `{context['scope']['timeframe']}`",
         f"- Strategy recommendation: `{context['proposal']['recommendation']}`",
         f"- Backtest status: `{context['backtest']['status']}`",
+        f"- Ensemble mode: `{context.get('ensemble', {}).get('mode')}`",
+        f"- Selected arms: `{context['proposal'].get('selected_arms', [])}`",
         "",
         "## Self-critique",
         f"- Pass: `{self_critique.get('pass')}`",
@@ -1237,6 +1641,12 @@ def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "## Ensemble evidence",
+            f"- Arm weights: `{context['proposal'].get('arm_weights', {})}`",
+            f"- Ensemble reason codes: `{context['proposal'].get('ensemble_reason_codes', [])}`",
+            f"- Performance update path: `{context.get('ensemble', {}).get('performance_update_path')}`",
+            f"- Weight state path: `{context.get('ensemble', {}).get('weight_state_path')}`",
+            "",
             "## Paper intent",
             f"- Status: `{intent_status}`",
             f"- Action: `{context['intent']['action']}`",
@@ -1249,6 +1659,7 @@ def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
             f"- Fee USD: `{context['execution']['fee_usd']}`",
             f"- Cash after USD: `{context['execution']['cash_after_usd']}`",
             f"- Position qty after: `{context['execution']['position_qty_after']}`",
+            f"- Arm attribution: `{context['execution'].get('arm_attribution', {})}`",
             "",
             "## Follow-ups",
             "- Validate model availability in local Ollama if fallback mode was used.",
@@ -1289,6 +1700,15 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     ops_report_markdown_path = run_dir / "ops_report.md"
     ops_report_contract_path = run_dir / "ops_report_contract.json"
     run_manifest_path = run_dir / "run_manifest.json"
+    ensemble_performance_update_path = run_dir / "ensemble_performance_update.json"
+    ensemble_weight_state_path = (
+        settings.quant_data_root / "paper-trading" / "state" / "ensemble_weight_state.json"
+    )
+    ensemble_state_path = (
+        ensemble_weight_state_path
+        if config.source_data_path is None
+        else (run_dir / "ensemble_weight_state_replay.json")
+    )
 
     def data_quality_runner() -> tuple[DataQualitySignal, pd.DataFrame]:
         frame = _load_market_frame(source_data_path)
@@ -1470,25 +1890,101 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         runner=strategy_runner,
         fallback=strategy_fallback,
     )
-    write_contract(strategy_signal_path, strategy_signal)
     step_records.append(strategy_step)
+    llm_strategy_signal = strategy_signal
+
+    ensemble_mode = _normalize_ensemble_mode(config.ensemble_mode)
+    enabled_arms = _normalize_enabled_arms(config.ensemble_enabled_arms)
+    ensemble_state = _load_ensemble_weight_state(
+        path=ensemble_state_path,
+        enabled_arms=enabled_arms,
+        decay_horizon=max(4, int(config.ensemble_decay_horizon)),
+        exploration_weight=max(0.0, float(config.ensemble_exploration_weight)),
+    )
+    arm_votes = _build_strategy_arm_votes(
+        market_frame=market_frame,
+        phase1_context=phase1_feature_context,
+        llm_strategy_signal=llm_strategy_signal,
+        fast_window=llm_strategy_signal.fast_window,
+        slow_window=llm_strategy_signal.slow_window,
+        enabled_arms=enabled_arms,
+    )
+    arm_weights, weight_reason_codes = _compute_arm_weights(
+        ensemble_mode=ensemble_mode,
+        enabled_arms=enabled_arms,
+        arm_votes=arm_votes,
+        ensemble_state=ensemble_state,
+        exploration_weight=max(0.0, float(config.ensemble_exploration_weight)),
+    )
+    (
+        ensemble_recommendation,
+        ensemble_confidence,
+        ensemble_action_scores,
+        selected_arms,
+        combine_reason_codes,
+    ) = _combine_arm_votes(
+        arm_votes=arm_votes,
+        arm_weights=arm_weights,
+    )
+    ensemble_reason_codes = sorted(
+        set([*weight_reason_codes, *combine_reason_codes, f"ensemble_mode_{ensemble_mode}"])
+    )
+    strategy_signal = StrategyProposalSignal(
+        contract="strategy_proposal_signal.v1",
+        run_id=llm_strategy_signal.run_id,
+        created_at_utc=_utc_now_iso(),
+        source=llm_strategy_signal.source,
+        model=llm_strategy_signal.model,
+        exchange=llm_strategy_signal.exchange,
+        symbol=llm_strategy_signal.symbol,
+        timeframe=llm_strategy_signal.timeframe,
+        input_data_path=llm_strategy_signal.input_data_path,
+        input_data_sha256=llm_strategy_signal.input_data_sha256,
+        recommendation=ensemble_recommendation,
+        confidence=ensemble_confidence,
+        fast_window=llm_strategy_signal.fast_window,
+        slow_window=llm_strategy_signal.slow_window,
+        rationale=(
+            f"Ensemble decision ({ensemble_mode}) over arms {selected_arms}. "
+            f"LLM context recommendation was {llm_strategy_signal.recommendation}. "
+            f"{llm_strategy_signal.rationale}"
+        ),
+        raw_model_response=llm_strategy_signal.raw_model_response,
+        warnings=list(llm_strategy_signal.warnings),
+        indicator_votes=ensemble_action_scores,
+        regime=llm_strategy_signal.regime,
+        feature_snapshot=dict(llm_strategy_signal.feature_snapshot),
+        reason_codes=sorted(
+            set([*llm_strategy_signal.reason_codes, *ensemble_reason_codes])
+        ),
+        arm_votes=arm_votes,
+        arm_weights=arm_weights,
+        selected_arms=selected_arms,
+        ensemble_reason_codes=ensemble_reason_codes,
+    )
+    write_contract(strategy_signal_path, strategy_signal)
 
     def backtest_runner() -> BacktestEvaluation:
-        backtest_result = run_sma_backtest(
+        backtest_result = run_ensemble_backtest(
             settings=settings,
             exchange=config.exchange,
             symbol=config.symbol,
             timeframe=config.timeframe,
-            fast_window=strategy_signal.fast_window,
-            slow_window=strategy_signal.slow_window,
+            fast_window=max(2, strategy_signal.fast_window),
+            slow_window=max(3, strategy_signal.slow_window),
+            enabled_arms=tuple(strategy_signal.selected_arms),
+            arm_weights=dict(strategy_signal.arm_weights),
+            llm_recommendation=llm_strategy_signal.recommendation,
+            ensemble_mode=ensemble_mode,
             source_data_path=source_data_path,
             archive_run=False,
         )
+        metrics_payload = backtest_result.ensemble_metrics or backtest_result.metrics
         return BacktestEvaluation(
             contract="backtest_evaluation.v1",
             run_id=run_id,
             created_at_utc=_utc_now_iso(),
-            strategy=STRATEGY_NAME,
+            strategy=ENSEMBLE_STRATEGY_NAME,
             exchange=config.exchange,
             symbol=config.symbol,
             timeframe=config.timeframe,
@@ -1498,13 +1994,20 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             backtest_run_dir=str(backtest_result.run_dir),
             metrics_path=str(backtest_result.metrics_path),
             manifest_path=str(backtest_result.manifest_path),
-            total_return=float(backtest_result.metrics["total_return"]),
-            annualized_return=float(backtest_result.metrics["annualized_return"]),
-            sharpe=float(backtest_result.metrics["sharpe"]),
-            max_drawdown=float(backtest_result.metrics["max_drawdown"]),
-            signal_flips=int(backtest_result.metrics["signal_flips"]),
-            bars=int(backtest_result.metrics["bars"]),
+            total_return=float(metrics_payload["total_return"]),
+            annualized_return=float(metrics_payload["annualized_return"]),
+            sharpe=float(metrics_payload["sharpe"]),
+            max_drawdown=float(metrics_payload["max_drawdown"]),
+            signal_flips=int(metrics_payload["signal_flips"]),
+            bars=int(metrics_payload["bars"]),
             error_message=None,
+            arm_metrics=dict(backtest_result.arm_metrics),
+            ensemble_metrics=dict(backtest_result.ensemble_metrics),
+            arm_attribution_path=(
+                str(backtest_result.arm_attribution_path)
+                if backtest_result.arm_attribution_path is not None
+                else None
+            ),
         )
 
     def backtest_fallback(errors: list[str]) -> BacktestEvaluation:
@@ -1512,7 +2015,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             contract="backtest_evaluation.v1",
             run_id=run_id,
             created_at_utc=_utc_now_iso(),
-            strategy=STRATEGY_NAME,
+            strategy=ENSEMBLE_STRATEGY_NAME,
             exchange=config.exchange,
             symbol=config.symbol,
             timeframe=config.timeframe,
@@ -1529,6 +2032,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             signal_flips=None,
             bars=None,
             error_message=errors[-1] if errors else "Unknown backtest failure",
+            arm_metrics={},
+            ensemble_metrics={},
+            arm_attribution_path=None,
         )
 
     backtest_evaluation, backtest_step = _run_step_with_retries(
@@ -1540,6 +2046,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     )
     write_contract(backtest_evaluation_path, backtest_evaluation)
     step_records.append(backtest_step)
+    backtest_arm_attribution_path = (
+        Path(backtest_evaluation.arm_attribution_path)
+        if backtest_evaluation.arm_attribution_path
+        else None
+    )
 
     def walkforward_runner() -> dict[str, Any]:
         return _run_walkforward_evaluation(
@@ -1750,6 +2261,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             if item.get("code")
         }
         action = strategy_signal.recommendation
+        arm_votes = dict(strategy_signal.arm_votes)
+        arm_weights = _normalize_arm_weight_map(tuple(arm_votes.keys()), dict(strategy_signal.arm_weights))
+        selected_arms = list(strategy_signal.selected_arms) or sorted(
+            [arm for arm, weight in arm_weights.items() if weight > 0.0],
+            key=lambda arm: arm_weights.get(arm, 0.0),
+            reverse=True,
+        )
+        ensemble_reason_codes = [str(code) for code in list(strategy_signal.ensemble_reason_codes)]
 
         def register_reason(reason_code: str, severity: Literal["block", "fail"], detail: str) -> None:
             if severity == "fail":
@@ -1818,6 +2337,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "self_critique_score": self_critique_score,
             "self_critique_highest_severity": self_critique_highest,
             "self_critique_reason_codes": self_critique_reason_codes,
+            "arm_votes": arm_votes,
+            "arm_weights": arm_weights,
+            "selected_arms": selected_arms,
+            "ensemble_reason_codes": ensemble_reason_codes,
         }
         thresholds = {
             "min_total_return": config.thresholds.min_total_return,
@@ -1830,6 +2353,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "walkforward_quality_medium_cutoff": 0.55,
             "walkforward_quality_high_cutoff": 0.70,
             "self_critique_min_score": config.self_critique_min_score,
+            "ensemble_min_selected_arms": 1.0,
         }
 
         trace_check(
@@ -1898,6 +2422,36 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             failure_reason_code="non_actionable_recommendation",
             failure_severity="block",
             failure_detail="Recommendation was hold and cannot emit a trade intent.",
+        )
+        trace_check(
+            gate="ensemble",
+            metric="arm_votes_present",
+            observed_value=len(arm_votes),
+            threshold=">= 1",
+            passed=len(arm_votes) >= 1,
+            failure_reason_code="ensemble_arm_votes_missing",
+            failure_severity="fail",
+            failure_detail="No arm vote evidence was available for ensemble decisioning.",
+        )
+        trace_check(
+            gate="ensemble",
+            metric="selected_arms_present",
+            observed_value=len(selected_arms),
+            threshold=">= 1",
+            passed=len(selected_arms) >= 1,
+            failure_reason_code="ensemble_selected_arms_missing",
+            failure_severity="fail",
+            failure_detail="Ensemble selected-arm list is empty.",
+        )
+        trace_check(
+            gate="ensemble",
+            metric="arm_weights_sum",
+            observed_value=sum(arm_weights.values()),
+            threshold="~ 1.0",
+            passed=abs(sum(arm_weights.values()) - 1.0) <= 0.05 if arm_weights else False,
+            failure_reason_code="ensemble_arm_weights_invalid",
+            failure_severity="fail",
+            failure_detail="Ensemble arm weights were missing or not normalized.",
         )
 
         if actionable:
@@ -2059,6 +2613,18 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                     "reason_code": reason_code,
                 }
             )
+        for reason_code in ensemble_reason_codes:
+            decision_trace.append(
+                {
+                    "gate": "ensemble_reason",
+                    "metric": reason_code,
+                    "observed": "advisory",
+                    "threshold": "none",
+                    "pass": True,
+                    "severity": "advisory",
+                    "reason_code": reason_code,
+                }
+            )
 
         reasons = sorted(set([*fail_reasons, *block_reasons]))
         approved = len(reasons) == 0
@@ -2074,6 +2640,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             recommendation=strategy_signal.recommendation,
             recommendation_confidence=calibrated_confidence,
             deterministic_gate="pass" if approved else "fail",
+            arm_votes=arm_votes,
+            arm_weights=arm_weights,
+            selected_arms=selected_arms,
+            ensemble_reason_codes=ensemble_reason_codes,
             decision_trace=decision_trace,
             reason_code_details=reason_code_details,
             gate_transition_sequence=gate_transition_sequence,
@@ -2121,6 +2691,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             risk_approved=risk_decision.approved,
             reason=reason,
             destination_path=destination_path,
+            arm_votes=dict(risk_decision.arm_votes),
+            arm_weights=dict(risk_decision.arm_weights),
+            selected_arms=list(risk_decision.selected_arms),
+            ensemble_reason_codes=list(risk_decision.ensemble_reason_codes),
         )
 
     paper_trade_intent, action_step = _run_step_with_retries(
@@ -2161,6 +2735,17 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     )
     write_contract(paper_trade_execution_path, paper_trade_execution)
     step_records.append(paper_execution_step)
+    ensemble_performance_update = _update_ensemble_weight_state(
+        state_path=ensemble_state_path,
+        ensemble_state=ensemble_state,
+        selected_arms=list(paper_trade_execution.selected_arms),
+        arm_weights=dict(paper_trade_execution.arm_weights),
+        paper_trade_execution=paper_trade_execution,
+        decay_horizon=max(4, int(config.ensemble_decay_horizon)),
+        exploration_weight=max(0.0, float(config.ensemble_exploration_weight)),
+        run_id=run_id,
+    )
+    _write_json(ensemble_performance_update_path, ensemble_performance_update)
 
     ops_context = {
         "run_id": run_id,
@@ -2183,6 +2768,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "fast_window": strategy_signal.fast_window,
             "slow_window": strategy_signal.slow_window,
             "rationale": strategy_signal.rationale,
+            "arm_votes": strategy_signal.arm_votes,
+            "arm_weights": strategy_signal.arm_weights,
+            "selected_arms": strategy_signal.selected_arms,
+            "ensemble_reason_codes": strategy_signal.ensemble_reason_codes,
         },
         "phase1": phase1_feature_context,
         "backtest": {
@@ -2191,6 +2780,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "annualized_return": backtest_evaluation.annualized_return,
             "sharpe": backtest_evaluation.sharpe,
             "max_drawdown": backtest_evaluation.max_drawdown,
+            "arm_metrics": backtest_evaluation.arm_metrics,
+            "ensemble_metrics": backtest_evaluation.ensemble_metrics,
+            "arm_attribution_path": backtest_evaluation.arm_attribution_path,
         },
         "walkforward": walkforward_evaluation,
         "calibration": confidence_calibration,
@@ -2203,6 +2795,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "decision_trace": risk_decision.decision_trace,
             "reason_code_details": risk_decision.reason_code_details,
             "gate_transition_sequence": risk_decision.gate_transition_sequence,
+            "arm_votes": risk_decision.arm_votes,
+            "arm_weights": risk_decision.arm_weights,
+            "selected_arms": risk_decision.selected_arms,
+            "ensemble_reason_codes": risk_decision.ensemble_reason_codes,
         },
         "intent": {
             "status": paper_trade_intent.status,
@@ -2222,6 +2818,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "portfolio_state_path": paper_trade_execution.portfolio_state_path,
             "fills_log_path": paper_trade_execution.fills_log_path,
             "execution_record_path": paper_trade_execution.execution_record_path,
+            "arm_attribution": paper_trade_execution.arm_attribution,
+        },
+        "ensemble": {
+            "mode": ensemble_mode,
+            "enabled_arms": list(enabled_arms),
+            "weight_state_path": str(ensemble_state_path),
+            "performance_update_path": str(ensemble_performance_update_path),
+            "performance_update": ensemble_performance_update,
         },
     }
 
@@ -2296,7 +2900,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "paper_portfolio_state": paper_trade_execution.portfolio_state_path or "",
             "paper_fills_log": paper_trade_execution.fills_log_path or "",
             "paper_execution_record": paper_trade_execution.execution_record_path or "",
+            "backtest_arm_attribution": backtest_evaluation.arm_attribution_path or "",
+            "ensemble_weight_state": str(ensemble_state_path),
+            "ensemble_performance_update": str(ensemble_performance_update_path),
         },
+        arm_votes=dict(risk_decision.arm_votes),
+        arm_weights=dict(risk_decision.arm_weights),
+        selected_arms=list(risk_decision.selected_arms),
+        ensemble_reason_codes=list(risk_decision.ensemble_reason_codes),
         decision_trace=list(risk_decision.decision_trace),
         reason_code_details=dict(risk_decision.reason_code_details),
         gate_transition_sequence=list(risk_decision.gate_transition_sequence),
@@ -2332,6 +2943,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "self_critique_min_score": config.self_critique_min_score,
             "self_critique_max_findings": config.self_critique_max_findings,
             "ops_report_verbosity": _normalize_report_verbosity(config.ops_report_verbosity),
+            "ensemble_mode": ensemble_mode,
+            "ensemble_enabled_arms": list(enabled_arms),
+            "ensemble_decay_horizon": max(4, int(config.ensemble_decay_horizon)),
+            "ensemble_exploration_weight": max(0.0, float(config.ensemble_exploration_weight)),
             "paper_notional_usd": config.paper_notional_usd,
             "paper_starting_cash_usd": config.paper_starting_cash_usd,
             "paper_fee_bps": config.paper_fee_bps,
@@ -2352,6 +2967,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "paper_trade_execution": str(paper_trade_execution_path),
             "ops_report_markdown": str(ops_report_markdown_path),
             "ops_report_contract": str(ops_report_contract_path),
+            "backtest_arm_attribution": str(backtest_arm_attribution_path)
+            if backtest_arm_attribution_path
+            else None,
+            "ensemble_weight_state": str(ensemble_state_path),
+            "ensemble_performance_update": str(ensemble_performance_update_path),
             "paper_trade_destination": str(intent_destination_path) if intent_destination_path else None,
             "paper_portfolio_state": paper_trade_execution.portfolio_state_path,
             "paper_fills_log": paper_trade_execution.fills_log_path,
@@ -2367,6 +2987,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "self_critique_score": self_critique_signal.get("score"),
             "self_critique_pass": self_critique_signal.get("pass"),
             "decision_trace_entries": len(risk_decision.decision_trace),
+            "selected_arms": list(risk_decision.selected_arms),
+            "ensemble_reason_codes": list(risk_decision.ensemble_reason_codes),
         },
     }
     _write_json(run_manifest_path, run_manifest)
@@ -2385,6 +3007,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         data_quality_path=data_quality_path,
         strategy_signal_path=strategy_signal_path,
         backtest_evaluation_path=backtest_evaluation_path,
+        backtest_arm_attribution_path=backtest_arm_attribution_path,
         phase1_feature_context_path=phase1_feature_context_path,
         walkforward_evaluation_path=walkforward_evaluation_path,
         confidence_calibration_path=confidence_calibration_path,
@@ -2395,6 +3018,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         ops_report_markdown_path=ops_report_markdown_path,
         ops_report_contract_path=ops_report_contract_path,
         run_manifest_path=run_manifest_path,
+        ensemble_performance_update_path=ensemble_performance_update_path,
         risk_approved=risk_decision.approved,
         intent_status=paper_trade_intent.status,
         paper_trade_execution_status=paper_trade_execution.execution_status,

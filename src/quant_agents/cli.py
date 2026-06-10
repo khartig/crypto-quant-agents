@@ -28,6 +28,19 @@ from quant_agents.visualization import generate_run_visuals
 logger = logging.getLogger(__name__)
 
 
+def _parse_ensemble_arms(value: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return tuple()
+    if isinstance(value, tuple):
+        items = value
+    elif isinstance(value, list):
+        items = tuple(str(item) for item in value)
+    else:
+        items = tuple(part.strip() for part in str(value).split(","))
+    normalized = tuple(item.strip().lower() for item in items if item and item.strip())
+    return normalized
+
+
 def _base_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quant-agents",
@@ -220,6 +233,29 @@ def _base_parser() -> argparse.ArgumentParser:
         choices=["compact", "standard", "verbose"],
         default=None,
         help="Phase 3: deterministic ops report detail level.",
+    )
+    agent_plane.add_argument(
+        "--ensemble-mode",
+        choices=["single", "adaptive"],
+        default=None,
+        help="Phase 4: ensemble combiner mode.",
+    )
+    agent_plane.add_argument(
+        "--ensemble-arms",
+        default=None,
+        help="Phase 4: comma-separated enabled strategy arms (for example sma_baseline,technical_composite,llm_context).",
+    )
+    agent_plane.add_argument(
+        "--ensemble-decay-horizon",
+        type=int,
+        default=None,
+        help="Phase 4: decay horizon for adaptive arm-performance weighting.",
+    )
+    agent_plane.add_argument(
+        "--ensemble-exploration-weight",
+        type=float,
+        default=None,
+        help="Phase 4: minimum exploration mass injected before adaptive normalization.",
     )
     agent_plane.add_argument(
         "--paper-notional-usd",
@@ -751,6 +787,31 @@ def main(argv: list[str] | None = None) -> None:
                 args.ops_report_verbosity
                 if args.ops_report_verbosity is not None
                 else settings.ops_report_verbosity
+            ),
+            ensemble_mode=(
+                args.ensemble_mode
+                if args.ensemble_mode is not None
+                else settings.ensemble_mode
+            ),
+            ensemble_enabled_arms=(
+                _parse_ensemble_arms(args.ensemble_arms)
+                if args.ensemble_arms is not None
+                else tuple(settings.ensemble_enabled_arms)
+            ),
+            ensemble_decay_horizon=max(
+                4,
+                args.ensemble_decay_horizon
+                if args.ensemble_decay_horizon is not None
+                else settings.ensemble_decay_horizon,
+            ),
+            ensemble_exploration_weight=min(
+                0.50,
+                max(
+                    0.0,
+                    args.ensemble_exploration_weight
+                    if args.ensemble_exploration_weight is not None
+                    else settings.ensemble_exploration_weight,
+                ),
             ),
             source_data_path=source_file,
         )

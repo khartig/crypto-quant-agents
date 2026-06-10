@@ -133,6 +133,13 @@ def execute_paper_trade_intent(
     position = _ensure_position(state, symbol)
     fee_rate = max(0.0, float(fee_bps)) / 10_000.0
     requested_notional_usd = max(0.0, float(intent.notional_usd))
+    arm_votes = dict(intent.arm_votes)
+    arm_weights = {
+        str(arm): max(0.0, _coerce_float(weight, 0.0))
+        for arm, weight in dict(intent.arm_weights).items()
+    }
+    selected_arms = [str(arm) for arm in list(intent.selected_arms) if str(arm).strip()]
+    ensemble_reason_codes = [str(code) for code in list(intent.ensemble_reason_codes)]
 
     execution_status = "skipped"
     executed_action: Recommendation = "hold"
@@ -233,10 +240,33 @@ def execute_paper_trade_intent(
                 "notional_usd": _round(executed_notional_usd),
                 "fee_usd": _round(fee_usd),
                 "reason": reason,
+                "selected_arms": selected_arms,
+                "arm_weights": arm_weights,
+                "ensemble_reason_codes": ensemble_reason_codes,
             },
         )
 
     position_after = state["positions"].get(symbol, {})
+    resolved_selected_arms = selected_arms or sorted(arm_weights.keys())
+    total_selected_weight = sum(max(0.0, arm_weights.get(arm, 0.0)) for arm in resolved_selected_arms)
+    arm_attribution: dict[str, dict[str, Any]] = {}
+    for arm in resolved_selected_arms:
+        raw_weight = max(0.0, arm_weights.get(arm, 0.0))
+        normalized_weight = (
+            (raw_weight / total_selected_weight)
+            if total_selected_weight > 0
+            else (1.0 / len(resolved_selected_arms))
+        )
+        arm_vote = dict(arm_votes.get(arm, {}))
+        arm_attribution[arm] = {
+            "weight": _round(normalized_weight),
+            "proposed_action": str(arm_vote.get("recommendation", "hold")),
+            "selected_action": intent.action,
+            "executed_action": executed_action,
+            "executed": execution_status == "executed",
+            "attributed_notional_usd": _round(executed_notional_usd * normalized_weight),
+            "attributed_realized_pnl_delta_usd": _round(realized_pnl_delta_usd * normalized_weight),
+        }
     contract = PaperTradeExecution(
         contract="paper_trade_execution.v1",
         run_id=run_id,
@@ -262,6 +292,11 @@ def execute_paper_trade_intent(
         portfolio_state_path=str(state_path),
         fills_log_path=str(fills_log_path),
         execution_record_path=str(execution_record_path),
+        arm_votes=arm_votes,
+        arm_weights=arm_weights,
+        selected_arms=resolved_selected_arms,
+        ensemble_reason_codes=ensemble_reason_codes,
+        arm_attribution=arm_attribution,
     )
     write_contract(execution_record_path, contract)
     return contract

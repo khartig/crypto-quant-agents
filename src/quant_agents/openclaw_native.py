@@ -24,11 +24,14 @@ REQUIRED_ARTIFACT_KEYS: tuple[str, ...] = (
     "self_critique_signal",
     "strategy_proposal_signal",
     "backtest_evaluation",
+    "backtest_arm_attribution",
     "risk_decision",
     "paper_trade_intent",
     "paper_trade_execution",
     "ops_report_markdown",
     "ops_report_contract",
+    "ensemble_weight_state",
+    "ensemble_performance_update",
     "run_manifest",
 )
 
@@ -84,6 +87,10 @@ class OpenClawOrchestrationRequest:
     self_critique_min_score: float
     self_critique_max_findings: int
     ops_report_verbosity: str
+    ensemble_mode: str
+    ensemble_enabled_arms: tuple[str, ...]
+    ensemble_decay_horizon: int
+    ensemble_exploration_weight: float
     paper_notional_usd: float
     paper_starting_cash_usd: float
     paper_fee_bps: float
@@ -152,6 +159,32 @@ class OpenClawOrchestrationRequest:
             ops_report_verbosity=str(
                 payload.get("ops_report_verbosity", settings.ops_report_verbosity)
             ).strip().lower(),
+            ensemble_mode=str(
+                payload.get("ensemble_mode", settings.ensemble_mode)
+            ).strip().lower(),
+            ensemble_enabled_arms=tuple(
+                str(arm).strip().lower()
+                for arm in (
+                    payload.get("ensemble_enabled_arms")
+                    if isinstance(payload.get("ensemble_enabled_arms"), list)
+                    else settings.ensemble_enabled_arms
+                )
+                if str(arm).strip()
+            )
+            or tuple(settings.ensemble_enabled_arms),
+            ensemble_decay_horizon=max(
+                4,
+                int(payload.get("ensemble_decay_horizon", settings.ensemble_decay_horizon)),
+            ),
+            ensemble_exploration_weight=max(
+                0.0,
+                float(
+                    payload.get(
+                        "ensemble_exploration_weight",
+                        settings.ensemble_exploration_weight,
+                    )
+                ),
+            ),
             paper_notional_usd=float(payload.get("paper_notional_usd", settings.paper_trade_notional_usd)),
             paper_starting_cash_usd=float(
                 payload.get("paper_starting_cash_usd", settings.paper_trade_starting_cash_usd)
@@ -190,6 +223,10 @@ class OpenClawOrchestrationRequest:
             self_critique_min_score=self.self_critique_min_score,
             self_critique_max_findings=self.self_critique_max_findings,
             ops_report_verbosity=self.ops_report_verbosity,
+            ensemble_mode=self.ensemble_mode if self.ensemble_mode in {"single", "adaptive"} else "adaptive",
+            ensemble_enabled_arms=tuple(self.ensemble_enabled_arms),
+            ensemble_decay_horizon=max(4, int(self.ensemble_decay_horizon)),
+            ensemble_exploration_weight=max(0.0, float(self.ensemble_exploration_weight)),
             source_data_path=Path(self.source_data_path).expanduser().resolve()
             if self.source_data_path
             else None,
@@ -217,6 +254,11 @@ def run_openclaw_orchestration(
             "phase1_feature_context": str(result.phase1_feature_context_path),
             "strategy_proposal_signal": str(result.strategy_signal_path),
             "backtest_evaluation": str(result.backtest_evaluation_path),
+            "backtest_arm_attribution": (
+                str(result.backtest_arm_attribution_path)
+                if result.backtest_arm_attribution_path is not None
+                else None
+            ),
             "walkforward_evaluation": str(result.walkforward_evaluation_path),
             "confidence_calibration": str(result.confidence_calibration_path),
             "self_critique_signal": str(result.self_critique_signal_path),
@@ -225,6 +267,23 @@ def run_openclaw_orchestration(
             "paper_trade_execution": str(result.paper_trade_execution_path),
             "ops_report_markdown": str(result.ops_report_markdown_path),
             "ops_report_contract": str(result.ops_report_contract_path),
+            "ensemble_weight_state": str(
+                (
+                    result.run_dir / "ensemble_weight_state_replay.json"
+                    if request.source_data_path
+                    else (
+                        resolved_settings.quant_data_root
+                        / "paper-trading"
+                        / "state"
+                        / "ensemble_weight_state.json"
+                    )
+                )
+            ),
+            "ensemble_performance_update": (
+                str(result.ensemble_performance_update_path)
+                if result.ensemble_performance_update_path is not None
+                else None
+            ),
             "run_manifest": str(result.run_manifest_path),
             "paper_trade_destination": (
                 str(result.intent_destination_path) if result.intent_destination_path else None
@@ -279,6 +338,7 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             return None
 
     data_quality = _load_contract("data_quality_signal")
+    strategy_proposal = _load_contract("strategy_proposal_signal")
     confidence_calibration = _load_contract("confidence_calibration")
     self_critique = _load_contract("self_critique_signal")
     backtest = _load_contract("backtest_evaluation")
@@ -286,6 +346,8 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
     intent = _load_contract("paper_trade_intent")
     execution = _load_contract("paper_trade_execution")
     ops_report_contract = _load_contract("ops_report_contract")
+    ensemble_weight_state = _load_contract("ensemble_weight_state")
+    ensemble_performance_update = _load_contract("ensemble_performance_update")
     run_manifest = _load_contract("run_manifest")
 
     if data_quality is not None:
@@ -294,11 +356,50 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
         if not is_valid:
             errors.append("data_quality_not_valid")
 
+    if strategy_proposal is not None:
+        strategy_arm_votes = strategy_proposal.get("arm_votes")
+        strategy_arm_weights = strategy_proposal.get("arm_weights")
+        strategy_selected_arms = strategy_proposal.get("selected_arms")
+        strategy_ensemble_reasons = strategy_proposal.get("ensemble_reason_codes")
+        arm_votes_present = isinstance(strategy_arm_votes, dict) and len(strategy_arm_votes) > 0
+        arm_weights_present = isinstance(strategy_arm_weights, dict) and len(strategy_arm_weights) > 0
+        selected_arms_present = isinstance(strategy_selected_arms, list) and len(strategy_selected_arms) > 0
+        ensemble_reasons_present = isinstance(strategy_ensemble_reasons, list)
+        checks["strategy:arm_votes_present"] = arm_votes_present
+        checks["strategy:arm_weights_present"] = arm_weights_present
+        checks["strategy:selected_arms_present"] = selected_arms_present
+        checks["strategy:ensemble_reason_codes_present"] = ensemble_reasons_present
+        if not arm_votes_present:
+            errors.append("strategy_arm_votes_missing")
+        if not arm_weights_present:
+            errors.append("strategy_arm_weights_missing")
+        if not selected_arms_present:
+            errors.append("strategy_selected_arms_missing")
+        if not ensemble_reasons_present:
+            errors.append("strategy_ensemble_reason_codes_invalid")
+
     if backtest is not None:
         backtest_success = str(backtest.get("backtest_status")) == "success"
+        backtest_arm_metrics = backtest.get("arm_metrics")
+        backtest_ensemble_metrics = backtest.get("ensemble_metrics")
+        backtest_arm_attribution_path = backtest.get("arm_attribution_path")
+        backtest_arm_metrics_present = isinstance(backtest_arm_metrics, dict) and len(backtest_arm_metrics) > 0
+        backtest_ensemble_metrics_present = isinstance(backtest_ensemble_metrics, dict)
+        backtest_arm_attribution_present = isinstance(backtest_arm_attribution_path, str) and bool(
+            backtest_arm_attribution_path
+        )
         checks["backtest:success"] = backtest_success
+        checks["backtest:arm_metrics_present"] = backtest_arm_metrics_present
+        checks["backtest:ensemble_metrics_present"] = backtest_ensemble_metrics_present
+        checks["backtest:arm_attribution_path_present"] = backtest_arm_attribution_present
         if not backtest_success:
             errors.append("backtest_not_success")
+        if not backtest_arm_metrics_present:
+            errors.append("backtest_arm_metrics_missing")
+        if not backtest_ensemble_metrics_present:
+            errors.append("backtest_ensemble_metrics_missing")
+        if not backtest_arm_attribution_present:
+            errors.append("backtest_arm_attribution_missing")
 
     if confidence_calibration is not None:
         calibrated_confidence_present = isinstance(
@@ -345,11 +446,25 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
         gate_transition_present = isinstance(risk.get("gate_transition_sequence"), list) and len(
             list(risk.get("gate_transition_sequence") or [])
         ) > 0
+        risk_arm_votes_present = isinstance(risk.get("arm_votes"), dict) and len(
+            dict(risk.get("arm_votes") or {})
+        ) > 0
+        risk_arm_weights_present = isinstance(risk.get("arm_weights"), dict) and len(
+            dict(risk.get("arm_weights") or {})
+        ) > 0
+        risk_selected_arms_present = isinstance(risk.get("selected_arms"), list) and len(
+            list(risk.get("selected_arms") or [])
+        ) > 0
+        risk_ensemble_reasons_present = isinstance(risk.get("ensemble_reason_codes"), list)
         checks["risk:approved"] = risk_approved
         checks["risk:deterministic_gate_pass"] = gate_pass
         checks["risk:decision_trace_present"] = decision_trace_present
         checks["risk:reason_code_details_present"] = reason_code_details_present
         checks["risk:gate_transition_present"] = gate_transition_present
+        checks["risk:arm_votes_present"] = risk_arm_votes_present
+        checks["risk:arm_weights_present"] = risk_arm_weights_present
+        checks["risk:selected_arms_present"] = risk_selected_arms_present
+        checks["risk:ensemble_reason_codes_present"] = risk_ensemble_reasons_present
         if not risk_approved:
             errors.append("risk_not_approved")
         if not gate_pass:
@@ -360,24 +475,50 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             errors.append("risk_reason_code_details_missing")
         if not gate_transition_present:
             errors.append("risk_gate_transition_sequence_missing")
+        if not risk_arm_votes_present:
+            errors.append("risk_arm_votes_missing")
+        if not risk_arm_weights_present:
+            errors.append("risk_arm_weights_missing")
+        if not risk_selected_arms_present:
+            errors.append("risk_selected_arms_missing")
+        if not risk_ensemble_reasons_present:
+            errors.append("risk_ensemble_reason_codes_invalid")
 
     if intent is not None:
         intent_emitted = str(intent.get("status")) == "emitted"
         intent_actionable = str(intent.get("action")) in {"buy", "sell"}
         intent_risk_approved = intent.get("risk_approved") is True
+        intent_selected_arms_present = isinstance(intent.get("selected_arms"), list) and len(
+            list(intent.get("selected_arms") or [])
+        ) > 0
+        intent_arm_votes_present = isinstance(intent.get("arm_votes"), dict) and len(
+            dict(intent.get("arm_votes") or {})
+        ) > 0
         checks["intent:emitted"] = intent_emitted
         checks["intent:actionable"] = intent_actionable
         checks["intent:risk_approved"] = intent_risk_approved
+        checks["intent:selected_arms_present"] = intent_selected_arms_present
+        checks["intent:arm_votes_present"] = intent_arm_votes_present
         if not intent_emitted:
             errors.append("intent_not_emitted")
         if not intent_actionable:
             errors.append("intent_not_actionable")
         if not intent_risk_approved:
             errors.append("intent_risk_not_approved")
+        if not intent_selected_arms_present:
+            errors.append("intent_selected_arms_missing")
+        if not intent_arm_votes_present:
+            errors.append("intent_arm_votes_missing")
 
     if execution is not None:
         execution_status_ok = str(execution.get("execution_status")) == "executed"
         execution_intent_status_ok = str(execution.get("intent_status")) == "emitted"
+        execution_arm_attribution_present = isinstance(execution.get("arm_attribution"), dict) and len(
+            dict(execution.get("arm_attribution") or {})
+        ) > 0
+        execution_selected_arms_present = isinstance(execution.get("selected_arms"), list) and len(
+            list(execution.get("selected_arms") or [])
+        ) > 0
         try:
             executed_notional_usd = float(execution.get("executed_notional_usd", 0.0))
         except (TypeError, ValueError):
@@ -386,12 +527,42 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
         checks["execution:executed"] = execution_status_ok
         checks["execution:intent_status_emitted"] = execution_intent_status_ok
         checks["execution:executed_notional_positive"] = executed_notional_positive
+        checks["execution:arm_attribution_present"] = execution_arm_attribution_present
+        checks["execution:selected_arms_present"] = execution_selected_arms_present
         if not execution_status_ok:
             errors.append("execution_not_executed")
         if not execution_intent_status_ok:
             errors.append("execution_intent_status_not_emitted")
         if not executed_notional_positive:
             errors.append("execution_notional_not_positive")
+        if not execution_arm_attribution_present:
+            errors.append("execution_arm_attribution_missing")
+        if not execution_selected_arms_present:
+            errors.append("execution_selected_arms_missing")
+
+    if ensemble_weight_state is not None:
+        arm_stats_present = isinstance(ensemble_weight_state.get("arm_stats"), dict) and len(
+            dict(ensemble_weight_state.get("arm_stats") or {})
+        ) > 0
+        checks["ensemble_weight_state:arm_stats_present"] = arm_stats_present
+        if not arm_stats_present:
+            errors.append("ensemble_weight_state_arm_stats_missing")
+
+    if ensemble_performance_update is not None:
+        update_selected_arms_present = isinstance(
+            ensemble_performance_update.get("selected_arms"), list
+        )
+        update_before_present = isinstance(ensemble_performance_update.get("before"), dict)
+        update_after_present = isinstance(ensemble_performance_update.get("after"), dict)
+        checks["ensemble_performance_update:selected_arms_present"] = update_selected_arms_present
+        checks["ensemble_performance_update:before_present"] = update_before_present
+        checks["ensemble_performance_update:after_present"] = update_after_present
+        if not update_selected_arms_present:
+            errors.append("ensemble_performance_update_selected_arms_missing")
+        if not update_before_present:
+            errors.append("ensemble_performance_update_before_missing")
+        if not update_after_present:
+            errors.append("ensemble_performance_update_after_missing")
 
     if ops_report_contract is not None:
         report_trace_present = isinstance(ops_report_contract.get("decision_trace"), list)
@@ -399,10 +570,22 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
         report_gate_sequence_present = isinstance(ops_report_contract.get("gate_transition_sequence"), list)
         report_verbosity = str(ops_report_contract.get("report_verbosity", "")).lower()
         report_verbosity_valid = report_verbosity in {"compact", "standard", "verbose"}
+        report_arm_votes_present = isinstance(ops_report_contract.get("arm_votes"), dict) and len(
+            dict(ops_report_contract.get("arm_votes") or {})
+        ) > 0
+        report_arm_weights_present = isinstance(ops_report_contract.get("arm_weights"), dict) and len(
+            dict(ops_report_contract.get("arm_weights") or {})
+        ) > 0
+        report_selected_arms_present = isinstance(ops_report_contract.get("selected_arms"), list) and len(
+            list(ops_report_contract.get("selected_arms") or [])
+        ) > 0
         checks["ops_report_contract:decision_trace_present"] = report_trace_present
         checks["ops_report_contract:reason_code_details_present"] = report_reason_details_present
         checks["ops_report_contract:gate_transition_present"] = report_gate_sequence_present
         checks["ops_report_contract:report_verbosity_valid"] = report_verbosity_valid
+        checks["ops_report_contract:arm_votes_present"] = report_arm_votes_present
+        checks["ops_report_contract:arm_weights_present"] = report_arm_weights_present
+        checks["ops_report_contract:selected_arms_present"] = report_selected_arms_present
         if not report_trace_present:
             errors.append("ops_report_contract_decision_trace_missing")
         if not report_reason_details_present:
@@ -411,6 +594,12 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             errors.append("ops_report_contract_gate_transition_sequence_missing")
         if not report_verbosity_valid:
             errors.append("ops_report_contract_report_verbosity_invalid")
+        if not report_arm_votes_present:
+            errors.append("ops_report_contract_arm_votes_missing")
+        if not report_arm_weights_present:
+            errors.append("ops_report_contract_arm_weights_missing")
+        if not report_selected_arms_present:
+            errors.append("ops_report_contract_selected_arms_missing")
 
     if run_manifest is not None:
         artifacts_obj = run_manifest.get("artifacts")
@@ -418,9 +607,27 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             manifest_self_critique_present = isinstance(artifacts_obj.get("self_critique_signal"), str) and bool(
                 str(artifacts_obj.get("self_critique_signal"))
             )
+            manifest_backtest_arm_attr_present = isinstance(
+                artifacts_obj.get("backtest_arm_attribution"), str
+            ) and bool(str(artifacts_obj.get("backtest_arm_attribution")))
+            manifest_ensemble_weight_state_present = isinstance(
+                artifacts_obj.get("ensemble_weight_state"), str
+            ) and bool(str(artifacts_obj.get("ensemble_weight_state")))
+            manifest_ensemble_update_present = isinstance(
+                artifacts_obj.get("ensemble_performance_update"), str
+            ) and bool(str(artifacts_obj.get("ensemble_performance_update")))
             checks["manifest:self_critique_artifact_present"] = manifest_self_critique_present
+            checks["manifest:backtest_arm_attribution_present"] = manifest_backtest_arm_attr_present
+            checks["manifest:ensemble_weight_state_present"] = manifest_ensemble_weight_state_present
+            checks["manifest:ensemble_performance_update_present"] = manifest_ensemble_update_present
             if not manifest_self_critique_present:
                 errors.append("manifest_self_critique_artifact_missing")
+            if not manifest_backtest_arm_attr_present:
+                errors.append("manifest_backtest_arm_attribution_missing")
+            if not manifest_ensemble_weight_state_present:
+                errors.append("manifest_ensemble_weight_state_missing")
+            if not manifest_ensemble_update_present:
+                errors.append("manifest_ensemble_performance_update_missing")
         else:
             checks["manifest:artifacts_present"] = False
             errors.append("manifest_artifacts_missing")
@@ -430,15 +637,31 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             config_has_min_score = "self_critique_min_score" in manifest_config
             config_has_max_findings = "self_critique_max_findings" in manifest_config
             config_has_report_verbosity = "ops_report_verbosity" in manifest_config
+            config_has_ensemble_mode = "ensemble_mode" in manifest_config
+            config_has_ensemble_arms = "ensemble_enabled_arms" in manifest_config
+            config_has_ensemble_decay = "ensemble_decay_horizon" in manifest_config
+            config_has_ensemble_exploration = "ensemble_exploration_weight" in manifest_config
             checks["manifest:config_self_critique_min_score_present"] = config_has_min_score
             checks["manifest:config_self_critique_max_findings_present"] = config_has_max_findings
             checks["manifest:config_ops_report_verbosity_present"] = config_has_report_verbosity
+            checks["manifest:config_ensemble_mode_present"] = config_has_ensemble_mode
+            checks["manifest:config_ensemble_arms_present"] = config_has_ensemble_arms
+            checks["manifest:config_ensemble_decay_present"] = config_has_ensemble_decay
+            checks["manifest:config_ensemble_exploration_present"] = config_has_ensemble_exploration
             if not config_has_min_score:
                 errors.append("manifest_config_self_critique_min_score_missing")
             if not config_has_max_findings:
                 errors.append("manifest_config_self_critique_max_findings_missing")
             if not config_has_report_verbosity:
                 errors.append("manifest_config_ops_report_verbosity_missing")
+            if not config_has_ensemble_mode:
+                errors.append("manifest_config_ensemble_mode_missing")
+            if not config_has_ensemble_arms:
+                errors.append("manifest_config_ensemble_arms_missing")
+            if not config_has_ensemble_decay:
+                errors.append("manifest_config_ensemble_decay_missing")
+            if not config_has_ensemble_exploration:
+                errors.append("manifest_config_ensemble_exploration_missing")
         else:
             checks["manifest:config_present"] = False
             errors.append("manifest_config_missing")
@@ -450,6 +673,10 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             manifest_intent_emitted = str(outcome.get("intent_status")) == "emitted"
             manifest_executed = str(outcome.get("paper_trade_execution_status")) == "executed"
             manifest_self_critique_pass = outcome.get("self_critique_pass") is True
+            manifest_selected_arms_present = isinstance(outcome.get("selected_arms"), list) and len(
+                list(outcome.get("selected_arms") or [])
+            ) > 0
+            manifest_ensemble_reasons_present = isinstance(outcome.get("ensemble_reason_codes"), list)
             try:
                 manifest_decision_trace_entries = int(outcome.get("decision_trace_entries", 0))
             except (TypeError, ValueError):
@@ -460,6 +687,8 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             checks["manifest:execution_executed"] = manifest_executed
             checks["manifest:self_critique_pass"] = manifest_self_critique_pass
             checks["manifest:decision_trace_entries_positive"] = manifest_decision_trace_entries > 0
+            checks["manifest:selected_arms_present"] = manifest_selected_arms_present
+            checks["manifest:ensemble_reason_codes_present"] = manifest_ensemble_reasons_present
             if not manifest_gate_pass:
                 errors.append("manifest_gate_not_pass")
             if not manifest_risk_approved:
@@ -472,6 +701,10 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_self_critique_not_pass")
             if manifest_decision_trace_entries <= 0:
                 errors.append("manifest_decision_trace_entries_missing")
+            if not manifest_selected_arms_present:
+                errors.append("manifest_selected_arms_missing")
+            if not manifest_ensemble_reasons_present:
+                errors.append("manifest_ensemble_reason_codes_invalid")
         else:
             checks["manifest:outcome_present"] = False
             errors.append("manifest_outcome_missing")
