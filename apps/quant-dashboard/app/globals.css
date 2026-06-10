@@ -75,6 +75,27 @@ button {
   font-size: 14px;
 }
 
+.toolbar select[multiple] {
+  min-width: 140px;
+  min-height: 92px;
+  padding: 6px 8px;
+}
+
+.recommendation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip-btn {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.recommendation-helper {
+  font-size: 12px;
+}
+
 button {
   cursor: pointer;
 }

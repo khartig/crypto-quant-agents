@@ -1,5 +1,5 @@
 QUANT PROJECT MEMORY
-Last updated: 2026-06-07
+Last updated: 2026-06-10
 
 External storage identity
 - Disk: /dev/sdb (Seagate ST4000LM024-2U817V, ~3.6T)
@@ -225,3 +225,97 @@ Latest project updates (2026-06-07)
     - poll-seconds=3600
     - confidence-threshold=0.60
   - Service status validated active after daemon reload + restart.
+
+Latest project updates (2026-06-10)
+- Phase 4 completion (adaptive ensemble + attribution + verification hardening):
+  - Updated files:
+    - .env.example
+    - src/quant_agents/agent_contracts.py
+    - src/quant_agents/agent_plane.py
+    - src/quant_agents/backtest.py
+    - src/quant_agents/cli.py
+    - src/quant_agents/config.py
+    - src/quant_agents/openclaw_native.py
+    - src/quant_agents/paper_trading.py
+  - Added and wired ensemble controls:
+    - AGENT_ENSEMBLE_MODE
+    - AGENT_ENSEMBLE_ARMS
+    - AGENT_ENSEMBLE_DECAY_HORIZON
+    - AGENT_ENSEMBLE_EXPLORATION_WEIGHT
+  - Added deterministic strategy-arm voting, adaptive arm weighting, arm-level backtest attribution, and per-arm paper execution attribution.
+  - OpenClaw verification gate now fail-closes on missing/malformed ensemble evidence in strategy/risk/ops/execution/manifest artifacts.
+
+- Deterministic replay fix:
+  - Problem:
+    - persistent ensemble state updates caused nondeterministic replay checks.
+  - Fix:
+    - replay runs using explicit `source_data_path` now write to run-local replay ensemble state instead of shared global ensemble state.
+  - Verification:
+    - python3 -m compileall src scripts -> pass
+    - scripts/validate_walkforward_policy_suite.py -> pass
+    - scripts/verify_phase2_completion.py -> pass after replay-state isolation
+
+- Data reset and rebuild:
+  - `/mnt/quant-data` reset and rebuilt.
+  - Kraken tuning snapshots:
+    - horizon=3 threshold=0.008 -> accuracy ~0.711
+    - horizon=3 threshold=0.010 -> accuracy ~0.767
+    - horizon=3 threshold=0.012 -> accuracy ~0.822 (high-hold regime)
+  - Kraken high-accuracy model artifact:
+    - /mnt/quant-data/models/trigger-models/exchange=kraken/symbol=BTC-USDT/interval=1h/20260610T163405Z/model.json
+
+- Six-month model testing and actionable optimization:
+  - Kraken 1h history was insufficient for a full 6-month experiment.
+  - binance endpoint returned region restriction (HTTP 451) on this host.
+  - Switched to binanceus for 6-month 1h data:
+    - /mnt/quant-data/raw/exchange=binanceus/symbol=BTC-USDT/interval=1h/year=2026/month=06/ohlcv_20260610T173442Z_6mo.parquet
+    - rows=4392
+  - Pre-week training split created:
+    - /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet
+  - Hold-optimized baseline model:
+    - /mnt/quant-data/models/trigger-models/exchange=binanceus/symbol=BTC-USDT/interval=1h/20260610T175033Z/model.json
+    - horizon=2, thresholds=0.03/0.03
+  - Second actionable-optimized model:
+    - /mnt/quant-data/models/trigger-models/exchange=binanceus/symbol=BTC-USDT/interval=1h/20260610T181601Z/model.json
+    - horizon=2, thresholds=0.005/0.005
+  - Fixed weekly benchmark (apples-to-apples):
+    - eval labels: horizon=2, thresholds=0.004/0.004
+    - window: 2026-06-03T17:00:00Z -> 2026-06-10T17:00:00Z
+    - rows=167
+    - label distribution: buy=44, sell=57, hold=66
+  - Side-by-side benchmark summary:
+    - baseline hold-optimized:
+      - overall_accuracy=0.4192
+      - hold_rate=0.8084
+      - actionable_rows=32
+      - actionable_accuracy=0.3438
+      - binary_actionable_precision=0.7813
+      - binary_actionable_recall=0.2475
+    - second actionable-optimized:
+      - overall_accuracy=0.4251
+      - hold_rate=0.5569
+      - actionable_rows=74
+      - actionable_accuracy=0.3378
+      - binary_actionable_precision=0.7297
+      - binary_actionable_recall=0.5347
+
+- Dashboard updates (apps/quant-dashboard):
+  - Added/maintained `Signals & Markers` and `Model & Trade Performance` tab workflow.
+  - Recommendation filter now supports multi-select with quick options:
+    - all
+    - buy + sell
+  - Existing chart controls retained (series toggles, zoom/pan, panel sizing, marker detail drill-down).
+  - Dashboard lint check passed:
+    - npm --prefix apps/quant-dashboard run lint
+
+- Documentation updates:
+  - Added:
+    - doc/MODEL_METRIC_DEFINITIONS_AND_RESULTS.md
+      - metric definitions (actionable accuracy, binary actionable precision/recall, per-class precision)
+      - fixed-benchmark side-by-side model tables
+      - interpretation notes for hold-rate vs actionable-coverage tradeoffs
+  - README updated with:
+    - Phase 4 adaptive ensemble summary
+    - ensemble config keys and CLI examples
+    - dashboard multi-select and performance-tab notes
+    - link to metric definitions/results doc

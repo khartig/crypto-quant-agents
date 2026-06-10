@@ -57,6 +57,7 @@ interface DragPanState {
 }
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
+const RECOMMENDATION_OPTIONS: Recommendation[] = ["buy", "sell", "hold"];
 
 function clampDomainToBounds(
   start: number,
@@ -162,7 +163,9 @@ export default function HomePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [symbolFilter, setSymbolFilter] = useState<string>("all");
-  const [recommendationFilter, setRecommendationFilter] = useState<string>("all");
+  const [recommendationFilter, setRecommendationFilter] = useState<Recommendation[]>([
+    ...RECOMMENDATION_OPTIONS
+  ]);
   const [showPredictionsOnChart, setShowPredictionsOnChart] = useState(true);
   const [showAlertsOnChart, setShowAlertsOnChart] = useState(true);
   const [showCloseLine, setShowCloseLine] = useState(true);
@@ -217,7 +220,7 @@ export default function HomePage() {
       if (symbolFilter !== "all" && row.symbol !== symbolFilter) {
         return false;
       }
-      if (recommendationFilter !== "all" && row.recommendation !== recommendationFilter) {
+      if (!recommendationFilter.includes(row.recommendation)) {
         return false;
       }
       return true;
@@ -229,7 +232,7 @@ export default function HomePage() {
       if (symbolFilter !== "all" && row.symbol !== symbolFilter) {
         return false;
       }
-      if (recommendationFilter !== "all" && row.recommendation !== recommendationFilter) {
+      if (!recommendationFilter.includes(row.recommendation)) {
         return false;
       }
       return true;
@@ -528,14 +531,40 @@ export default function HomePage() {
         <label>
           Recommendation
           <select
+            multiple
             value={recommendationFilter}
-            onChange={(event) => setRecommendationFilter(event.target.value)}
+            onChange={(event) => {
+              const selected = Array.from(event.target.selectedOptions).map(
+                (option) => option.value as Recommendation
+              );
+              setRecommendationFilter(
+                selected.length > 0 ? selected : [...RECOMMENDATION_OPTIONS]
+              );
+            }}
           >
-            <option value="all">all</option>
-            <option value="buy">buy</option>
-            <option value="sell">sell</option>
-            <option value="hold">hold</option>
+            {RECOMMENDATION_OPTIONS.map((value) => (
+              <option value={value} key={value}>
+                {value}
+              </option>
+            ))}
           </select>
+          <div className="recommendation-actions">
+            <button
+              type="button"
+              className="chip-btn"
+              onClick={() => setRecommendationFilter([...RECOMMENDATION_OPTIONS])}
+            >
+              all
+            </button>
+            <button
+              type="button"
+              className="chip-btn"
+              onClick={() => setRecommendationFilter(["buy", "sell"])}
+            >
+              buy + sell
+            </button>
+          </div>
+          <span className="recommendation-helper muted">Ctrl/Cmd-click supports manual multi-select.</span>
         </label>
         <label>
           Data freshness

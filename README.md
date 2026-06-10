@@ -5,15 +5,16 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
 
 ## What the system does
 - Ingests OHLCV market data from exchanges via `ccxt`.
-- Runs deterministic SMA-crossover backtests.
+- Runs deterministic SMA-crossover and adaptive-ensemble backtests.
 - Produces model-assisted strategy proposals (`buy` / `sell` / `hold`) with confidence and rationale.
+- Supports Phase 4 adaptive strategy-arm ensembling with deterministic arm weighting and exploration controls.
 - Trains a deterministic trigger model (`buy` / `sell` / `hold`) from historical OHLCV features.
 - Produces explainable trigger predictions with class probabilities and top feature reasons.
 - Monitors the market continuously and emits trigger notifications (local log + optional webhook).
 - Applies deterministic risk thresholds before any execution.
 - Emits and executes paper-trade intents in a local ledger.
 - Generates ops reports and structured run artifacts.
-- Ships a Next.js dashboard project for interactive prediction/alert review.
+- Ships a Next.js dashboard project for interactive prediction/alert review and model/trade performance analysis.
 - Supports OpenClaw-native orchestration with async job supervision and strict verification gating.
 
 ## End-to-end process flow
@@ -39,6 +40,14 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
    Generate markdown summary and run manifest with artifact pointers.
 9. **(OpenClaw path) strict verification gate**  
    Async supervisor validates artifacts and contract states; marks job `succeeded` only if all required checks pass.
+
+## Phase 4 adaptive ensemble highlights
+- Strategy proposals now carry ensemble evidence fields such as arm votes, selected arms, arm weights, and reason codes.
+- Agent-plane supports adaptive per-arm performance weighting with decay + exploration and persists rolling state in paper-trading state storage.
+- Backtest outputs include arm-level attribution (`arm_attribution.parquet`) and ensemble metrics for post-run diagnostics.
+- Paper execution artifacts include per-arm attribution fields for executed intents.
+- OpenClaw verification is fail-closed on missing/malformed ensemble evidence across strategy, risk, execution, and manifest contracts.
+- Deterministic replay behavior is preserved by isolating ensemble weight state when explicit replay source data is used.
 
 ## How buy/sell signals are generated
 - Signals are proposed by the configured **strategy model** from market context and constraints.
@@ -111,6 +120,10 @@ Key environment variables (see `.env.example`):
   - `OLLAMA_OPS_MODEL`
   - `AGENT_STEP_RETRIES`
   - `AGENT_MINIMUM_BARS`
+  - `AGENT_ENSEMBLE_MODE`
+  - `AGENT_ENSEMBLE_ARMS`
+  - `AGENT_ENSEMBLE_DECAY_HORIZON`
+  - `AGENT_ENSEMBLE_EXPLORATION_WEIGHT`
 - Trigger model:
   - `TRIGGER_MODEL_HORIZON_BARS`
   - `TRIGGER_MODEL_BUY_THRESHOLD`
@@ -165,6 +178,7 @@ quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limi
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --ensemble-mode adaptive --ensemble-arms sma_baseline,technical_composite,llm_context --ensemble-decay-horizon 48 --ensemble-exploration-weight 0.15
 ```
 
 ### Paper-account connectivity checks
@@ -186,6 +200,7 @@ quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet
 ```
 
 ### OpenClaw-native orchestration commands
@@ -208,7 +223,12 @@ Then open `http://localhost:3000` and use the dashboard to:
 - toggle BTC/SMA/MACD/RSI/volatility/MACD histogram overlays,
 - adjust panel heights with slider controls,
 - toggle prediction/alert markers directly on the chart,
-- click markers to inspect confidence/probabilities/reason details below the chart.
+- click markers to inspect confidence/probabilities/reason details below the chart,
+- switch between `Signals & Markers` and `Model & Trade Performance` tabs,
+- filter recommendations with multi-select controls (including `buy + sell` quick-select).
+
+Model metric definitions and current performance snapshot:
+- [doc/MODEL_METRIC_DEFINITIONS_AND_RESULTS.md](doc/MODEL_METRIC_DEFINITIONS_AND_RESULTS.md)
 
 ### Refreshing clustered development artifacts
 If chart markers are clustered from old development data, use this refresh sequence:
@@ -226,8 +246,8 @@ systemctl --user --no-pager status quant-trigger-monitor.service
 All paths below are relative to `QUANT_DATA_ROOT`.
 
 - Raw market data: `raw/exchange=<exchange>/symbol=<pair>/interval=<tf>/year=<yyyy>/month=<mm>/`
-- Backtests: `backtests/sma_crossover/<run_id>/`  
-  Includes `metrics.json`, `equity_curve.parquet`, `run_manifest.json`.
+- Backtests: `backtests/<strategy_name>/<run_id>/`  
+  Includes `metrics.json`, `equity_curve.parquet`, `run_manifest.json`; adaptive ensemble runs also include `arm_attribution.parquet`.
 - Orchestration runs: `logs/agents/openclaw-orchestrator/<yyyy-mm-dd>/<run_id>/`  
   Includes:
   - `data_quality_signal.json`
@@ -236,12 +256,14 @@ All paths below are relative to `QUANT_DATA_ROOT`.
   - `risk_decision.json`
   - `paper_trade_intent.json`
   - `paper_trade_execution.json`
+  - `ensemble_performance_update.json`
   - `ops_report.md`
   - `ops_report_contract.json`
   - `run_manifest.json`
   - `steps/<step-name>/attempt_*.json`
 - Paper-trading state:
   - `paper-trading/state/portfolio_state.json`
+  - `paper-trading/state/ensemble_weight_state.json`
   - `paper-trading/<yyyy-mm-dd>/fills.jsonl`
   - `paper-trading/<yyyy-mm-dd>/paper_trade_execution_<run_id>.json`
 - Metrics:
