@@ -34,7 +34,12 @@ class Settings:
     risk_min_total_return: float
     risk_min_sharpe: float
     risk_max_drawdown: float
+    risk_max_cost_return_drag: float
     risk_min_signal_confidence: float
+    backtest_fee_bps: float
+    backtest_slippage_bps: float
+    walk_forward_fee_bps: float
+    walk_forward_slippage_bps: float
     walk_forward_train_bars: int
     walk_forward_validate_bars: int
     walk_forward_step_bars: int
@@ -50,9 +55,11 @@ class Settings:
     ensemble_enabled_arms: tuple[str, ...]
     ensemble_decay_horizon: int
     ensemble_exploration_weight: float
+    ensemble_turnover_penalty_bps: float
     paper_trade_notional_usd: float
     paper_trade_starting_cash_usd: float
     paper_trade_fee_bps: float
+    paper_trade_slippage_bps: float
     paper_account_provider: str
     paper_account_exchange: str
     paper_account_sandbox: bool
@@ -65,6 +72,8 @@ class Settings:
     trigger_model_buy_threshold: float
     trigger_model_sell_threshold: float
     trigger_model_min_train_samples: int
+    trigger_model_cost_bps: float
+    trigger_model_optimize_thresholds: bool
     trigger_monitor_poll_seconds: float
     trigger_monitor_signal_confidence: float
     trigger_monitor_webhook_url: str | None
@@ -139,7 +148,27 @@ def load_settings() -> Settings:
         risk_min_total_return=_as_float(os.getenv("RISK_MIN_TOTAL_RETURN"), default=0.0),
         risk_min_sharpe=_as_float(os.getenv("RISK_MIN_SHARPE"), default=0.0),
         risk_max_drawdown=_as_float(os.getenv("RISK_MAX_DRAWDOWN"), default=-0.20),
+        risk_max_cost_return_drag=max(
+            0.0,
+            _as_float(os.getenv("RISK_MAX_COST_RETURN_DRAG"), default=0.03),
+        ),
         risk_min_signal_confidence=_as_float(os.getenv("RISK_MIN_SIGNAL_CONFIDENCE"), default=0.55),
+        backtest_fee_bps=max(
+            0.0,
+            _as_float(os.getenv("BACKTEST_FEE_BPS"), default=5.0),
+        ),
+        backtest_slippage_bps=max(
+            0.0,
+            _as_float(os.getenv("BACKTEST_SLIPPAGE_BPS"), default=2.5),
+        ),
+        walk_forward_fee_bps=max(
+            0.0,
+            _as_float(os.getenv("WALK_FORWARD_FEE_BPS"), default=5.0),
+        ),
+        walk_forward_slippage_bps=max(
+            0.0,
+            _as_float(os.getenv("WALK_FORWARD_SLIPPAGE_BPS"), default=2.5),
+        ),
         walk_forward_train_bars=max(
             50,
             _as_int(os.getenv("WALK_FORWARD_TRAIN_BARS"), default=240),
@@ -212,6 +241,10 @@ def load_settings() -> Settings:
                 _as_float(os.getenv("AGENT_ENSEMBLE_EXPLORATION_WEIGHT"), default=0.08),
             ),
         ),
+        ensemble_turnover_penalty_bps=max(
+            0.0,
+            _as_float(os.getenv("AGENT_ENSEMBLE_TURNOVER_PENALTY_BPS"), default=8.0),
+        ),
         paper_trade_notional_usd=_as_float(os.getenv("PAPER_TRADE_NOTIONAL_USD"), default=100.0),
         paper_trade_starting_cash_usd=max(
             0.0,
@@ -220,6 +253,10 @@ def load_settings() -> Settings:
         paper_trade_fee_bps=max(
             0.0,
             _as_float(os.getenv("PAPER_TRADE_FEE_BPS"), default=5.0),
+        ),
+        paper_trade_slippage_bps=max(
+            0.0,
+            _as_float(os.getenv("PAPER_TRADE_SLIPPAGE_BPS"), default=1.0),
         ),
         paper_account_provider=os.getenv("PAPER_ACCOUNT_PROVIDER", "tradingview"),
         paper_account_exchange=os.getenv("PAPER_ACCOUNT_EXCHANGE", "kraken"),
@@ -238,14 +275,22 @@ def load_settings() -> Settings:
         ),
         trigger_model_buy_threshold=_as_float(
             os.getenv("TRIGGER_MODEL_BUY_THRESHOLD"),
-            default=0.004,
+            default=0.012,
         ),
         trigger_model_sell_threshold=abs(
-            _as_float(os.getenv("TRIGGER_MODEL_SELL_THRESHOLD"), default=0.004)
+            _as_float(os.getenv("TRIGGER_MODEL_SELL_THRESHOLD"), default=0.003)
         ),
         trigger_model_min_train_samples=max(
             20,
             _as_int(os.getenv("TRIGGER_MODEL_MIN_TRAIN_SAMPLES"), default=120),
+        ),
+        trigger_model_cost_bps=max(
+            0.0,
+            _as_float(os.getenv("TRIGGER_MODEL_COST_BPS"), default=7.5),
+        ),
+        trigger_model_optimize_thresholds=_as_bool(
+            os.getenv("TRIGGER_MODEL_OPTIMIZE_THRESHOLDS"),
+            default=True,
         ),
         trigger_monitor_poll_seconds=max(
             5.0,

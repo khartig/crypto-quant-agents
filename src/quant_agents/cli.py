@@ -58,8 +58,20 @@ def _base_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--exchange", default=None)
     backtest.add_argument("--symbol", default=None)
     backtest.add_argument("--timeframe", default=None)
-    backtest.add_argument("--fast-window", type=int, default=20)
-    backtest.add_argument("--slow-window", type=int, default=50)
+    backtest.add_argument("--fast-window", type=int, default=24)
+    backtest.add_argument("--slow-window", type=int, default=60)
+    backtest.add_argument(
+        "--fee-bps",
+        type=float,
+        default=None,
+        help="One-way fee in bps used for cost-adjusted backtest metrics (default from settings).",
+    )
+    backtest.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=None,
+        help="One-way slippage in bps used for cost-adjusted backtest metrics (default from settings).",
+    )
     backtest.add_argument(
         "--input-file",
         default=None,
@@ -98,8 +110,20 @@ def _base_parser() -> argparse.ArgumentParser:
     daily.add_argument("--symbol", default=None)
     daily.add_argument("--timeframe", default=None)
     daily.add_argument("--limit", type=int, default=1000)
-    daily.add_argument("--fast-window", type=int, default=20)
-    daily.add_argument("--slow-window", type=int, default=50)
+    daily.add_argument("--fast-window", type=int, default=24)
+    daily.add_argument("--slow-window", type=int, default=60)
+    daily.add_argument(
+        "--fee-bps",
+        type=float,
+        default=None,
+        help="One-way fee in bps used by daily backtest stage (default from settings).",
+    )
+    daily.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=None,
+        help="One-way slippage in bps used by daily backtest stage (default from settings).",
+    )
     daily.add_argument(
         "--archive-backtest",
         action="store_true",
@@ -163,10 +187,40 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Deterministic risk gate: minimum allowed max drawdown (negative value).",
     )
     agent_plane.add_argument(
+        "--max-cost-return-drag",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: maximum allowed cost drag in return units.",
+    )
+    agent_plane.add_argument(
         "--min-signal-confidence",
         type=float,
         default=None,
         help="Deterministic risk gate: minimum strategy confidence.",
+    )
+    agent_plane.add_argument(
+        "--backtest-fee-bps",
+        type=float,
+        default=None,
+        help="One-way fee bps applied in agent-plane backtest evaluation.",
+    )
+    agent_plane.add_argument(
+        "--backtest-slippage-bps",
+        type=float,
+        default=None,
+        help="One-way slippage bps applied in agent-plane backtest evaluation.",
+    )
+    agent_plane.add_argument(
+        "--walkforward-fee-bps",
+        type=float,
+        default=None,
+        help="One-way fee bps applied in walk-forward evaluation.",
+    )
+    agent_plane.add_argument(
+        "--walkforward-slippage-bps",
+        type=float,
+        default=None,
+        help="One-way slippage bps applied in walk-forward evaluation.",
     )
     agent_plane.add_argument(
         "--walkforward-train-bars",
@@ -258,6 +312,12 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Phase 4: minimum exploration mass injected before adaptive normalization.",
     )
     agent_plane.add_argument(
+        "--ensemble-turnover-penalty-bps",
+        type=float,
+        default=None,
+        help="Phase 4: turnover penalty in bps applied during adaptive arm weighting.",
+    )
+    agent_plane.add_argument(
         "--paper-notional-usd",
         type=float,
         default=None,
@@ -274,6 +334,12 @@ def _base_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Per-trade fee in basis points used by deterministic paper execution.",
+    )
+    agent_plane.add_argument(
+        "--paper-slippage-bps",
+        type=float,
+        default=None,
+        help="Per-trade slippage in basis points used by deterministic paper execution.",
     )
     paper_account = subparsers.add_parser(
         "paper-account-check",
@@ -364,6 +430,25 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Minimum training rows required after feature/label generation.",
     )
+    trigger_train.add_argument(
+        "--cost-bps",
+        type=float,
+        default=None,
+        help="One-way cost in bps used for net-expectancy diagnostics.",
+    )
+    trigger_train.add_argument(
+        "--optimize-thresholds",
+        dest="optimize_thresholds",
+        action="store_true",
+        help="Enable threshold optimization by net expectancy.",
+    )
+    trigger_train.add_argument(
+        "--no-optimize-thresholds",
+        dest="optimize_thresholds",
+        action="store_false",
+        help="Disable threshold optimization and use provided thresholds directly.",
+    )
+    trigger_train.set_defaults(optimize_thresholds=None)
 
     trigger_predict = subparsers.add_parser(
         "predict-trigger",
@@ -486,6 +571,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "backtest":
         source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
+        fee_bps = args.fee_bps if args.fee_bps is not None else settings.backtest_fee_bps
+        slippage_bps = args.slippage_bps if args.slippage_bps is not None else settings.backtest_slippage_bps
         with tracked_operation(
             settings.quant_data_root,
             operation="backtest",
@@ -498,6 +585,8 @@ def main(argv: list[str] | None = None) -> None:
                 timeframe=timeframe,
                 fast_window=args.fast_window,
                 slow_window=args.slow_window,
+                fee_bps=max(0.0, float(fee_bps)),
+                slippage_bps=max(0.0, float(slippage_bps)),
                 source_data_path=source_file,
                 archive_run=args.archive,
             )
@@ -533,6 +622,16 @@ def main(argv: list[str] | None = None) -> None:
             if args.min_train_samples is not None
             else settings.trigger_model_min_train_samples
         )
+        cost_bps = (
+            args.cost_bps
+            if args.cost_bps is not None
+            else settings.trigger_model_cost_bps
+        )
+        optimize_thresholds = (
+            args.optimize_thresholds
+            if args.optimize_thresholds is not None
+            else settings.trigger_model_optimize_thresholds
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="train-trigger-model",
@@ -552,6 +651,8 @@ def main(argv: list[str] | None = None) -> None:
                 buy_threshold=float(buy_threshold),
                 sell_threshold=float(sell_threshold),
                 min_train_samples=max(20, int(min_train_samples)),
+                cost_bps=max(0.0, float(cost_bps)),
+                optimize_thresholds=bool(optimize_thresholds),
             )
             metric["model_path"] = str(result.model_path)
             metric["run_dir"] = str(result.run_dir)
@@ -559,10 +660,14 @@ def main(argv: list[str] | None = None) -> None:
             metric["train_count"] = result.train_count
             metric["test_count"] = result.test_count
             metric["accuracy"] = result.accuracy
+            metric["selected_buy_threshold"] = result.selected_buy_threshold
+            metric["selected_sell_threshold"] = result.selected_sell_threshold
+            metric["net_expectancy_per_actionable"] = result.net_expectancy_per_actionable
         print(
             "Trigger model training complete -> "
             f"{result.model_path} "
-            f"(samples={result.sample_count} accuracy={result.accuracy:.3f})"
+            f"(samples={result.sample_count} accuracy={result.accuracy:.3f} "
+            f"buy_th={result.selected_buy_threshold:.4f} sell_th={result.selected_sell_threshold:.4f})"
         )
         return
 
@@ -659,6 +764,18 @@ def main(argv: list[str] | None = None) -> None:
                 timeframe=timeframe,
                 fast_window=args.fast_window,
                 slow_window=args.slow_window,
+                fee_bps=max(
+                    0.0,
+                    float(args.fee_bps if args.fee_bps is not None else settings.backtest_fee_bps),
+                ),
+                slippage_bps=max(
+                    0.0,
+                    float(
+                        args.slippage_bps
+                        if args.slippage_bps is not None
+                        else settings.backtest_slippage_bps
+                    ),
+                ),
                 archive_run=args.archive_backtest,
             )
             logger.info("Backtest complete at %s", backtest_result.run_dir)
@@ -687,6 +804,11 @@ def main(argv: list[str] | None = None) -> None:
             ),
             min_sharpe=args.min_sharpe if args.min_sharpe is not None else settings.risk_min_sharpe,
             max_drawdown=args.max_drawdown if args.max_drawdown is not None else settings.risk_max_drawdown,
+            max_cost_return_drag=(
+                args.max_cost_return_drag
+                if args.max_cost_return_drag is not None
+                else settings.risk_max_cost_return_drag
+            ),
             min_signal_confidence=(
                 args.min_signal_confidence
                 if args.min_signal_confidence is not None
@@ -704,6 +826,30 @@ def main(argv: list[str] | None = None) -> None:
                 args.step_retries if args.step_retries is not None else settings.agent_step_retries,
             ),
             thresholds=thresholds,
+            backtest_fee_bps=max(
+                0.0,
+                args.backtest_fee_bps
+                if args.backtest_fee_bps is not None
+                else settings.backtest_fee_bps,
+            ),
+            backtest_slippage_bps=max(
+                0.0,
+                args.backtest_slippage_bps
+                if args.backtest_slippage_bps is not None
+                else settings.backtest_slippage_bps,
+            ),
+            walk_forward_fee_bps=max(
+                0.0,
+                args.walkforward_fee_bps
+                if args.walkforward_fee_bps is not None
+                else settings.walk_forward_fee_bps,
+            ),
+            walk_forward_slippage_bps=max(
+                0.0,
+                args.walkforward_slippage_bps
+                if args.walkforward_slippage_bps is not None
+                else settings.walk_forward_slippage_bps,
+            ),
             paper_notional_usd=(
                 args.paper_notional_usd
                 if args.paper_notional_usd is not None
@@ -718,6 +864,11 @@ def main(argv: list[str] | None = None) -> None:
                 args.paper_fee_bps
                 if args.paper_fee_bps is not None
                 else settings.paper_trade_fee_bps
+            ),
+            paper_slippage_bps=(
+                args.paper_slippage_bps
+                if args.paper_slippage_bps is not None
+                else settings.paper_trade_slippage_bps
             ),
             minimum_bars=max(
                 10,
@@ -812,6 +963,12 @@ def main(argv: list[str] | None = None) -> None:
                     if args.ensemble_exploration_weight is not None
                     else settings.ensemble_exploration_weight,
                 ),
+            ),
+            ensemble_turnover_penalty_bps=max(
+                0.0,
+                args.ensemble_turnover_penalty_bps
+                if args.ensemble_turnover_penalty_bps is not None
+                else settings.ensemble_turnover_penalty_bps,
             ),
             source_data_path=source_file,
         )
