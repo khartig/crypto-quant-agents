@@ -65,6 +65,9 @@ class StrategyProposalSignal:
     warnings: list[str] = field(default_factory=list)
     indicator_votes: dict[str, float] = field(default_factory=dict)
     regime: str = "unknown"
+    regime_confidence: float = 0.0
+    regime_transition: str = "none"
+    regime_diagnostics: dict[str, float | int | str | bool] = field(default_factory=dict)
     feature_snapshot: dict[str, float | int | str | bool] = field(default_factory=dict)
     reason_codes: list[str] = field(default_factory=list)
     arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)

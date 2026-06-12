@@ -60,6 +60,7 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
   - backtest success,
   - threshold checks (return, sharpe, drawdown, cost drag),
   - minimum signal confidence,
+  - minimum regime confidence for actionable (`buy`/`sell`) recommendations,
   - minimum walk-forward quality score for actionable (`buy`/`sell`) recommendations.
 
 ## How models are used
@@ -122,6 +123,11 @@ Key environment variables (see `.env.example`):
   - `OLLAMA_OPS_MODEL`
   - `AGENT_STEP_RETRIES`
   - `AGENT_MINIMUM_BARS`
+  - `REGIME_DETECTOR_MODE`
+  - `REGIME_VOLATILITY_THRESHOLD`
+  - `REGIME_TREND_SPREAD_THRESHOLD`
+  - `REGIME_PERSISTENCE_BARS`
+  - `REGIME_ABLATION_MODE`
   - `AGENT_ENSEMBLE_MODE`
   - `AGENT_ENSEMBLE_ARMS`
   - `AGENT_ENSEMBLE_DECAY_HORIZON`
@@ -151,6 +157,7 @@ Key environment variables (see `.env.example`):
   - `RISK_MAX_COST_RETURN_DRAG`
   - `RISK_MIN_SIGNAL_CONFIDENCE`
   - `RISK_MIN_WALKFORWARD_QUALITY_SCORE`
+  - `RISK_MIN_REGIME_CONFIDENCE`
 - Paper execution:
   - `PAPER_TRADE_NOTIONAL_USD`
   - `PAPER_TRADE_STARTING_CASH_USD`
@@ -164,10 +171,17 @@ Key environment variables (see `.env.example`):
 
 ### Recommended tuned defaults (current production profile: SMA 24/60)
 - Strategy windows: `fast_window=24`, `slow_window=60`
+- Regime detector:
+  - `REGIME_DETECTOR_MODE=score`
+  - `REGIME_VOLATILITY_THRESHOLD=0.03`
+  - `REGIME_TREND_SPREAD_THRESHOLD=0.01`
+  - `REGIME_PERSISTENCE_BARS=3`
+  - `REGIME_ABLATION_MODE=0`
 - Risk thresholds:
   - `RISK_MAX_COST_RETURN_DRAG=0.06`
   - `RISK_MIN_WALKFORWARD_QUALITY_SCORE=0.43`
   - `RISK_MIN_SIGNAL_CONFIDENCE=0.55`
+  - `RISK_MIN_REGIME_CONFIDENCE=0.45`
 - Cost model:
   - `BACKTEST_FEE_BPS=5.0`, `BACKTEST_SLIPPAGE_BPS=2.5`
   - `WALK_FORWARD_FEE_BPS=5.0`, `WALK_FORWARD_SLIPPAGE_BPS=2.5`
@@ -203,6 +217,8 @@ quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limi
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --max-cost-return-drag 0.06 --min-walkforward-quality-score 0.43 --backtest-fee-bps 5 --backtest-slippage-bps 2.5 --walkforward-fee-bps 5 --walkforward-slippage-bps 2.5
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --regime-detector-mode score --regime-volatility-threshold 0.03 --regime-trend-spread-threshold 0.01 --regime-persistence-bars 3 --min-regime-confidence 0.45
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --regime-ablation-mode
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5 --paper-slippage-bps 1
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --ensemble-mode adaptive --ensemble-arms sma_baseline,technical_composite,llm_context --ensemble-decay-horizon 48 --ensemble-exploration-weight 0.15 --ensemble-turnover-penalty-bps 8
 ```

@@ -33,6 +33,7 @@ from quant_agents.backtest import (
 from quant_agents.config import Settings
 from quant_agents.ollama_client import OllamaClient
 from quant_agents.paper_trading import execute_paper_trade_intent
+from quant_agents.regime_detection import RegimeDetectionConfig, detect_regime_from_frame
 from quant_agents.storage import latest_raw_dataset
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class RiskThresholds:
     max_cost_return_drag: float
     min_signal_confidence: float
     min_walkforward_quality_score: float = 0.43
+    min_regime_confidence: float = 0.45
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,11 @@ class AgentPlaneConfig:
     paper_fee_bps: float
     paper_slippage_bps: float
     minimum_bars: int
+    regime_detector_mode: str = "score"
+    regime_volatility_threshold: float = 0.03
+    regime_trend_spread_threshold: float = 0.01
+    regime_persistence_bars: int = 3
+    regime_ablation_mode: bool = False
     walk_forward_train_bars: int = 240
     walk_forward_validate_bars: int = 72
     walk_forward_step_bars: int = 72
@@ -371,6 +378,8 @@ def _build_technical_arm_vote(phase1_context: dict[str, Any]) -> dict[str, Any]:
         "reason_codes": reason_codes,
         "metadata": {
             "regime": str(phase1_context.get("regime", "unknown")),
+            "regime_confidence": float(phase1_context.get("regime_confidence", 0.0)),
+            "regime_transition": str(phase1_context.get("regime_transition", "none")),
         },
     }
 
@@ -378,6 +387,7 @@ def _build_technical_arm_vote(phase1_context: dict[str, Any]) -> dict[str, Any]:
 def _build_llm_context_arm_vote(strategy_signal: StrategyProposalSignal) -> dict[str, Any]:
     recommendation = strategy_signal.recommendation
     confidence = float(np.clip(strategy_signal.confidence, 0.0, 1.0))
+    regime_confidence = float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
     action_scores = _normalize_probability_votes(
         dict(strategy_signal.indicator_votes)
         if strategy_signal.indicator_votes
@@ -395,6 +405,9 @@ def _build_llm_context_arm_vote(strategy_signal: StrategyProposalSignal) -> dict
         "reason_codes": list(strategy_signal.reason_codes),
         "metadata": {
             "regime": strategy_signal.regime,
+            "regime_confidence": regime_confidence,
+            "regime_transition": strategy_signal.regime_transition,
+            "regime_diagnostics": strategy_signal.regime_diagnostics,
             "warnings": list(strategy_signal.warnings),
         },
     }
@@ -802,7 +815,15 @@ def _normalize_probability_votes(votes: dict[str, float]) -> dict[str, float]:
     return {key: float(value / total) for key, value in clean.items()}
 
 
-def _compute_phase1_feature_context(frame: pd.DataFrame) -> dict[str, Any]:
+def _compute_phase1_feature_context(
+    frame: pd.DataFrame,
+    *,
+    regime_detector_mode: str,
+    regime_volatility_threshold: float,
+    regime_trend_spread_threshold: float,
+    regime_persistence_bars: int,
+    regime_ablation_mode: bool = False,
+) -> dict[str, Any]:
     close = pd.to_numeric(frame.get("close"), errors="coerce").ffill().bfill()
     high = pd.to_numeric(frame.get("high"), errors="coerce").ffill().bfill()
     low = pd.to_numeric(frame.get("low"), errors="coerce").ffill().bfill()
@@ -842,16 +863,28 @@ def _compute_phase1_feature_context(frame: pd.DataFrame) -> dict[str, Any]:
     latest_volume_zscore = (
         float(volume_zscore_24.iloc[-1]) if pd.notna(volume_zscore_24.iloc[-1]) else 0.0
     )
-
-    trend_spread = abs((latest_sma_fast / max(latest_sma_slow, 1e-9)) - 1.0)
-    if latest_volatility >= 0.03:
-        regime = "volatile"
-    elif trend_spread >= 0.01 and latest_macd >= 0:
-        regime = "bull_trend"
-    elif trend_spread >= 0.01 and latest_macd < 0:
-        regime = "bear_trend"
-    else:
-        regime = "range_bound"
+    regime_detection = detect_regime_from_frame(
+        frame,
+        config=RegimeDetectionConfig(
+            mode=str(regime_detector_mode),
+            volatility_threshold=max(0.0001, float(regime_volatility_threshold)),
+            trend_spread_threshold=max(0.0001, float(regime_trend_spread_threshold)),
+            persistence_bars=max(1, int(regime_persistence_bars)),
+        ),
+    )
+    regime = str(regime_detection.get("regime", "unknown"))
+    regime_confidence = float(
+        np.clip(regime_detection.get("regime_confidence", 0.0), 0.0, 1.0)
+    )
+    regime_transition = str(regime_detection.get("regime_transition", "none"))
+    regime_reason_codes = [
+        str(code) for code in list(regime_detection.get("reason_codes", [])) if str(code).strip()
+    ]
+    regime_diagnostics = {
+        str(key): value
+        for key, value in dict(regime_detection.get("diagnostics", {})).items()
+        if isinstance(key, str) and isinstance(value, (int, float, str, bool))
+    }
 
     vote_counts = {"buy": 0.0, "sell": 0.0, "hold": 0.0}
     reason_codes: list[str] = []
@@ -895,13 +928,30 @@ def _compute_phase1_feature_context(frame: pd.DataFrame) -> dict[str, Any]:
         vote_counts["hold"] += 0.5
         reason_codes.append("price_inside_bands")
 
-    if regime == "volatile":
-        vote_counts["hold"] += 0.75
-        reason_codes.append("regime_volatile")
+    if regime_ablation_mode:
+        reason_codes.append("regime_ablation_mode_enabled")
     else:
-        reason_codes.append(f"regime_{regime}")
+        if regime == "volatile":
+            vote_counts["hold"] += 0.75
+            reason_codes.append("regime_volatile")
+        else:
+            reason_codes.append(f"regime_{regime}")
+        if regime_transition != "none":
+            reason_codes.append("regime_transition_detected")
+        if regime_confidence < 0.5:
+            reason_codes.append("regime_confidence_low")
 
     indicator_votes = _normalize_probability_votes(vote_counts)
+    output_regime = regime
+    output_regime_confidence = regime_confidence
+    output_regime_transition = regime_transition
+    output_regime_diagnostics = regime_diagnostics
+    if regime_ablation_mode:
+        output_regime = "unknown"
+        output_regime_confidence = 0.5
+        output_regime_transition = "none"
+        output_regime_diagnostics = {"ablation_mode": True}
+
     feature_snapshot: dict[str, float | int | str | bool] = {
         "close": latest_close,
         "sma_fast": latest_sma_fast,
@@ -917,12 +967,20 @@ def _compute_phase1_feature_context(frame: pd.DataFrame) -> dict[str, Any]:
         "bb_lower": latest_bb_lower,
         "hl_range_14": latest_hl_range,
         "volume_zscore_24": latest_volume_zscore,
+        "regime_confidence": output_regime_confidence,
     }
     return {
-        "regime": regime,
+        "regime": output_regime,
+        "regime_confidence": output_regime_confidence,
+        "regime_transition": output_regime_transition,
+        "regime_diagnostics": output_regime_diagnostics,
         "indicator_votes": indicator_votes,
         "feature_snapshot": feature_snapshot,
-        "reason_codes": sorted(set(reason_codes)),
+        "reason_codes": (
+            sorted(set(reason_codes))
+            if regime_ablation_mode
+            else sorted(set([*reason_codes, *regime_reason_codes]))
+        ),
     }
 
 
@@ -950,6 +1008,48 @@ def _normalize_regime(value: Any, fallback: str) -> str:
     if not normalized:
         return fallback
     return normalized
+
+
+def _normalize_regime_confidence(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(fallback)
+    return float(np.clip(parsed, 0.0, 1.0))
+
+
+def _normalize_regime_transition(value: Any, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    normalized = value.strip().lower().replace(" ", "_")
+    return normalized if normalized else fallback
+
+
+def _normalize_regime_diagnostics(
+    value: Any,
+    fallback: dict[str, float | int | str | bool],
+) -> dict[str, float | int | str | bool]:
+    if not isinstance(value, dict):
+        return fallback
+    normalized: dict[str, float | int | str | bool] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(raw, bool):
+            normalized[key] = raw
+            continue
+        if isinstance(raw, (int, float)):
+            normalized[key] = float(raw)
+            continue
+        if isinstance(raw, str):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                normalized[key] = float(stripped)
+            except ValueError:
+                normalized[key] = stripped
+    return normalized or fallback
 
 
 def _normalize_feature_snapshot(
@@ -1283,6 +1383,7 @@ def _run_self_critique(
     min_score: float,
     max_findings: int,
     timeframe: str,
+    regime_ablation_mode: bool = False,
 ) -> dict[str, Any]:
     severity_rank = {"fail": 0, "block": 1}
     findings: list[dict[str, Any]] = []
@@ -1334,24 +1435,37 @@ def _run_self_critique(
         )
 
     regime = strategy_signal.regime.strip().lower()
-    if recommendation == "buy" and ("bear" in regime or "downtrend" in regime):
-        add_finding(
-            code="contradiction_regime_recommendation",
-            severity="block",
-            category="regime",
-            message="Recommendation buy is inconsistent with detected bearish regime.",
-            observed=regime,
-            expected="bull/uptrend or neutral regime",
-        )
-    if recommendation == "sell" and ("bull" in regime or "uptrend" in regime):
-        add_finding(
-            code="contradiction_regime_recommendation",
-            severity="block",
-            category="regime",
-            message="Recommendation sell is inconsistent with detected bullish regime.",
-            observed=regime,
-            expected="bear/downtrend or neutral regime",
-        )
+    regime_confidence = float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
+    if not regime_ablation_mode:
+        if recommendation == "buy" and ("bear" in regime or "downtrend" in regime):
+            severity: Literal["block", "fail"] = "fail" if regime_confidence >= 0.70 else "block"
+            add_finding(
+                code="contradiction_regime_recommendation",
+                severity=severity,
+                category="regime",
+                message="Recommendation buy is inconsistent with detected bearish regime.",
+                observed={"regime": regime, "regime_confidence": regime_confidence},
+                expected="bull/uptrend or neutral regime",
+            )
+        if recommendation == "sell" and ("bull" in regime or "uptrend" in regime):
+            severity = "fail" if regime_confidence >= 0.70 else "block"
+            add_finding(
+                code="contradiction_regime_recommendation",
+                severity=severity,
+                category="regime",
+                message="Recommendation sell is inconsistent with detected bullish regime.",
+                observed={"regime": regime, "regime_confidence": regime_confidence},
+                expected="bear/downtrend or neutral regime",
+            )
+        if recommendation in {"buy", "sell"} and regime_confidence < 0.35:
+            add_finding(
+                code="regime_confidence_low",
+                severity="block",
+                category="regime",
+                message="Regime confidence is too low for an actionable recommendation.",
+                observed=regime_confidence,
+                expected=">= 0.35",
+            )
 
     votes = _normalize_probability_votes(strategy_signal.indicator_votes)
     alignment = float(votes.get(recommendation, 0.0))
@@ -1534,8 +1648,10 @@ def _calibrate_confidence(
     strategy_signal: StrategyProposalSignal,
     walkforward_evaluation: dict[str, Any],
     min_walkforward_sharpe: float,
+    min_regime_confidence: float,
     confidence_floor: float,
     confidence_ceiling: float,
+    regime_ablation_mode: bool = False,
 ) -> dict[str, Any]:
     lower = min(confidence_floor, confidence_ceiling)
     upper = max(confidence_floor, confidence_ceiling)
@@ -1550,9 +1666,16 @@ def _calibrate_confidence(
         strategy_signal.indicator_votes,
         strategy_signal.recommendation,
     )
-    regime_adjustment = _regime_alignment_adjustment(
-        strategy_signal.regime,
-        strategy_signal.recommendation,
+    regime_adjustment = (
+        0.0
+        if regime_ablation_mode
+        else _regime_alignment_adjustment(
+            strategy_signal.regime,
+            strategy_signal.recommendation,
+        )
+    )
+    regime_confidence = (
+        0.5 if regime_ablation_mode else float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
     )
 
     reason_codes: list[str] = []
@@ -1560,6 +1683,7 @@ def _calibrate_confidence(
     calibrated_confidence += (indicator_alignment - 0.5) * 0.20
     calibrated_confidence += (walkforward_quality - 0.5) * 0.35
     calibrated_confidence += regime_adjustment
+    calibrated_confidence += (regime_confidence - 0.5) * 0.10
 
     contradiction_detected = False
     contradiction_count = 0
@@ -1583,6 +1707,15 @@ def _calibrate_confidence(
         if contradiction_detected:
             calibrated_confidence *= contradiction_penalty
             reason_codes.append(f"walkforward_contradiction_{contradiction_severity}")
+        if (not regime_ablation_mode) and regime_confidence < min_regime_confidence:
+            calibrated_confidence *= float(
+                np.clip(
+                    regime_confidence / max(min_regime_confidence, 1e-6),
+                    0.50,
+                    1.0,
+                )
+            )
+            reason_codes.append("regime_confidence_below_threshold")
 
     if not strategy_signal.feature_snapshot:
         calibrated_confidence *= 0.95
@@ -1590,7 +1723,7 @@ def _calibrate_confidence(
     if not strategy_signal.indicator_votes:
         calibrated_confidence *= 0.95
         reason_codes.append("phase1_indicator_votes_missing")
-    if strategy_signal.regime in {"", "unknown"}:
+    if (not regime_ablation_mode) and strategy_signal.regime in {"", "unknown"}:
         calibrated_confidence *= 0.95
         reason_codes.append("phase1_regime_missing")
 
@@ -1623,6 +1756,10 @@ def _calibrate_confidence(
         },
         "phase1_inputs": {
             "regime": strategy_signal.regime,
+            "regime_confidence": regime_confidence,
+            "regime_transition": strategy_signal.regime_transition,
+            "regime_diagnostics": strategy_signal.regime_diagnostics,
+            "regime_ablation_mode": bool(regime_ablation_mode),
             "indicator_votes": strategy_signal.indicator_votes,
             "feature_snapshot": strategy_signal.feature_snapshot,
             "reason_codes": strategy_signal.reason_codes,
@@ -1630,6 +1767,8 @@ def _calibrate_confidence(
         "components": {
             "indicator_alignment": indicator_alignment,
             "regime_adjustment": regime_adjustment,
+            "regime_confidence": regime_confidence,
+            "regime_ablation_mode": bool(regime_ablation_mode),
             "walkforward_quality": walkforward_quality,
         },
         "reason_codes": sorted(set(reason_codes)),
@@ -1648,7 +1787,23 @@ def _strategy_prompt(
     source_data_sha256: str,
     preferred_fast_window: int,
     preferred_slow_window: int,
+    regime_ablation_mode: bool = False,
 ) -> str:
+    rules = [
+        "- confidence must be between 0 and 1.",
+        "- regime_confidence must be between 0 and 1.",
+        "- fast_window and slow_window must be positive integers with slow_window > fast_window.",
+        f"- Use fast_window={preferred_fast_window} and slow_window={preferred_slow_window} for this run.",
+        "- Keep rationale concise and risk-aware.",
+    ]
+    if regime_ablation_mode:
+        rules.extend(
+            [
+                "- Regime ablation mode is enabled: do not use regime features to drive recommendation.",
+                '- Set regime="unknown", regime_confidence=0.5, regime_transition="none".',
+                '- Set regime_diagnostics={"ablation_mode": true}.',
+            ]
+        )
     return "\n".join(
         [
             "You are strategy-agent for a deterministic crypto quant pipeline.",
@@ -1658,14 +1813,13 @@ def _strategy_prompt(
                 + '"recommendation":"buy|sell|hold","confidence":0.0,'
                 + f'"fast_window":{preferred_fast_window},"slow_window":{preferred_slow_window},'
                 + '"rationale":"...","indicator_votes":{"buy":0.0,"sell":0.0,"hold":1.0},'
-                + '"regime":"...","feature_snapshot":{"key":"value"},"reason_codes":["..."]'
+                + '"regime":"...","regime_confidence":0.0,"regime_transition":"none",'
+                + '"regime_diagnostics":{"key":"value"},"feature_snapshot":{"key":"value"},'
+                + '"reason_codes":["..."]'
                 + "}"
             ),
             "Rules:",
-            "- confidence must be between 0 and 1.",
-            "- fast_window and slow_window must be positive integers with slow_window > fast_window.",
-            f"- Use fast_window={preferred_fast_window} and slow_window={preferred_slow_window} for this run.",
-            "- Keep rationale concise and risk-aware.",
+            *rules,
             f"Exchange: {exchange}",
             f"Symbol: {symbol}",
             f"Timeframe: {timeframe}",
@@ -1792,6 +1946,8 @@ def _compact_ops_prompt_context(context: dict[str, Any]) -> dict[str, Any]:
             "recommendation": proposal.get("recommendation"),
             "confidence": proposal.get("confidence"),
             "regime": proposal.get("regime"),
+            "regime_confidence": proposal.get("regime_confidence"),
+            "regime_transition": proposal.get("regime_transition"),
             "fast_window": proposal.get("fast_window"),
             "slow_window": proposal.get("slow_window"),
             "rationale": proposal.get("rationale"),
@@ -1897,6 +2053,7 @@ def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
         f"- Symbol: `{context['scope']['symbol']}`",
         f"- Timeframe: `{context['scope']['timeframe']}`",
         f"- Strategy recommendation: `{context['proposal']['recommendation']}`",
+        f"- Regime: `{context['proposal'].get('regime')}` confidence=`{context['proposal'].get('regime_confidence')}` transition=`{context['proposal'].get('regime_transition')}`",
         f"- Backtest status: `{context['backtest']['status']}`",
         f"- Ensemble mode: `{context.get('ensemble', {}).get('mode')}`",
         f"- Selected arms: `{context['proposal'].get('selected_arms', [])}`",
@@ -2083,7 +2240,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "timeframe": config.timeframe,
             "input_data_path": str(source_data_path),
             "input_data_sha256": source_data_sha256,
-            **_compute_phase1_feature_context(market_frame),
+            **_compute_phase1_feature_context(
+                market_frame,
+                regime_detector_mode=config.regime_detector_mode,
+                regime_volatility_threshold=config.regime_volatility_threshold,
+                regime_trend_spread_threshold=config.regime_trend_spread_threshold,
+                regime_persistence_bars=config.regime_persistence_bars,
+                regime_ablation_mode=bool(config.regime_ablation_mode),
+            ),
         }
 
     phase1_feature_context, phase1_feature_step = _run_step_with_retries(
@@ -2112,6 +2276,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             source_data_sha256=source_data_sha256,
             preferred_fast_window=strategy_fast_window,
             preferred_slow_window=strategy_slow_window,
+            regime_ablation_mode=bool(config.regime_ablation_mode),
         )
         raw_response = ollama.generate(
             model=config.strategy_model,
@@ -2147,6 +2312,18 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             payload.get("regime"),
             fallback=str(phase1_feature_context.get("regime", "unknown")),
         )
+        regime_confidence = _normalize_regime_confidence(
+            payload.get("regime_confidence"),
+            fallback=float(phase1_feature_context.get("regime_confidence", 0.0)),
+        )
+        regime_transition = _normalize_regime_transition(
+            payload.get("regime_transition"),
+            fallback=str(phase1_feature_context.get("regime_transition", "none")),
+        )
+        regime_diagnostics = _normalize_regime_diagnostics(
+            payload.get("regime_diagnostics"),
+            fallback=dict(phase1_feature_context.get("regime_diagnostics", {})),
+        )
         feature_snapshot = _normalize_feature_snapshot(
             payload.get("feature_snapshot"),
             fallback=dict(phase1_feature_context.get("feature_snapshot", {})),
@@ -2155,6 +2332,13 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             payload.get("reason_codes"),
             fallback=list(phase1_feature_context.get("reason_codes", [])),
         )
+        if config.regime_ablation_mode:
+            warnings.append("regime_ablation_mode_enabled")
+            regime = "unknown"
+            regime_confidence = 0.5
+            regime_transition = "none"
+            regime_diagnostics = {"ablation_mode": True}
+            reason_codes = sorted(set([*reason_codes, "regime_ablation_mode_enabled"]))
 
         return StrategyProposalSignal(
             contract="strategy_proposal_signal.v1",
@@ -2176,11 +2360,27 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             warnings=warnings,
             indicator_votes=indicator_votes,
             regime=regime,
+            regime_confidence=regime_confidence,
+            regime_transition=regime_transition,
+            regime_diagnostics=regime_diagnostics,
             feature_snapshot=feature_snapshot,
             reason_codes=reason_codes,
         )
 
     def strategy_fallback(errors: list[str]) -> StrategyProposalSignal:
+        fallback_regime = str(phase1_feature_context.get("regime", "unknown"))
+        fallback_regime_confidence = float(phase1_feature_context.get("regime_confidence", 0.0))
+        fallback_regime_transition = str(phase1_feature_context.get("regime_transition", "none"))
+        fallback_regime_diagnostics = dict(phase1_feature_context.get("regime_diagnostics", {}))
+        fallback_reason_codes = list(phase1_feature_context.get("reason_codes", []))
+        fallback_warnings = list(errors)
+        if config.regime_ablation_mode:
+            fallback_warnings.append("regime_ablation_mode_enabled")
+            fallback_regime = "unknown"
+            fallback_regime_confidence = 0.5
+            fallback_regime_transition = "none"
+            fallback_regime_diagnostics = {"ablation_mode": True}
+            fallback_reason_codes = sorted(set([*fallback_reason_codes, "regime_ablation_mode_enabled"]))
         return StrategyProposalSignal(
             contract="strategy_proposal_signal.v1",
             run_id=run_id,
@@ -2198,11 +2398,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             slow_window=strategy_slow_window,
             rationale="Fallback strategy due to model unavailability or invalid output.",
             raw_model_response=None,
-            warnings=errors,
+            warnings=fallback_warnings,
             indicator_votes=dict(phase1_feature_context.get("indicator_votes", {})),
-            regime=str(phase1_feature_context.get("regime", "unknown")),
+            regime=fallback_regime,
+            regime_confidence=fallback_regime_confidence,
+            regime_transition=fallback_regime_transition,
+            regime_diagnostics=fallback_regime_diagnostics,
             feature_snapshot=dict(phase1_feature_context.get("feature_snapshot", {})),
-            reason_codes=list(phase1_feature_context.get("reason_codes", [])),
+            reason_codes=fallback_reason_codes,
         )
 
     strategy_signal, strategy_step = _run_step_with_retries(
@@ -2276,6 +2479,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         warnings=list(llm_strategy_signal.warnings),
         indicator_votes=ensemble_action_scores,
         regime=llm_strategy_signal.regime,
+        regime_confidence=llm_strategy_signal.regime_confidence,
+        regime_transition=llm_strategy_signal.regime_transition,
+        regime_diagnostics=dict(llm_strategy_signal.regime_diagnostics),
         feature_snapshot=dict(llm_strategy_signal.feature_snapshot),
         reason_codes=sorted(
             set([*llm_strategy_signal.reason_codes, *ensemble_reason_codes])
@@ -2469,8 +2675,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             strategy_signal=strategy_signal,
             walkforward_evaluation=walkforward_evaluation,
             min_walkforward_sharpe=config.calibration_min_walkforward_sharpe,
+            min_regime_confidence=config.thresholds.min_regime_confidence,
             confidence_floor=config.calibration_confidence_floor,
             confidence_ceiling=config.calibration_confidence_ceiling,
+            regime_ablation_mode=bool(config.regime_ablation_mode),
         )
 
     def calibration_fallback(errors: list[str]) -> dict[str, Any]:
@@ -2501,6 +2709,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             },
             "phase1_inputs": {
                 "regime": strategy_signal.regime,
+                "regime_confidence": strategy_signal.regime_confidence,
+                "regime_transition": strategy_signal.regime_transition,
+                "regime_diagnostics": strategy_signal.regime_diagnostics,
                 "indicator_votes": strategy_signal.indicator_votes,
                 "feature_snapshot": strategy_signal.feature_snapshot,
                 "reason_codes": strategy_signal.reason_codes,
@@ -2508,6 +2719,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "components": {
                 "indicator_alignment": 0.5,
                 "regime_adjustment": 0.0,
+                "regime_confidence": strategy_signal.regime_confidence,
                 "walkforward_quality": 0.0,
             },
             "reason_codes": ["calibration_fallback", *errors],
@@ -2542,6 +2754,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             min_score=config.self_critique_min_score,
             max_findings=max(1, config.self_critique_max_findings),
             timeframe=config.timeframe,
+            regime_ablation_mode=bool(config.regime_ablation_mode),
         )
 
     def self_critique_fallback(errors: list[str]) -> dict[str, Any]:
@@ -2602,6 +2815,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             .get("contradiction_counts", {})
             .get("current_run", 0)
         )
+        regime_confidence = float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
+        regime_transition = str(strategy_signal.regime_transition or "none")
         self_critique_pass = bool(self_critique_signal.get("pass", False))
         self_critique_score = float(self_critique_signal.get("score", 0.0))
         self_critique_highest = str(self_critique_signal.get("highest_severity", "none")).lower()
@@ -2693,6 +2908,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "contradiction_severity": contradiction_severity,
             "contradiction_count": contradiction_count,
             "phase1_regime": strategy_signal.regime,
+            "phase1_regime_confidence": regime_confidence,
+            "phase1_regime_transition": regime_transition,
+            "phase1_regime_diagnostics": strategy_signal.regime_diagnostics,
+            "phase1_regime_ablation_mode": bool(config.regime_ablation_mode),
             "phase1_indicator_votes": strategy_signal.indicator_votes,
             "phase1_feature_snapshot": strategy_signal.feature_snapshot,
             "self_critique_pass": self_critique_pass,
@@ -2713,6 +2932,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "min_walkforward_sharpe": config.calibration_min_walkforward_sharpe,
             "max_contradictions": float(config.calibration_max_contradictions),
             "min_walkforward_quality_score": config.thresholds.min_walkforward_quality_score,
+            "min_regime_confidence": config.thresholds.min_regime_confidence,
+            "regime_ablation_mode": bool(config.regime_ablation_mode),
             "walkforward_quality_low_cutoff": 0.40,
             "walkforward_quality_medium_cutoff": 0.55,
             "walkforward_quality_high_cutoff": 0.70,
@@ -2873,6 +3094,34 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         )
 
         if actionable:
+            if config.regime_ablation_mode:
+                decision_trace.append(
+                    {
+                        "gate": "regime",
+                        "metric": "ablation_mode",
+                        "observed": True,
+                        "threshold": "regime checks disabled",
+                        "pass": True,
+                        "severity": "advisory",
+                        "reason_code": None,
+                    }
+                )
+                append_transition("regime:ablation")
+            else:
+                trace_check(
+                    gate="regime",
+                    metric="regime_confidence",
+                    observed_value={
+                        "regime": strategy_signal.regime,
+                        "regime_confidence": regime_confidence,
+                        "regime_transition": regime_transition,
+                    },
+                    threshold=f">= {config.thresholds.min_regime_confidence}",
+                    passed=regime_confidence >= config.thresholds.min_regime_confidence,
+                    failure_reason_code=f"risk_block_{action}_regime_confidence_low",
+                    failure_severity="block",
+                    failure_detail="Detected regime confidence is below the actionable threshold.",
+                )
             quality_very_low = walkforward_quality_band == "very_low"
             trace_check(
                 gate="calibration",
@@ -3186,6 +3435,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "recommendation": strategy_signal.recommendation,
             "confidence": strategy_signal.confidence,
             "regime": strategy_signal.regime,
+            "regime_confidence": strategy_signal.regime_confidence,
+            "regime_transition": strategy_signal.regime_transition,
+            "regime_diagnostics": strategy_signal.regime_diagnostics,
             "indicator_votes": strategy_signal.indicator_votes,
             "feature_snapshot": strategy_signal.feature_snapshot,
             "reason_codes": strategy_signal.reason_codes,
@@ -3384,6 +3636,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "self_critique_min_score": config.self_critique_min_score,
             "self_critique_max_findings": config.self_critique_max_findings,
             "ops_report_verbosity": _normalize_report_verbosity(config.ops_report_verbosity),
+            "regime_detector_mode": str(config.regime_detector_mode).strip().lower(),
+            "regime_volatility_threshold": max(0.0001, float(config.regime_volatility_threshold)),
+            "regime_trend_spread_threshold": max(
+                0.0001,
+                float(config.regime_trend_spread_threshold),
+            ),
+            "regime_persistence_bars": max(1, int(config.regime_persistence_bars)),
+            "regime_ablation_mode": bool(config.regime_ablation_mode),
             "ensemble_mode": ensemble_mode,
             "ensemble_enabled_arms": list(enabled_arms),
             "ensemble_decay_horizon": max(4, int(config.ensemble_decay_horizon)),
@@ -3432,6 +3692,10 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "paper_trade_execution_status": paper_trade_execution.execution_status,
             "deterministic_gate": risk_decision.deterministic_gate,
             "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
+            "phase1_regime": strategy_signal.regime,
+            "phase1_regime_confidence": strategy_signal.regime_confidence,
+            "phase1_regime_transition": strategy_signal.regime_transition,
+            "phase1_regime_ablation_mode": bool(config.regime_ablation_mode),
             "walkforward_quality_score": confidence_calibration.get("walkforward_quality_score"),
             "self_critique_score": self_critique_signal.get("score"),
             "self_critique_pass": self_critique_signal.get("pass"),

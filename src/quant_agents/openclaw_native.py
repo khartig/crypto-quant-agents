@@ -62,6 +62,17 @@ def _try_read_json_object(path: Path) -> dict[str, Any] | None:
     except Exception:
         return None
 
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
 
 @dataclass(frozen=True)
 class OpenClawOrchestrationRequest:
@@ -72,12 +83,18 @@ class OpenClawOrchestrationRequest:
     ops_model: str
     step_retries: int
     minimum_bars: int
+    regime_detector_mode: str
+    regime_volatility_threshold: float
+    regime_trend_spread_threshold: float
+    regime_persistence_bars: int
+    regime_ablation_mode: bool
     min_total_return: float
     min_sharpe: float
     max_drawdown: float
     max_cost_return_drag: float
     min_signal_confidence: float
     min_walkforward_quality_score: float
+    min_regime_confidence: float
     backtest_fee_bps: float
     backtest_slippage_bps: float
     walk_forward_fee_bps: float
@@ -114,6 +131,40 @@ class OpenClawOrchestrationRequest:
             ops_model=str(payload.get("ops_model") or settings.ollama_ops_model),
             step_retries=max(0, int(payload.get("step_retries", settings.agent_step_retries))),
             minimum_bars=max(10, int(payload.get("minimum_bars", settings.agent_minimum_bars))),
+            regime_detector_mode=str(
+                payload.get("regime_detector_mode", settings.regime_detector_mode)
+            ).strip().lower(),
+            regime_volatility_threshold=max(
+                0.0001,
+                float(
+                    payload.get(
+                        "regime_volatility_threshold",
+                        settings.regime_volatility_threshold,
+                    )
+                ),
+            ),
+            regime_trend_spread_threshold=max(
+                0.0001,
+                float(
+                    payload.get(
+                        "regime_trend_spread_threshold",
+                        settings.regime_trend_spread_threshold,
+                    )
+                ),
+            ),
+            regime_persistence_bars=max(
+                1,
+                int(
+                    payload.get(
+                        "regime_persistence_bars",
+                        settings.regime_persistence_bars,
+                    )
+                ),
+            ),
+            regime_ablation_mode=_coerce_bool(
+                payload.get("regime_ablation_mode"),
+                default=bool(settings.regime_ablation_mode),
+            ),
             min_total_return=float(payload.get("min_total_return", settings.risk_min_total_return)),
             min_sharpe=float(payload.get("min_sharpe", settings.risk_min_sharpe)),
             max_drawdown=float(payload.get("max_drawdown", settings.risk_max_drawdown)),
@@ -127,6 +178,12 @@ class OpenClawOrchestrationRequest:
                 payload.get(
                     "min_walkforward_quality_score",
                     settings.risk_min_walkforward_quality_score,
+                )
+            ),
+            min_regime_confidence=float(
+                payload.get(
+                    "min_regime_confidence",
+                    settings.risk_min_regime_confidence,
                 )
             ),
             backtest_fee_bps=float(payload.get("backtest_fee_bps", settings.backtest_fee_bps)),
@@ -240,6 +297,7 @@ class OpenClawOrchestrationRequest:
             max_cost_return_drag=self.max_cost_return_drag,
             min_signal_confidence=self.min_signal_confidence,
             min_walkforward_quality_score=max(0.0, min(1.0, float(self.min_walkforward_quality_score))),
+            min_regime_confidence=max(0.0, min(1.0, float(self.min_regime_confidence))),
         )
         return AgentPlaneConfig(
             exchange=self.exchange,
@@ -258,6 +316,13 @@ class OpenClawOrchestrationRequest:
             paper_fee_bps=self.paper_fee_bps,
             paper_slippage_bps=max(0.0, float(self.paper_slippage_bps)),
             minimum_bars=self.minimum_bars,
+            regime_detector_mode=(
+                self.regime_detector_mode if self.regime_detector_mode in {"heuristic", "score"} else "score"
+            ),
+            regime_volatility_threshold=max(0.0001, float(self.regime_volatility_threshold)),
+            regime_trend_spread_threshold=max(0.0001, float(self.regime_trend_spread_threshold)),
+            regime_persistence_bars=max(1, int(self.regime_persistence_bars)),
+            regime_ablation_mode=bool(self.regime_ablation_mode),
             walk_forward_train_bars=self.walk_forward_train_bars,
             walk_forward_validate_bars=self.walk_forward_validate_bars,
             walk_forward_step_bars=self.walk_forward_step_bars,

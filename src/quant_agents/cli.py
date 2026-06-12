@@ -169,6 +169,43 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Minimum bars required for data-quality pass.",
     )
     agent_plane.add_argument(
+        "--regime-detector-mode",
+        choices=["heuristic", "score"],
+        default=None,
+        help="Regime detector mode used in phase-1 feature context.",
+    )
+    agent_plane.add_argument(
+        "--regime-volatility-threshold",
+        type=float,
+        default=None,
+        help="Regime detector volatility threshold (rolling std units).",
+    )
+    agent_plane.add_argument(
+        "--regime-trend-spread-threshold",
+        type=float,
+        default=None,
+        help="Regime detector absolute SMA trend-spread threshold.",
+    )
+    agent_plane.add_argument(
+        "--regime-persistence-bars",
+        type=int,
+        default=None,
+        help="Regime detector persistence window for transition smoothing.",
+    )
+    agent_plane.add_argument(
+        "--regime-ablation-mode",
+        dest="regime_ablation_mode",
+        action="store_true",
+        help="Disable all regime contributions (prompting, calibration terms, self-critique regime checks, and risk regime gate).",
+    )
+    agent_plane.add_argument(
+        "--no-regime-ablation-mode",
+        dest="regime_ablation_mode",
+        action="store_false",
+        help="Enable normal regime contributions (default behavior unless env enables ablation).",
+    )
+    agent_plane.set_defaults(regime_ablation_mode=None)
+    agent_plane.add_argument(
         "--fast-window",
         type=int,
         default=None,
@@ -215,6 +252,12 @@ def _base_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Deterministic risk gate: minimum walk-forward quality score for actionable recommendations.",
+    )
+    agent_plane.add_argument(
+        "--min-regime-confidence",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: minimum regime confidence for actionable recommendations.",
     )
     agent_plane.add_argument(
         "--backtest-fee-bps",
@@ -843,6 +886,17 @@ def main(argv: list[str] | None = None) -> None:
                     ),
                 ),
             ),
+            min_regime_confidence=min(
+                1.0,
+                max(
+                    0.0,
+                    (
+                        args.min_regime_confidence
+                        if args.min_regime_confidence is not None
+                        else settings.risk_min_regime_confidence
+                    ),
+                ),
+            ),
         )
         config = AgentPlaneConfig(
             exchange=exchange,
@@ -902,6 +956,34 @@ def main(argv: list[str] | None = None) -> None:
             minimum_bars=max(
                 10,
                 args.minimum_bars if args.minimum_bars is not None else settings.agent_minimum_bars,
+            ),
+            regime_detector_mode=(
+                args.regime_detector_mode
+                if args.regime_detector_mode is not None
+                else settings.regime_detector_mode
+            ),
+            regime_volatility_threshold=max(
+                0.0001,
+                args.regime_volatility_threshold
+                if args.regime_volatility_threshold is not None
+                else settings.regime_volatility_threshold,
+            ),
+            regime_trend_spread_threshold=max(
+                0.0001,
+                args.regime_trend_spread_threshold
+                if args.regime_trend_spread_threshold is not None
+                else settings.regime_trend_spread_threshold,
+            ),
+            regime_persistence_bars=max(
+                1,
+                args.regime_persistence_bars
+                if args.regime_persistence_bars is not None
+                else settings.regime_persistence_bars,
+            ),
+            regime_ablation_mode=(
+                bool(args.regime_ablation_mode)
+                if args.regime_ablation_mode is not None
+                else bool(settings.regime_ablation_mode)
             ),
             strategy_fast_window=max(2, int(args.fast_window)) if args.fast_window is not None else None,
             strategy_slow_window=max(3, int(args.slow_window)) if args.slow_window is not None else None,

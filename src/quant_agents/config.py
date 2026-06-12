@@ -31,12 +31,18 @@ class Settings:
     ollama_ops_model: str
     agent_step_retries: int
     agent_minimum_bars: int
+    regime_detector_mode: str
+    regime_volatility_threshold: float
+    regime_trend_spread_threshold: float
+    regime_persistence_bars: int
+    regime_ablation_mode: bool
     risk_min_total_return: float
     risk_min_sharpe: float
     risk_max_drawdown: float
     risk_max_cost_return_drag: float
     risk_min_signal_confidence: float
     risk_min_walkforward_quality_score: float
+    risk_min_regime_confidence: float
     backtest_fee_bps: float
     backtest_slippage_bps: float
     walk_forward_fee_bps: float
@@ -112,6 +118,15 @@ def _as_ensemble_mode(value: str | None, default: str = "adaptive") -> str:
     return default
 
 
+def _as_regime_mode(value: str | None, default: str = "score") -> str:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"heuristic", "score"}:
+        return normalized
+    return default
+
+
 def _as_csv_tuple(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
     if value is None:
         return default
@@ -146,6 +161,26 @@ def load_settings() -> Settings:
         ollama_ops_model=os.getenv("OLLAMA_OPS_MODEL", "llama3.1:8b"),
         agent_step_retries=max(0, _as_int(os.getenv("AGENT_STEP_RETRIES"), default=2)),
         agent_minimum_bars=max(10, _as_int(os.getenv("AGENT_MINIMUM_BARS"), default=120)),
+        regime_detector_mode=_as_regime_mode(
+            os.getenv("REGIME_DETECTOR_MODE"),
+            default="score",
+        ),
+        regime_volatility_threshold=max(
+            0.0001,
+            _as_float(os.getenv("REGIME_VOLATILITY_THRESHOLD"), default=0.03),
+        ),
+        regime_trend_spread_threshold=max(
+            0.0001,
+            _as_float(os.getenv("REGIME_TREND_SPREAD_THRESHOLD"), default=0.01),
+        ),
+        regime_persistence_bars=max(
+            1,
+            _as_int(os.getenv("REGIME_PERSISTENCE_BARS"), default=3),
+        ),
+        regime_ablation_mode=_as_bool(
+            os.getenv("REGIME_ABLATION_MODE"),
+            default=False,
+        ),
         risk_min_total_return=_as_float(os.getenv("RISK_MIN_TOTAL_RETURN"), default=0.0),
         risk_min_sharpe=_as_float(os.getenv("RISK_MIN_SHARPE"), default=0.0),
         risk_max_drawdown=_as_float(os.getenv("RISK_MAX_DRAWDOWN"), default=-0.20),
@@ -159,6 +194,13 @@ def load_settings() -> Settings:
             max(
                 0.0,
                 _as_float(os.getenv("RISK_MIN_WALKFORWARD_QUALITY_SCORE"), default=0.43),
+            ),
+        ),
+        risk_min_regime_confidence=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("RISK_MIN_REGIME_CONFIDENCE"), default=0.45),
             ),
         ),
         backtest_fee_bps=max(
