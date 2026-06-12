@@ -36,6 +36,8 @@ from quant_agents.paper_trading import execute_paper_trade_intent
 from quant_agents.storage import latest_raw_dataset
 
 logger = logging.getLogger(__name__)
+DEFAULT_STRATEGY_FAST_WINDOW = 24
+DEFAULT_STRATEGY_SLOW_WINDOW = 60
 
 _T = TypeVar("_T")
 
@@ -45,7 +47,9 @@ class RiskThresholds:
     min_total_return: float
     min_sharpe: float
     max_drawdown: float
+    max_cost_return_drag: float
     min_signal_confidence: float
+    min_walkforward_quality_score: float = 0.43
 
 
 @dataclass(frozen=True)
@@ -57,9 +61,14 @@ class AgentPlaneConfig:
     ops_model: str
     step_retries: int
     thresholds: RiskThresholds
+    backtest_fee_bps: float
+    backtest_slippage_bps: float
+    walk_forward_fee_bps: float
+    walk_forward_slippage_bps: float
     paper_notional_usd: float
     paper_starting_cash_usd: float
     paper_fee_bps: float
+    paper_slippage_bps: float
     minimum_bars: int
     walk_forward_train_bars: int = 240
     walk_forward_validate_bars: int = 72
@@ -80,7 +89,10 @@ class AgentPlaneConfig:
     )
     ensemble_decay_horizon: int = 96
     ensemble_exploration_weight: float = 0.08
+    ensemble_turnover_penalty_bps: float = 8.0
     source_data_path: Path | None = None
+    strategy_fast_window: int | None = None
+    strategy_slow_window: int | None = None
 
 
 @dataclass(frozen=True)
@@ -193,23 +205,25 @@ def _sanitize_windows(fast_window: Any, slow_window: Any) -> tuple[int, int, lis
     try:
         fast = int(fast_window)
     except (TypeError, ValueError):
-        fast = 20
-        warnings.append("fast_window invalid; defaulted to 20")
+        fast = DEFAULT_STRATEGY_FAST_WINDOW
+        warnings.append(f"fast_window invalid; defaulted to {DEFAULT_STRATEGY_FAST_WINDOW}")
     try:
         slow = int(slow_window)
     except (TypeError, ValueError):
-        slow = 50
-        warnings.append("slow_window invalid; defaulted to 50")
+        slow = DEFAULT_STRATEGY_SLOW_WINDOW
+        warnings.append(f"slow_window invalid; defaulted to {DEFAULT_STRATEGY_SLOW_WINDOW}")
 
     if fast <= 0:
-        fast = 20
-        warnings.append("fast_window <= 0; defaulted to 20")
+        fast = DEFAULT_STRATEGY_FAST_WINDOW
+        warnings.append(f"fast_window <= 0; defaulted to {DEFAULT_STRATEGY_FAST_WINDOW}")
     if slow <= 0:
-        slow = 50
-        warnings.append("slow_window <= 0; defaulted to 50")
+        slow = DEFAULT_STRATEGY_SLOW_WINDOW
+        warnings.append(f"slow_window <= 0; defaulted to {DEFAULT_STRATEGY_SLOW_WINDOW}")
     if fast >= slow:
-        fast, slow = 20, 50
-        warnings.append("fast_window >= slow_window; reset to 20/50")
+        fast, slow = DEFAULT_STRATEGY_FAST_WINDOW, DEFAULT_STRATEGY_SLOW_WINDOW
+        warnings.append(
+            f"fast_window >= slow_window; reset to {DEFAULT_STRATEGY_FAST_WINDOW}/{DEFAULT_STRATEGY_SLOW_WINDOW}"
+        )
     return fast, slow, warnings
 
 
@@ -266,7 +280,10 @@ def _load_ensemble_weight_state(
             "ewma_pnl": float(entry.get("ewma_pnl", 0.0)),
             "ewma_drawdown": float(entry.get("ewma_drawdown", 0.0)),
             "ewma_stability": float(entry.get("ewma_stability", 0.5)),
+            "ewma_cost_drag": float(entry.get("ewma_cost_drag", 0.0)),
+            "ewma_turnover": float(entry.get("ewma_turnover", 0.0)),
             "observations": max(0, int(entry.get("observations", 0))),
+            "selections": max(0, int(entry.get("selections", 0))),
             "last_weight": float(entry.get("last_weight", equal_weight)),
         }
     history = payload.get("history")
@@ -450,6 +467,7 @@ def _compute_arm_weights(
     arm_votes: dict[str, dict[str, Any]],
     ensemble_state: dict[str, Any],
     exploration_weight: float,
+    turnover_penalty_bps: float,
 ) -> tuple[dict[str, float], list[str]]:
     if not enabled_arms:
         return {}, ["ensemble_no_enabled_arms"]
@@ -472,7 +490,17 @@ def _compute_arm_weights(
         ewma_pnl = float(stats.get("ewma_pnl", 0.0))
         ewma_drawdown = float(stats.get("ewma_drawdown", 0.0))
         ewma_stability = float(np.clip(stats.get("ewma_stability", 0.5), 0.0, 1.0))
-        performance_score = 0.5 + ewma_pnl - ewma_drawdown + ((ewma_stability - 0.5) * 0.2)
+        ewma_cost_drag = float(max(0.0, stats.get("ewma_cost_drag", 0.0)))
+        ewma_turnover = float(max(0.0, stats.get("ewma_turnover", 0.0)))
+        turnover_penalty = (max(0.0, float(turnover_penalty_bps)) / 10_000.0) * ewma_turnover
+        performance_score = (
+            0.5
+            + ewma_pnl
+            - ewma_drawdown
+            - ewma_cost_drag
+            - turnover_penalty
+            + ((ewma_stability - 0.5) * 0.2)
+        )
         raw_scores[arm] = max(
             0.0,
             (0.60 * vote_confidence) + (0.40 * performance_score),
@@ -532,9 +560,20 @@ def _update_ensemble_weight_state(
 ) -> dict[str, Any]:
     alpha = 2.0 / (max(4, decay_horizon) + 1.0)
     executed_notional = max(0.0, float(paper_trade_execution.executed_notional_usd))
+    requested_notional = max(0.0, float(paper_trade_execution.requested_notional_usd))
     realized_pnl = float(paper_trade_execution.realized_pnl_delta_usd)
+    fee_ratio = (
+        max(0.0, float(paper_trade_execution.fee_usd)) / max(1.0, executed_notional)
+        if executed_notional > 0
+        else 0.0
+    )
     pnl_ratio = realized_pnl / max(1.0, executed_notional) if executed_notional > 0 else 0.0
     drawdown = max(0.0, -pnl_ratio)
+    turnover_ratio = (
+        float(min(1.0, executed_notional / max(1.0, requested_notional)))
+        if executed_notional > 0
+        else 0.0
+    )
     executed = paper_trade_execution.execution_status == "executed"
 
     before_state = _json_safe(dict(ensemble_state))
@@ -546,10 +585,18 @@ def _update_ensemble_weight_state(
         attributed_weight = float(normalized_weights.get(arm, 0.0)) if participated else 0.0
         pnl_signal = pnl_ratio * attributed_weight if participated and executed else 0.0
         drawdown_signal = drawdown * attributed_weight if participated and executed else 0.0
-        stability_signal = 1.0 if participated and executed else 0.0
+        cost_signal = fee_ratio * attributed_weight if participated and executed else 0.0
+        turnover_signal = turnover_ratio * attributed_weight if participated and executed else 0.0
+        stability_signal = 1.0 if participated and executed and realized_pnl >= 0 else 0.0
         stats["ewma_pnl"] = float(((1.0 - alpha) * float(stats.get("ewma_pnl", 0.0))) + (alpha * pnl_signal))
         stats["ewma_drawdown"] = float(
             ((1.0 - alpha) * float(stats.get("ewma_drawdown", 0.0))) + (alpha * drawdown_signal)
+        )
+        stats["ewma_cost_drag"] = float(
+            ((1.0 - alpha) * float(stats.get("ewma_cost_drag", 0.0))) + (alpha * cost_signal)
+        )
+        stats["ewma_turnover"] = float(
+            ((1.0 - alpha) * float(stats.get("ewma_turnover", 0.0))) + (alpha * turnover_signal)
         )
         stats["ewma_stability"] = float(
             np.clip(
@@ -558,7 +605,10 @@ def _update_ensemble_weight_state(
                 1.0,
             )
         )
-        stats["observations"] = int(max(0, int(stats.get("observations", 0)) + (1 if participated else 0)))
+        stats["selections"] = int(max(0, int(stats.get("selections", 0)) + (1 if participated else 0)))
+        stats["observations"] = int(
+            max(0, int(stats.get("observations", 0)) + (1 if participated and executed else 0))
+        )
         stats["last_weight"] = float(normalized_weights.get(arm, 0.0))
         arm_stats[arm] = stats
 
@@ -572,6 +622,8 @@ def _update_ensemble_weight_state(
             "executed_action": paper_trade_execution.executed_action,
             "pnl_ratio": pnl_ratio,
             "drawdown": drawdown,
+            "fee_ratio": fee_ratio,
+            "turnover_ratio": turnover_ratio,
         }
     )
     ensemble_state["contract"] = "ensemble_weight_state.v1"
@@ -591,9 +643,12 @@ def _update_ensemble_weight_state(
         "execution_status": paper_trade_execution.execution_status,
         "executed_action": paper_trade_execution.executed_action,
         "executed_notional_usd": executed_notional,
+        "requested_notional_usd": requested_notional,
+        "fee_ratio": fee_ratio,
         "realized_pnl_delta_usd": realized_pnl,
         "pnl_ratio": pnl_ratio,
         "drawdown": drawdown,
+        "turnover_ratio": turnover_ratio,
         "before": before_state,
         "after": _json_safe(dict(ensemble_state)),
     }
@@ -1040,6 +1095,8 @@ def _run_walkforward_evaluation(
     source_data_sha256: str,
     fast_window: int,
     slow_window: int,
+    fee_bps: float,
+    slippage_bps: float,
     train_bars: int,
     validate_bars: int,
     step_bars: int,
@@ -1055,6 +1112,8 @@ def _run_walkforward_evaluation(
         )
 
     periods_per_year = _periods_per_year(timeframe)
+    one_way_cost_bps = max(0.0, float(fee_bps)) + max(0.0, float(slippage_bps))
+    cost_rate = one_way_cost_bps / 10_000.0
     rows: list[dict[str, Any]] = []
     total_bars = len(close_frame)
     window_span = train_bars + validate_bars
@@ -1068,23 +1127,47 @@ def _run_walkforward_evaluation(
         segment["ma_slow"] = segment["close"].rolling(window=slow_window).mean()
         segment["signal"] = (segment["ma_fast"] > segment["ma_slow"]).astype(float)
         segment["position"] = segment["signal"].shift(1).fillna(0.0)
+        segment["turnover_units"] = segment["position"].diff().abs().fillna(segment["position"].abs())
 
         validation = segment.iloc[train_bars:].copy().reset_index(drop=True)
-        validation["strategy_returns"] = validation["position"] * validation["returns"]
-        validation["equity_curve"] = (1.0 + validation["strategy_returns"]).cumprod()
+        validation["strategy_returns_gross"] = validation["position"] * validation["returns"]
+        validation["cost_returns"] = validation["turnover_units"] * cost_rate
+        validation["strategy_returns_net"] = validation["strategy_returns_gross"] - validation["cost_returns"]
+        validation["strategy_returns"] = validation["strategy_returns_net"]
+        validation["equity_curve_gross"] = (1.0 + validation["strategy_returns_gross"]).cumprod()
+        validation["equity_curve_net"] = (1.0 + validation["strategy_returns_net"]).cumprod()
+        validation["equity_curve"] = validation["equity_curve_net"]
         if validation.empty:
             next_start += step_bars
             continue
 
-        total_return = float(validation["equity_curve"].iloc[-1] - 1.0)
-        mean_ret = float(validation["strategy_returns"].mean())
-        std_ret = float(validation["strategy_returns"].std(ddof=0))
+        total_return = float(validation["equity_curve_net"].iloc[-1] - 1.0)
+        gross_total_return = float(validation["equity_curve_gross"].iloc[-1] - 1.0)
+        mean_ret = float(validation["strategy_returns_net"].mean())
+        std_ret = float(validation["strategy_returns_net"].std(ddof=0))
+        gross_mean_ret = float(validation["strategy_returns_gross"].mean())
+        gross_std_ret = float(validation["strategy_returns_gross"].std(ddof=0))
         sharpe = float(np.sqrt(periods_per_year) * mean_ret / std_ret) if std_ret > 0 else 0.0
-        rolling_peak = validation["equity_curve"].cummax()
-        drawdown = (validation["equity_curve"] / rolling_peak) - 1.0
+        gross_sharpe = (
+            float(np.sqrt(periods_per_year) * gross_mean_ret / gross_std_ret)
+            if gross_std_ret > 0
+            else 0.0
+        )
+        rolling_peak = validation["equity_curve_net"].cummax()
+        drawdown = (validation["equity_curve_net"] / rolling_peak) - 1.0
         max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
-        hit_rate = float((validation["strategy_returns"] > 0).mean()) if len(validation) else 0.0
+        gross_rolling_peak = validation["equity_curve_gross"].cummax()
+        gross_drawdown = (validation["equity_curve_gross"] / gross_rolling_peak) - 1.0
+        gross_max_drawdown = float(gross_drawdown.min()) if not gross_drawdown.empty else 0.0
+        hit_rate = float((validation["strategy_returns_net"] > 0).mean()) if len(validation) else 0.0
         signal_flips = int(validation["signal"].diff().abs().fillna(0.0).sum())
+        turnover_units = float(validation["turnover_units"].sum())
+        total_cost_return_drag = float(validation["cost_returns"].sum())
+        break_even_one_way_cost_bps = (
+            float((max(0.0, gross_total_return) / turnover_units) * 10_000.0)
+            if turnover_units > 0
+            else 0.0
+        )
         quality_score = _walkforward_quality_score(
             total_return=total_return,
             sharpe=sharpe,
@@ -1102,10 +1185,20 @@ def _run_walkforward_evaluation(
                 "bars": int(len(validation)),
                 "total_return": total_return,
                 "annualized_return": float((1.0 + total_return) ** (periods_per_year / len(validation)) - 1.0),
+                "gross_total_return": gross_total_return,
+                "gross_annualized_return": float(
+                    (1.0 + gross_total_return) ** (periods_per_year / len(validation)) - 1.0
+                ),
                 "sharpe": sharpe,
+                "gross_sharpe": gross_sharpe,
                 "max_drawdown": max_drawdown,
+                "gross_max_drawdown": gross_max_drawdown,
                 "hit_rate": hit_rate,
                 "signal_flips": signal_flips,
+                "turnover_units": turnover_units,
+                "total_cost_return_drag": total_cost_return_drag,
+                "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
+                "one_way_trading_cost_bps": one_way_cost_bps,
                 "quality_score": quality_score,
             }
         )
@@ -1117,18 +1210,33 @@ def _run_walkforward_evaluation(
         )
 
     total_returns = np.asarray([row["total_return"] for row in rows], dtype=float)
+    gross_total_returns = np.asarray([row["gross_total_return"] for row in rows], dtype=float)
     sharpes = np.asarray([row["sharpe"] for row in rows], dtype=float)
+    gross_sharpes = np.asarray([row["gross_sharpe"] for row in rows], dtype=float)
     drawdowns = np.asarray([row["max_drawdown"] for row in rows], dtype=float)
+    gross_drawdowns = np.asarray([row["gross_max_drawdown"] for row in rows], dtype=float)
     hit_rates = np.asarray([row["hit_rate"] for row in rows], dtype=float)
+    total_cost_drags = np.asarray([row["total_cost_return_drag"] for row in rows], dtype=float)
+    turnover_units = np.asarray([row["turnover_units"] for row in rows], dtype=float)
     quality_scores = np.asarray([row["quality_score"] for row in rows], dtype=float)
 
     avg_return = float(np.mean(total_returns))
+    avg_gross_return = float(np.mean(gross_total_returns))
     avg_sharpe = float(np.mean(sharpes))
+    avg_gross_sharpe = float(np.mean(gross_sharpes))
     worst_drawdown = float(np.min(drawdowns))
+    gross_worst_drawdown = float(np.min(gross_drawdowns))
     avg_hit_rate = float(np.mean(hit_rates))
+    avg_cost_drag = float(np.mean(total_cost_drags))
+    avg_turnover_units = float(np.mean(turnover_units))
     return_variance = float(np.std(total_returns))
     stability_score = float(np.clip(1.0 - min(1.0, return_variance / 0.08), 0.0, 1.0))
     quality_score = float(np.clip(float(np.mean(quality_scores)) * (0.7 + 0.3 * stability_score), 0.0, 1.0))
+    break_even_one_way_cost_bps = (
+        float((max(0.0, avg_gross_return) / avg_turnover_units) * 10_000.0)
+        if avg_turnover_units > 0
+        else 0.0
+    )
     diagnostics = _build_walkforward_diagnostics(rows)
 
     return {
@@ -1145,16 +1253,26 @@ def _run_walkforward_evaluation(
         "train_bars": train_bars,
         "validate_bars": validate_bars,
         "step_bars": step_bars,
+        "fee_bps": float(max(0.0, fee_bps)),
+        "slippage_bps": float(max(0.0, slippage_bps)),
+        "one_way_trading_cost_bps": float(one_way_cost_bps),
         "window_count": len(rows),
         "aggregate_total_return": avg_return,
+        "aggregate_gross_total_return": avg_gross_return,
         "aggregate_sharpe": avg_sharpe,
+        "aggregate_gross_sharpe": avg_gross_sharpe,
         "aggregate_max_drawdown": worst_drawdown,
+        "aggregate_gross_max_drawdown": gross_worst_drawdown,
         "aggregate_hit_rate": avg_hit_rate,
+        "aggregate_total_cost_return_drag": avg_cost_drag,
+        "aggregate_turnover_units": avg_turnover_units,
+        "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
         "stability_score": stability_score,
         "quality_score": quality_score,
         "windows": rows,
         "diagnostics": diagnostics,
     }
+
 def _run_self_critique(
     *,
     run_id: str,
@@ -1528,15 +1646,25 @@ def _strategy_prompt(
     phase1_context: dict[str, Any],
     source_data_path: Path,
     source_data_sha256: str,
+    preferred_fast_window: int,
+    preferred_slow_window: int,
 ) -> str:
     return "\n".join(
         [
             "You are strategy-agent for a deterministic crypto quant pipeline.",
             "Return STRICT JSON only with keys:",
-            '{"recommendation":"buy|sell|hold","confidence":0.0,"fast_window":20,"slow_window":50,"rationale":"...","indicator_votes":{"buy":0.0,"sell":0.0,"hold":1.0},"regime":"...","feature_snapshot":{"key":"value"},"reason_codes":["..."]}',
+            (
+                "{"
+                + '"recommendation":"buy|sell|hold","confidence":0.0,'
+                + f'"fast_window":{preferred_fast_window},"slow_window":{preferred_slow_window},'
+                + '"rationale":"...","indicator_votes":{"buy":0.0,"sell":0.0,"hold":1.0},'
+                + '"regime":"...","feature_snapshot":{"key":"value"},"reason_codes":["..."]'
+                + "}"
+            ),
             "Rules:",
             "- confidence must be between 0 and 1.",
             "- fast_window and slow_window must be positive integers with slow_window > fast_window.",
+            f"- Use fast_window={preferred_fast_window} and slow_window={preferred_slow_window} for this run.",
             "- Keep rationale concise and risk-aware.",
             f"Exchange: {exchange}",
             f"Symbol: {symbol}",
@@ -1576,10 +1704,180 @@ def _ops_prompt(context: dict[str, Any]) -> str:
             "## Paper execution",
             "## Follow-ups",
             "Use only facts from the context JSON and do not invent metrics.",
-            json.dumps(context, indent=2, sort_keys=True),
+            (
+                "Keep the report concise: "
+                "compact<=140 words, standard<=240 words, verbose<=380 words."
+            ),
+            json.dumps(context, sort_keys=True),
         ]
     )
 
+
+def _compact_ops_prompt_context(context: dict[str, Any]) -> dict[str, Any]:
+    proposal = context.get("proposal", {})
+    if not isinstance(proposal, dict):
+        proposal = {}
+    backtest = context.get("backtest", {})
+    if not isinstance(backtest, dict):
+        backtest = {}
+    ensemble_metrics = backtest.get("ensemble_metrics", {})
+    if not isinstance(ensemble_metrics, dict):
+        ensemble_metrics = {}
+    walkforward = context.get("walkforward", {})
+    if not isinstance(walkforward, dict):
+        walkforward = {}
+    calibration = context.get("calibration", {})
+    if not isinstance(calibration, dict):
+        calibration = {}
+    self_critique = context.get("self_critique", {})
+    if not isinstance(self_critique, dict):
+        self_critique = {}
+    risk = context.get("risk", {})
+    if not isinstance(risk, dict):
+        risk = {}
+    intent = context.get("intent", {})
+    if not isinstance(intent, dict):
+        intent = {}
+    execution = context.get("execution", {})
+    if not isinstance(execution, dict):
+        execution = {}
+    ensemble = context.get("ensemble", {})
+    if not isinstance(ensemble, dict):
+        ensemble = {}
+    performance_update = ensemble.get("performance_update", {})
+    if not isinstance(performance_update, dict):
+        performance_update = {}
+
+    decision_trace = risk.get("decision_trace", [])
+    if not isinstance(decision_trace, list):
+        decision_trace = []
+    trace_sample = decision_trace[:8]
+    trace_sample = [
+        {
+            "gate": row.get("gate"),
+            "metric": row.get("metric"),
+            "pass": row.get("pass"),
+            "reason_code": row.get("reason_code"),
+        }
+        for row in trace_sample
+        if isinstance(row, dict)
+    ]
+    truncated_trace_rows = max(0, len(decision_trace) - len(trace_sample))
+
+    walk_windows = walkforward.get("windows", [])
+    if not isinstance(walk_windows, list):
+        walk_windows = []
+    walk_sample = walk_windows[:4]
+    walk_sample = [
+        {
+            "window_index": row.get("window_index"),
+            "total_return": row.get("total_return"),
+            "sharpe": row.get("sharpe"),
+            "max_drawdown": row.get("max_drawdown"),
+            "turnover_units": row.get("turnover_units"),
+            "total_cost_return_drag": row.get("total_cost_return_drag"),
+            "quality_score": row.get("quality_score"),
+        }
+        for row in walk_sample
+        if isinstance(row, dict)
+    ]
+    truncated_walk_rows = max(0, len(walk_windows) - len(walk_sample))
+
+    return {
+        "run_id": context.get("run_id"),
+        "report_verbosity": context.get("report_verbosity"),
+        "scope": context.get("scope", {}),
+        "proposal": {
+            "source": proposal.get("source"),
+            "recommendation": proposal.get("recommendation"),
+            "confidence": proposal.get("confidence"),
+            "regime": proposal.get("regime"),
+            "fast_window": proposal.get("fast_window"),
+            "slow_window": proposal.get("slow_window"),
+            "rationale": proposal.get("rationale"),
+            "reason_codes": list(proposal.get("reason_codes", []))[:12],
+            "selected_arms": list(proposal.get("selected_arms", [])),
+            "arm_weights": proposal.get("arm_weights", {}),
+            "ensemble_reason_codes": list(proposal.get("ensemble_reason_codes", []))[:12],
+        },
+        "backtest": {
+            "status": backtest.get("status"),
+            "total_return": backtest.get("total_return"),
+            "annualized_return": backtest.get("annualized_return"),
+            "sharpe": backtest.get("sharpe"),
+            "max_drawdown": backtest.get("max_drawdown"),
+            "total_cost_return_drag": ensemble_metrics.get("total_cost_return_drag"),
+            "turnover_units": ensemble_metrics.get("turnover_units"),
+            "break_even_one_way_cost_bps": ensemble_metrics.get("break_even_one_way_cost_bps"),
+            "one_way_trading_cost_bps": ensemble_metrics.get("one_way_trading_cost_bps"),
+        },
+        "walkforward": {
+            "window_count": walkforward.get("window_count"),
+            "aggregate_total_return": walkforward.get("aggregate_total_return"),
+            "aggregate_sharpe": walkforward.get("aggregate_sharpe"),
+            "aggregate_max_drawdown": walkforward.get("aggregate_max_drawdown"),
+            "aggregate_total_cost_return_drag": walkforward.get("aggregate_total_cost_return_drag"),
+            "aggregate_turnover_units": walkforward.get("aggregate_turnover_units"),
+            "break_even_one_way_cost_bps": walkforward.get("break_even_one_way_cost_bps"),
+            "stability_score": walkforward.get("stability_score"),
+            "quality_score": walkforward.get("quality_score"),
+            "window_sample": walk_sample,
+            "window_sample_truncated_rows": truncated_walk_rows,
+        },
+        "calibration": {
+            "raw_confidence": calibration.get("raw_confidence"),
+            "calibrated_confidence": calibration.get("calibrated_confidence"),
+            "walkforward_quality_score": calibration.get("walkforward_quality_score"),
+            "walkforward_quality_band": calibration.get("walkforward_quality_band"),
+            "walkforward_sharpe": calibration.get("walkforward_sharpe"),
+            "contradiction_detected": calibration.get("contradiction_detected"),
+            "contradiction_severity": calibration.get("contradiction_severity"),
+            "reason_codes": list(calibration.get("reason_codes", []))[:12],
+        },
+        "self_critique": {
+            "pass": self_critique.get("pass"),
+            "score": self_critique.get("score"),
+            "highest_severity": self_critique.get("highest_severity"),
+            "reason_codes": list(self_critique.get("reason_codes", []))[:12],
+        },
+        "risk": {
+            "approved": risk.get("approved"),
+            "deterministic_gate": risk.get("deterministic_gate"),
+            "reason_codes": list(risk.get("reason_codes", []))[:12],
+            "reason_code_details": risk.get("reason_code_details", {}),
+            "gate_transition_sequence": list(risk.get("gate_transition_sequence", [])),
+            "decision_trace_sample": trace_sample,
+            "decision_trace_sample_truncated_rows": truncated_trace_rows,
+        },
+        "intent": {
+            "status": intent.get("status"),
+            "action": intent.get("action"),
+            "notional_usd": intent.get("notional_usd"),
+        },
+        "execution": {
+            "status": execution.get("status"),
+            "executed_action": execution.get("executed_action"),
+            "executed_notional_usd": execution.get("executed_notional_usd"),
+            "fee_usd": execution.get("fee_usd"),
+            "cash_after_usd": execution.get("cash_after_usd"),
+            "position_qty_after": execution.get("position_qty_after"),
+            "reason": execution.get("reason"),
+        },
+        "ensemble": {
+            "mode": ensemble.get("mode"),
+            "enabled_arms": list(ensemble.get("enabled_arms", [])),
+            "weight_state_path": ensemble.get("weight_state_path"),
+            "performance_update_path": ensemble.get("performance_update_path"),
+            "performance_update_summary": {
+                "execution_status": performance_update.get("execution_status"),
+                "executed_action": performance_update.get("executed_action"),
+                "pnl_ratio": performance_update.get("pnl_ratio"),
+                "drawdown": performance_update.get("drawdown"),
+                "fee_ratio": performance_update.get("fee_ratio"),
+                "turnover_ratio": performance_update.get("turnover_ratio"),
+            },
+        },
+    }
 
 def _deterministic_ops_markdown(context: dict[str, Any]) -> str:
     verbosity = _normalize_report_verbosity(context.get("report_verbosity"))
@@ -1680,6 +1978,22 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     )
     source_data_path = source_data_path.expanduser().resolve()
     source_data_sha256 = _sha256_file(source_data_path)
+    strategy_fast_window = (
+        int(config.strategy_fast_window)
+        if config.strategy_fast_window is not None
+        else DEFAULT_STRATEGY_FAST_WINDOW
+    )
+    strategy_slow_window = (
+        int(config.strategy_slow_window)
+        if config.strategy_slow_window is not None
+        else DEFAULT_STRATEGY_SLOW_WINDOW
+    )
+    if strategy_fast_window <= 0 or strategy_slow_window <= 0 or strategy_fast_window >= strategy_slow_window:
+        raise ValueError(
+            "Invalid strategy window overrides: "
+            f"fast={strategy_fast_window}, slow={strategy_slow_window}. "
+            "Require positive integers with slow > fast."
+        )
 
     ollama = OllamaClient(
         settings.ollama_base_url,
@@ -1796,6 +2110,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             phase1_context=phase1_feature_context,
             source_data_path=source_data_path,
             source_data_sha256=source_data_sha256,
+            preferred_fast_window=strategy_fast_window,
+            preferred_slow_window=strategy_slow_window,
         )
         raw_response = ollama.generate(
             model=config.strategy_model,
@@ -1814,6 +2130,12 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         fast_window, slow_window, warnings = _sanitize_windows(
             payload.get("fast_window"), payload.get("slow_window")
         )
+        if fast_window != strategy_fast_window or slow_window != strategy_slow_window:
+            warnings.append(
+                f"strategy_windows_overridden_to_{strategy_fast_window}/{strategy_slow_window}"
+            )
+        fast_window = strategy_fast_window
+        slow_window = strategy_slow_window
         rationale = str(payload.get("rationale", "")).strip()
         if not rationale:
             raise RuntimeError("Strategy model returned empty rationale.")
@@ -1872,8 +2194,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             input_data_sha256=source_data_sha256,
             recommendation="hold",
             confidence=0.0,
-            fast_window=20,
-            slow_window=50,
+            fast_window=strategy_fast_window,
+            slow_window=strategy_slow_window,
             rationale="Fallback strategy due to model unavailability or invalid output.",
             raw_model_response=None,
             warnings=errors,
@@ -1915,6 +2237,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         arm_votes=arm_votes,
         ensemble_state=ensemble_state,
         exploration_weight=max(0.0, float(config.ensemble_exploration_weight)),
+        turnover_penalty_bps=max(0.0, float(config.ensemble_turnover_penalty_bps)),
     )
     (
         ensemble_recommendation,
@@ -1976,6 +2299,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             arm_weights=dict(strategy_signal.arm_weights),
             llm_recommendation=llm_strategy_signal.recommendation,
             ensemble_mode=ensemble_mode,
+            fee_bps=max(0.0, float(config.backtest_fee_bps)),
+            slippage_bps=max(0.0, float(config.backtest_slippage_bps)),
             source_data_path=source_data_path,
             archive_run=False,
         )
@@ -1998,6 +2323,16 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             annualized_return=float(metrics_payload["annualized_return"]),
             sharpe=float(metrics_payload["sharpe"]),
             max_drawdown=float(metrics_payload["max_drawdown"]),
+            gross_total_return=float(metrics_payload.get("gross_total_return", metrics_payload["total_return"])),
+            gross_annualized_return=float(
+                metrics_payload.get("gross_annualized_return", metrics_payload["annualized_return"])
+            ),
+            gross_sharpe=float(metrics_payload.get("gross_sharpe", metrics_payload["sharpe"])),
+            gross_max_drawdown=float(metrics_payload.get("gross_max_drawdown", metrics_payload["max_drawdown"])),
+            total_cost_return_drag=float(metrics_payload.get("total_cost_return_drag", 0.0)),
+            turnover_units=float(metrics_payload.get("turnover_units", 0.0)),
+            break_even_one_way_cost_bps=float(metrics_payload.get("break_even_one_way_cost_bps", 0.0)),
+            one_way_trading_cost_bps=float(metrics_payload.get("one_way_trading_cost_bps", 0.0)),
             signal_flips=int(metrics_payload["signal_flips"]),
             bars=int(metrics_payload["bars"]),
             error_message=None,
@@ -2029,6 +2364,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             annualized_return=None,
             sharpe=None,
             max_drawdown=None,
+            gross_total_return=None,
+            gross_annualized_return=None,
+            gross_sharpe=None,
+            gross_max_drawdown=None,
+            total_cost_return_drag=None,
+            turnover_units=None,
+            break_even_one_way_cost_bps=None,
+            one_way_trading_cost_bps=None,
             signal_flips=None,
             bars=None,
             error_message=errors[-1] if errors else "Unknown backtest failure",
@@ -2062,6 +2405,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             source_data_sha256=source_data_sha256,
             fast_window=strategy_signal.fast_window,
             slow_window=strategy_signal.slow_window,
+            fee_bps=max(0.0, float(config.walk_forward_fee_bps)),
+            slippage_bps=max(0.0, float(config.walk_forward_slippage_bps)),
             train_bars=max(20, config.walk_forward_train_bars),
             validate_bars=max(5, config.walk_forward_validate_bars),
             step_bars=max(5, config.walk_forward_step_bars),
@@ -2083,11 +2428,21 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "train_bars": max(20, config.walk_forward_train_bars),
             "validate_bars": max(5, config.walk_forward_validate_bars),
             "step_bars": max(5, config.walk_forward_step_bars),
+            "fee_bps": max(0.0, float(config.walk_forward_fee_bps)),
+            "slippage_bps": max(0.0, float(config.walk_forward_slippage_bps)),
+            "one_way_trading_cost_bps": max(0.0, float(config.walk_forward_fee_bps))
+            + max(0.0, float(config.walk_forward_slippage_bps)),
             "window_count": 0,
             "aggregate_total_return": 0.0,
+            "aggregate_gross_total_return": 0.0,
             "aggregate_sharpe": 0.0,
+            "aggregate_gross_sharpe": 0.0,
             "aggregate_max_drawdown": 0.0,
+            "aggregate_gross_max_drawdown": 0.0,
             "aggregate_hit_rate": 0.0,
+            "aggregate_total_cost_return_drag": 0.0,
+            "aggregate_turnover_units": 0.0,
+            "break_even_one_way_cost_bps": 0.0,
             "stability_score": 0.0,
             "quality_score": 0.0,
             "windows": [],
@@ -2318,8 +2673,15 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "data_quality_valid": data_quality_signal.is_valid,
             "backtest_status": backtest_evaluation.backtest_status,
             "total_return": backtest_evaluation.total_return,
+            "gross_total_return": backtest_evaluation.gross_total_return,
             "sharpe": backtest_evaluation.sharpe,
+            "gross_sharpe": backtest_evaluation.gross_sharpe,
             "max_drawdown": backtest_evaluation.max_drawdown,
+            "gross_max_drawdown": backtest_evaluation.gross_max_drawdown,
+            "total_cost_return_drag": backtest_evaluation.total_cost_return_drag,
+            "turnover_units": backtest_evaluation.turnover_units,
+            "break_even_one_way_cost_bps": backtest_evaluation.break_even_one_way_cost_bps,
+            "one_way_trading_cost_bps": backtest_evaluation.one_way_trading_cost_bps,
             "recommendation": action,
             "raw_recommendation_confidence": confidence_calibration.get("raw_confidence"),
             "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
@@ -2346,9 +2708,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "min_total_return": config.thresholds.min_total_return,
             "min_sharpe": config.thresholds.min_sharpe,
             "max_drawdown": config.thresholds.max_drawdown,
+            "max_cost_return_drag": config.thresholds.max_cost_return_drag,
             "min_signal_confidence": config.thresholds.min_signal_confidence,
             "min_walkforward_sharpe": config.calibration_min_walkforward_sharpe,
             "max_contradictions": float(config.calibration_max_contradictions),
+            "min_walkforward_quality_score": config.thresholds.min_walkforward_quality_score,
             "walkforward_quality_low_cutoff": 0.40,
             "walkforward_quality_medium_cutoff": 0.55,
             "walkforward_quality_high_cutoff": 0.70,
@@ -2411,6 +2775,60 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             failure_severity="fail",
             failure_detail="Backtest max drawdown exceeded allowable bounds.",
         )
+        total_cost_return_drag = backtest_evaluation.total_cost_return_drag
+        trace_check(
+            gate="backtest",
+            metric="total_cost_return_drag",
+            observed_value=total_cost_return_drag,
+            threshold=f"<= {config.thresholds.max_cost_return_drag}",
+            passed=(
+                backtest_success
+                and total_cost_return_drag is not None
+                and total_cost_return_drag <= config.thresholds.max_cost_return_drag
+            ),
+            failure_reason_code="cost_drag_above_threshold",
+            failure_severity="block",
+            failure_detail="Backtest cost drag exceeded configured threshold.",
+        )
+        gross_total_return = backtest_evaluation.gross_total_return
+        trace_check(
+            gate="backtest",
+            metric="cost_drag_vs_gross_edge",
+            observed_value={
+                "gross_total_return": gross_total_return,
+                "total_cost_return_drag": total_cost_return_drag,
+            },
+            threshold="cost_drag < gross_total_return",
+            passed=(
+                backtest_success
+                and gross_total_return is not None
+                and total_cost_return_drag is not None
+                and total_cost_return_drag < gross_total_return
+            ),
+            failure_reason_code="cost_drag_exceeds_gross_edge",
+            failure_severity="block",
+            failure_detail="Estimated transaction-cost drag exceeds gross strategy edge.",
+        )
+        break_even_cost_bps = backtest_evaluation.break_even_one_way_cost_bps
+        configured_cost_bps = backtest_evaluation.one_way_trading_cost_bps
+        trace_check(
+            gate="backtest",
+            metric="break_even_cost_bps",
+            observed_value={
+                "break_even_one_way_cost_bps": break_even_cost_bps,
+                "configured_one_way_cost_bps": configured_cost_bps,
+            },
+            threshold="break_even >= configured_cost",
+            passed=(
+                backtest_success
+                and break_even_cost_bps is not None
+                and configured_cost_bps is not None
+                and break_even_cost_bps >= configured_cost_bps
+            ),
+            failure_reason_code="configured_cost_above_break_even",
+            failure_severity="block",
+            failure_detail="Configured trading frictions exceed estimated break-even cost budget.",
+        )
 
         actionable = action in {"buy", "sell"}
         trace_check(
@@ -2467,16 +2885,21 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                 failure_detail="Walk-forward quality band is very_low for an actionable recommendation.",
             )
 
-            quality_low = walkforward_quality_band == "low"
+            quality_low = (
+                walkforward_quality_score < float(config.thresholds.min_walkforward_quality_score)
+            )
             trace_check(
                 gate="calibration",
-                metric="walkforward_quality_low_block",
-                observed_value=walkforward_quality_band,
-                threshold="not low",
+                metric="walkforward_quality_score",
+                observed_value={
+                    "quality_score": walkforward_quality_score,
+                    "quality_band": walkforward_quality_band,
+                },
+                threshold=f">= {config.thresholds.min_walkforward_quality_score}",
                 passed=not quality_low,
                 failure_reason_code=f"risk_block_{action}_walkforward_quality_low",
                 failure_severity="block",
-                failure_detail="Walk-forward quality band is low and requires blocking execution.",
+                failure_detail="Walk-forward quality score fell below the actionable minimum threshold.",
             )
 
             contradiction_failure_reason = (
@@ -2725,6 +3148,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             mark_price=mark_price,
             starting_cash_usd=config.paper_starting_cash_usd,
             fee_bps=config.paper_fee_bps,
+            slippage_bps=config.paper_slippage_bps,
         )
 
     paper_trade_execution, paper_execution_step = _run_step_with_retries(
@@ -2810,7 +3234,9 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "status": paper_trade_execution.execution_status,
             "executed_action": paper_trade_execution.executed_action,
             "executed_notional_usd": paper_trade_execution.executed_notional_usd,
+            "execution_price": paper_trade_execution.execution_price,
             "fee_usd": paper_trade_execution.fee_usd,
+            "slippage_bps": paper_trade_execution.slippage_bps,
             "cash_after_usd": paper_trade_execution.cash_after_usd,
             "position_qty_after": paper_trade_execution.position_qty_after,
             "position_avg_entry_after": paper_trade_execution.position_avg_entry_after,
@@ -2830,17 +3256,32 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     }
 
     def reporting_runner() -> dict[str, Any]:
+        report_verbosity = _normalize_report_verbosity(config.ops_report_verbosity)
+        if report_verbosity in {"compact", "standard"}:
+            return {
+                "source": "deterministic",
+                "model": None,
+                "markdown": _deterministic_ops_markdown(ops_context),
+                "warnings": [],
+            }
         available_models = ollama.list_models()
         if available_models and config.ops_model not in available_models:
             raise RuntimeError(
                 f"Configured ops model `{config.ops_model}` not found. Available models: {available_models}"
             )
+        max_tokens_by_verbosity = {"compact": 160, "standard": 240, "verbose": 360}
+        ops_report_timeout_seconds = min(240.0, max(1.0, float(settings.ollama_timeout_seconds)))
+        prompt_context = _compact_ops_prompt_context(ops_context)
+        prompt = _ops_prompt(prompt_context)
+        logger.info("Ops-report prompt prepared (%d bytes).", len(prompt.encode("utf-8")))
         markdown = ollama.generate(
             model=config.ops_model,
-            prompt=_ops_prompt(ops_context),
+            prompt=prompt,
             system="Respond with markdown only.",
             temperature=0.1,
             format_json=False,
+            num_predict=max_tokens_by_verbosity.get(report_verbosity, 240),
+            timeout_seconds=ops_report_timeout_seconds,
         )
         if not markdown.strip():
             raise RuntimeError("Ops report model returned empty markdown.")
@@ -2862,7 +3303,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     report_payload, reporting_step = _run_step_with_retries(
         run_dir=run_dir,
         step_name="ops-report-agent",
-        max_retries=config.step_retries,
+        max_retries=0,
         runner=reporting_runner,
         fallback=reporting_fallback,
     )
@@ -2947,9 +3388,17 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "ensemble_enabled_arms": list(enabled_arms),
             "ensemble_decay_horizon": max(4, int(config.ensemble_decay_horizon)),
             "ensemble_exploration_weight": max(0.0, float(config.ensemble_exploration_weight)),
+            "ensemble_turnover_penalty_bps": max(0.0, float(config.ensemble_turnover_penalty_bps)),
+            "strategy_fast_window": strategy_fast_window,
+            "strategy_slow_window": strategy_slow_window,
+            "backtest_fee_bps": max(0.0, float(config.backtest_fee_bps)),
+            "backtest_slippage_bps": max(0.0, float(config.backtest_slippage_bps)),
+            "walk_forward_fee_bps": max(0.0, float(config.walk_forward_fee_bps)),
+            "walk_forward_slippage_bps": max(0.0, float(config.walk_forward_slippage_bps)),
             "paper_notional_usd": config.paper_notional_usd,
             "paper_starting_cash_usd": config.paper_starting_cash_usd,
             "paper_fee_bps": config.paper_fee_bps,
+            "paper_slippage_bps": config.paper_slippage_bps,
             "thresholds": _json_safe(asdict(config.thresholds)),
         },
         "steps": [_json_safe(asdict(record)) for record in step_records],

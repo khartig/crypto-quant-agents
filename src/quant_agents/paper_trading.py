@@ -114,6 +114,7 @@ def execute_paper_trade_intent(
     mark_price: float | None,
     starting_cash_usd: float,
     fee_bps: float,
+    slippage_bps: float,
 ) -> PaperTradeExecution:
     try:
         created_at = datetime.fromisoformat(created_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -145,11 +146,13 @@ def execute_paper_trade_intent(
     executed_action: Recommendation = "hold"
     executed_notional_usd = 0.0
     executed_quantity = 0.0
+    execution_price: float | None = None
     fee_usd = 0.0
     realized_pnl_delta_usd = 0.0
     reason = "intent_not_emitted"
 
     valid_price = mark_price is not None and mark_price > 0
+    slippage_rate = max(0.0, float(slippage_bps)) / 10_000.0
 
     if intent.status != "emitted":
         reason = f"intent_{intent.status}"
@@ -158,6 +161,7 @@ def execute_paper_trade_intent(
             execution_status = "rejected"
             reason = "invalid_mark_price"
         else:
+            execution_price = float(mark_price) * (1.0 + slippage_rate)
             cash_before = _coerce_float(state.get("cash_usd"), 0.0)
             max_notional = cash_before / (1.0 + fee_rate)
             executed_notional_usd = min(requested_notional_usd, max(0.0, max_notional))
@@ -168,14 +172,18 @@ def execute_paper_trade_intent(
                 execution_status = "executed"
                 executed_action = "buy"
                 reason = "executed_buy"
-                executed_quantity = executed_notional_usd / float(mark_price)
+                executed_quantity = (
+                    executed_notional_usd / execution_price if execution_price and execution_price > 0 else 0.0
+                )
                 fee_usd = executed_notional_usd * fee_rate
                 state["cash_usd"] = cash_before - executed_notional_usd - fee_usd
                 old_qty = _coerce_float(position.get("quantity"), 0.0)
                 old_avg = _coerce_float(position.get("avg_entry_price"), 0.0)
                 new_qty = old_qty + executed_quantity
+                existing_cost_basis = old_qty * old_avg
+                new_cost_basis = existing_cost_basis + executed_notional_usd + fee_usd
                 new_avg = (
-                    ((old_qty * old_avg) + (executed_quantity * float(mark_price))) / new_qty
+                    (new_cost_basis / new_qty)
                     if new_qty > 0
                     else 0.0
                 )
@@ -186,30 +194,37 @@ def execute_paper_trade_intent(
             execution_status = "rejected"
             reason = "invalid_mark_price"
         else:
-            available_qty = max(0.0, _coerce_float(position.get("quantity"), 0.0))
-            requested_qty = requested_notional_usd / float(mark_price)
-            executed_quantity = min(requested_qty, available_qty)
-            if executed_quantity <= 0:
+            execution_price = float(mark_price) * (1.0 - slippage_rate)
+            if execution_price <= 0:
                 execution_status = "rejected"
-                reason = "no_long_position_to_sell"
+                reason = "invalid_execution_price_after_slippage"
+                execution_price = None
             else:
-                execution_status = "executed"
-                executed_action = "sell"
-                reason = "executed_sell"
-                executed_notional_usd = executed_quantity * float(mark_price)
-                fee_usd = executed_notional_usd * fee_rate
-                cash_before = _coerce_float(state.get("cash_usd"), 0.0)
-                state["cash_usd"] = cash_before + executed_notional_usd - fee_usd
-                avg_entry_price = _coerce_float(position.get("avg_entry_price"), 0.0)
-                realized_pnl_delta_usd = (float(mark_price) - avg_entry_price) * executed_quantity
-                new_qty = available_qty - executed_quantity
-                if new_qty <= 1e-12:
-                    new_qty = 0.0
-                    position["avg_entry_price"] = 0.0
-                position["quantity"] = new_qty
-                position["realized_pnl_usd"] = (
-                    _coerce_float(position.get("realized_pnl_usd"), 0.0) + realized_pnl_delta_usd
-                )
+                available_qty = max(0.0, _coerce_float(position.get("quantity"), 0.0))
+                requested_qty = requested_notional_usd / execution_price
+                executed_quantity = min(requested_qty, available_qty)
+                if executed_quantity <= 0:
+                    execution_status = "rejected"
+                    reason = "no_long_position_to_sell"
+                else:
+                    execution_status = "executed"
+                    executed_action = "sell"
+                    reason = "executed_sell"
+                    executed_notional_usd = executed_quantity * execution_price
+                    fee_usd = executed_notional_usd * fee_rate
+                    cash_before = _coerce_float(state.get("cash_usd"), 0.0)
+                    state["cash_usd"] = cash_before + executed_notional_usd - fee_usd
+                    avg_entry_price = _coerce_float(position.get("avg_entry_price"), 0.0)
+                    gross_realized_pnl_delta = (execution_price - avg_entry_price) * executed_quantity
+                    realized_pnl_delta_usd = gross_realized_pnl_delta - fee_usd
+                    new_qty = available_qty - executed_quantity
+                    if new_qty <= 1e-12:
+                        new_qty = 0.0
+                        position["avg_entry_price"] = 0.0
+                    position["quantity"] = new_qty
+                    position["realized_pnl_usd"] = (
+                        _coerce_float(position.get("realized_pnl_usd"), 0.0) + realized_pnl_delta_usd
+                    )
     else:
         reason = "non_actionable_intent"
 
@@ -236,9 +251,11 @@ def execute_paper_trade_intent(
                 "timeframe": timeframe,
                 "action": executed_action,
                 "quantity": _round(executed_quantity),
-                "price": _round(float(mark_price) if mark_price is not None else 0.0),
+                "mark_price": _round(float(mark_price) if mark_price is not None else 0.0),
+                "price": _round(float(execution_price) if execution_price is not None else 0.0),
                 "notional_usd": _round(executed_notional_usd),
                 "fee_usd": _round(fee_usd),
+                "slippage_bps": _round(max(0.0, float(slippage_bps))),
                 "reason": reason,
                 "selected_arms": selected_arms,
                 "arm_weights": arm_weights,
@@ -283,7 +300,9 @@ def execute_paper_trade_intent(
         executed_notional_usd=_round(executed_notional_usd),
         executed_quantity=_round(executed_quantity),
         mark_price=_round(float(mark_price)) if mark_price is not None else None,
+        execution_price=_round(float(execution_price)) if execution_price is not None else None,
         fee_usd=_round(fee_usd),
+        slippage_bps=_round(max(0.0, float(slippage_bps))),
         cash_after_usd=_round(_coerce_float(state.get("cash_usd"), 0.0)),
         position_qty_after=_round(_coerce_float(position_after.get("quantity"), 0.0)),
         position_avg_entry_after=_round(_coerce_float(position_after.get("avg_entry_price"), 0.0)),

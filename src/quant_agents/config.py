@@ -36,6 +36,7 @@ class Settings:
     risk_max_drawdown: float
     risk_max_cost_return_drag: float
     risk_min_signal_confidence: float
+    risk_min_walkforward_quality_score: float
     backtest_fee_bps: float
     backtest_slippage_bps: float
     walk_forward_fee_bps: float
@@ -140,7 +141,7 @@ def load_settings() -> Settings:
         exchange_api_secret=os.getenv("EXCHANGE_API_SECRET") or None,
         exchange_api_passphrase=os.getenv("EXCHANGE_API_PASSPHRASE") or None,
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-        ollama_timeout_seconds=max(1.0, _as_float(os.getenv("OLLAMA_TIMEOUT_SECONDS"), default=180.0)),
+        ollama_timeout_seconds=max(1.0, _as_float(os.getenv("OLLAMA_TIMEOUT_SECONDS"), default=600.0)),
         ollama_strategy_model=os.getenv("OLLAMA_STRATEGY_MODEL", "llama3.1:8b"),
         ollama_ops_model=os.getenv("OLLAMA_OPS_MODEL", "llama3.1:8b"),
         agent_step_retries=max(0, _as_int(os.getenv("AGENT_STEP_RETRIES"), default=2)),
@@ -150,9 +151,16 @@ def load_settings() -> Settings:
         risk_max_drawdown=_as_float(os.getenv("RISK_MAX_DRAWDOWN"), default=-0.20),
         risk_max_cost_return_drag=max(
             0.0,
-            _as_float(os.getenv("RISK_MAX_COST_RETURN_DRAG"), default=0.03),
+            _as_float(os.getenv("RISK_MAX_COST_RETURN_DRAG"), default=0.06),
         ),
         risk_min_signal_confidence=_as_float(os.getenv("RISK_MIN_SIGNAL_CONFIDENCE"), default=0.55),
+        risk_min_walkforward_quality_score=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("RISK_MIN_WALKFORWARD_QUALITY_SCORE"), default=0.43),
+            ),
+        ),
         backtest_fee_bps=max(
             0.0,
             _as_float(os.getenv("BACKTEST_FEE_BPS"), default=5.0),

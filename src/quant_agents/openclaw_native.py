@@ -75,7 +75,13 @@ class OpenClawOrchestrationRequest:
     min_total_return: float
     min_sharpe: float
     max_drawdown: float
+    max_cost_return_drag: float
     min_signal_confidence: float
+    min_walkforward_quality_score: float
+    backtest_fee_bps: float
+    backtest_slippage_bps: float
+    walk_forward_fee_bps: float
+    walk_forward_slippage_bps: float
     walk_forward_train_bars: int
     walk_forward_validate_bars: int
     walk_forward_step_bars: int
@@ -91,9 +97,11 @@ class OpenClawOrchestrationRequest:
     ensemble_enabled_arms: tuple[str, ...]
     ensemble_decay_horizon: int
     ensemble_exploration_weight: float
+    ensemble_turnover_penalty_bps: float
     paper_notional_usd: float
     paper_starting_cash_usd: float
     paper_fee_bps: float
+    paper_slippage_bps: float
     source_data_path: str | None = None
 
     @staticmethod
@@ -109,8 +117,27 @@ class OpenClawOrchestrationRequest:
             min_total_return=float(payload.get("min_total_return", settings.risk_min_total_return)),
             min_sharpe=float(payload.get("min_sharpe", settings.risk_min_sharpe)),
             max_drawdown=float(payload.get("max_drawdown", settings.risk_max_drawdown)),
+            max_cost_return_drag=float(
+                payload.get("max_cost_return_drag", settings.risk_max_cost_return_drag)
+            ),
             min_signal_confidence=float(
                 payload.get("min_signal_confidence", settings.risk_min_signal_confidence)
+            ),
+            min_walkforward_quality_score=float(
+                payload.get(
+                    "min_walkforward_quality_score",
+                    settings.risk_min_walkforward_quality_score,
+                )
+            ),
+            backtest_fee_bps=float(payload.get("backtest_fee_bps", settings.backtest_fee_bps)),
+            backtest_slippage_bps=float(
+                payload.get("backtest_slippage_bps", settings.backtest_slippage_bps)
+            ),
+            walk_forward_fee_bps=float(
+                payload.get("walk_forward_fee_bps", settings.walk_forward_fee_bps)
+            ),
+            walk_forward_slippage_bps=float(
+                payload.get("walk_forward_slippage_bps", settings.walk_forward_slippage_bps)
             ),
             walk_forward_train_bars=max(
                 50,
@@ -146,6 +173,15 @@ class OpenClawOrchestrationRequest:
                     payload.get(
                         "calibration_max_contradictions",
                         settings.calibration_max_contradictions,
+                    )
+                ),
+            ),
+            ensemble_turnover_penalty_bps=max(
+                0.0,
+                float(
+                    payload.get(
+                        "ensemble_turnover_penalty_bps",
+                        settings.ensemble_turnover_penalty_bps,
                     )
                 ),
             ),
@@ -190,6 +226,9 @@ class OpenClawOrchestrationRequest:
                 payload.get("paper_starting_cash_usd", settings.paper_trade_starting_cash_usd)
             ),
             paper_fee_bps=float(payload.get("paper_fee_bps", settings.paper_trade_fee_bps)),
+            paper_slippage_bps=float(
+                payload.get("paper_slippage_bps", settings.paper_trade_slippage_bps)
+            ),
             source_data_path=(str(payload["source_data_path"]) if payload.get("source_data_path") else None),
         )
 
@@ -198,7 +237,9 @@ class OpenClawOrchestrationRequest:
             min_total_return=self.min_total_return,
             min_sharpe=self.min_sharpe,
             max_drawdown=self.max_drawdown,
+            max_cost_return_drag=self.max_cost_return_drag,
             min_signal_confidence=self.min_signal_confidence,
+            min_walkforward_quality_score=max(0.0, min(1.0, float(self.min_walkforward_quality_score))),
         )
         return AgentPlaneConfig(
             exchange=self.exchange,
@@ -208,9 +249,14 @@ class OpenClawOrchestrationRequest:
             ops_model=self.ops_model,
             step_retries=self.step_retries,
             thresholds=thresholds,
+            backtest_fee_bps=max(0.0, float(self.backtest_fee_bps)),
+            backtest_slippage_bps=max(0.0, float(self.backtest_slippage_bps)),
+            walk_forward_fee_bps=max(0.0, float(self.walk_forward_fee_bps)),
+            walk_forward_slippage_bps=max(0.0, float(self.walk_forward_slippage_bps)),
             paper_notional_usd=self.paper_notional_usd,
             paper_starting_cash_usd=self.paper_starting_cash_usd,
             paper_fee_bps=self.paper_fee_bps,
+            paper_slippage_bps=max(0.0, float(self.paper_slippage_bps)),
             minimum_bars=self.minimum_bars,
             walk_forward_train_bars=self.walk_forward_train_bars,
             walk_forward_validate_bars=self.walk_forward_validate_bars,
@@ -227,6 +273,7 @@ class OpenClawOrchestrationRequest:
             ensemble_enabled_arms=tuple(self.ensemble_enabled_arms),
             ensemble_decay_horizon=max(4, int(self.ensemble_decay_horizon)),
             ensemble_exploration_weight=max(0.0, float(self.ensemble_exploration_weight)),
+            ensemble_turnover_penalty_bps=max(0.0, float(self.ensemble_turnover_penalty_bps)),
             source_data_path=Path(self.source_data_path).expanduser().resolve()
             if self.source_data_path
             else None,

@@ -169,6 +169,18 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Minimum bars required for data-quality pass.",
     )
     agent_plane.add_argument(
+        "--fast-window",
+        type=int,
+        default=None,
+        help="Strategy/backtest fast SMA window override (defaults to 24).",
+    )
+    agent_plane.add_argument(
+        "--slow-window",
+        type=int,
+        default=None,
+        help="Strategy/backtest slow SMA window override (defaults to 60).",
+    )
+    agent_plane.add_argument(
         "--min-total-return",
         type=float,
         default=None,
@@ -197,6 +209,12 @@ def _base_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Deterministic risk gate: minimum strategy confidence.",
+    )
+    agent_plane.add_argument(
+        "--min-walkforward-quality-score",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: minimum walk-forward quality score for actionable recommendations.",
     )
     agent_plane.add_argument(
         "--backtest-fee-bps",
@@ -814,6 +832,17 @@ def main(argv: list[str] | None = None) -> None:
                 if args.min_signal_confidence is not None
                 else settings.risk_min_signal_confidence
             ),
+            min_walkforward_quality_score=min(
+                1.0,
+                max(
+                    0.0,
+                    (
+                        args.min_walkforward_quality_score
+                        if args.min_walkforward_quality_score is not None
+                        else settings.risk_min_walkforward_quality_score
+                    ),
+                ),
+            ),
         )
         config = AgentPlaneConfig(
             exchange=exchange,
@@ -874,6 +903,8 @@ def main(argv: list[str] | None = None) -> None:
                 10,
                 args.minimum_bars if args.minimum_bars is not None else settings.agent_minimum_bars,
             ),
+            strategy_fast_window=max(2, int(args.fast_window)) if args.fast_window is not None else None,
+            strategy_slow_window=max(3, int(args.slow_window)) if args.slow_window is not None else None,
             walk_forward_train_bars=max(
                 50,
                 args.walkforward_train_bars

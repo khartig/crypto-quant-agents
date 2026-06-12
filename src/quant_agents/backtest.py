@@ -91,11 +91,28 @@ def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return rsi.fillna(50.0)
 
+def _compute_turnover_units(position: pd.Series) -> pd.Series:
+    return position.diff().abs().fillna(position.abs())
 
-def _metrics_from_position(
+
+def _compute_cost_adjusted_returns(
+    *,
+    position: pd.Series,
+    gross_returns: pd.Series,
+    fee_bps: float,
+    slippage_bps: float,
+) -> tuple[pd.Series, pd.Series, pd.Series, float]:
+    turnover_units = _compute_turnover_units(position.astype(float))
+    one_way_cost_bps = max(0.0, float(fee_bps)) + max(0.0, float(slippage_bps))
+    cost_rate = one_way_cost_bps / 10_000.0
+    cost_returns = turnover_units * cost_rate
+    net_returns = gross_returns.astype(float) - cost_returns
+    return turnover_units, cost_returns, net_returns, one_way_cost_bps
+
+
+def _performance_stats(
     frame: pd.DataFrame,
     *,
-    position_column: str,
     returns_column: str,
     equity_column: str,
     timeframe: str,
@@ -111,7 +128,6 @@ def _metrics_from_position(
     drawdown = (frame[equity_column] / rolling_peak) - 1.0
     max_drawdown = float(drawdown.min())
     buy_hold_return = float(frame["close"].iloc[-1] / frame["close"].iloc[0] - 1.0)
-    signal_flips = int(frame[position_column].diff().abs().fillna(0).sum())
     return {
         "bars": bars,
         "total_return": total_return,
@@ -119,9 +135,82 @@ def _metrics_from_position(
         "sharpe": sharpe,
         "max_drawdown": max_drawdown,
         "buy_and_hold_return": buy_hold_return,
-        "signal_flips": signal_flips,
         "data_start": str(frame["timestamp"].min()),
         "data_end": str(frame["timestamp"].max()),
+    }
+
+
+def _metrics_from_position(
+    frame: pd.DataFrame,
+    *,
+    position_column: str,
+    gross_returns_column: str,
+    gross_equity_column: str,
+    net_returns_column: str | None,
+    net_equity_column: str | None,
+    turnover_column: str | None,
+    cost_returns_column: str | None,
+    one_way_cost_bps: float | None,
+    timeframe: str,
+) -> dict[str, float | int | str]:
+    gross_stats = _performance_stats(
+        frame,
+        returns_column=gross_returns_column,
+        equity_column=gross_equity_column,
+        timeframe=timeframe,
+    )
+    resolved_net_returns = net_returns_column or gross_returns_column
+    resolved_net_equity = net_equity_column or gross_equity_column
+    net_stats = _performance_stats(
+        frame,
+        returns_column=resolved_net_returns,
+        equity_column=resolved_net_equity,
+        timeframe=timeframe,
+    )
+    signal_flips = int(frame[position_column].diff().abs().fillna(0).sum())
+    turnover_units = (
+        float(frame[turnover_column].sum())
+        if turnover_column and turnover_column in frame.columns
+        else float(signal_flips)
+    )
+    total_cost_return_drag = (
+        float(frame[cost_returns_column].sum())
+        if cost_returns_column and cost_returns_column in frame.columns
+        else 0.0
+    )
+    effective_cost_per_turnover_bps = (
+        float((total_cost_return_drag / turnover_units) * 10_000.0)
+        if turnover_units > 0
+        else 0.0
+    )
+    break_even_one_way_cost_bps = (
+        float((max(0.0, float(gross_stats["total_return"])) / turnover_units) * 10_000.0)
+        if turnover_units > 0
+        else 0.0
+    )
+    return {
+        "bars": int(net_stats["bars"]),
+        "total_return": float(net_stats["total_return"]),
+        "annualized_return": float(net_stats["annualized_return"]),
+        "sharpe": float(net_stats["sharpe"]),
+        "max_drawdown": float(net_stats["max_drawdown"]),
+        "gross_total_return": float(gross_stats["total_return"]),
+        "gross_annualized_return": float(gross_stats["annualized_return"]),
+        "gross_sharpe": float(gross_stats["sharpe"]),
+        "gross_max_drawdown": float(gross_stats["max_drawdown"]),
+        "net_total_return": float(net_stats["total_return"]),
+        "net_annualized_return": float(net_stats["annualized_return"]),
+        "net_sharpe": float(net_stats["sharpe"]),
+        "net_max_drawdown": float(net_stats["max_drawdown"]),
+        "buy_and_hold_return": float(net_stats["buy_and_hold_return"]),
+        "signal_flips": signal_flips,
+        "turnover_units": turnover_units,
+        "total_cost_return_drag": total_cost_return_drag,
+        "effective_cost_per_turnover_bps": effective_cost_per_turnover_bps,
+        "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
+        "one_way_trading_cost_bps": float(one_way_cost_bps or 0.0),
+        "data_start": str(net_stats["data_start"]),
+        "data_end": str(net_stats["data_end"]),
     }
 
 
@@ -197,6 +286,8 @@ def run_ensemble_backtest(
     arm_weights: dict[str, float] | None,
     llm_recommendation: str,
     ensemble_mode: str,
+    fee_bps: float = 0.0,
+    slippage_bps: float = 0.0,
     source_data_path: Path | None = None,
     archive_run: bool = False,
 ) -> BacktestResult:
@@ -223,11 +314,19 @@ def run_ensemble_backtest(
     ) or ("sma_baseline",)
     resolved_weights = _normalize_weights(resolved_arms, arm_weights)
 
+    fee_bps = max(0.0, float(fee_bps))
+    slippage_bps = max(0.0, float(slippage_bps))
     arm_attribution = pd.DataFrame({"timestamp": frame["timestamp"], "close": frame["close"], "returns": frame["returns"]})
     arm_metrics: dict[str, dict[str, Any]] = {}
     for arm in resolved_arms:
         position_col = f"{arm}_position"
+        gross_returns_col = f"{arm}_strategy_returns_gross"
+        cost_returns_col = f"{arm}_cost_returns"
+        turnover_col = f"{arm}_turnover_units"
+        net_returns_col = f"{arm}_strategy_returns_net"
         returns_col = f"{arm}_strategy_returns"
+        gross_equity_col = f"{arm}_equity_curve_gross"
+        net_equity_col = f"{arm}_equity_curve_net"
         equity_col = f"{arm}_equity_curve"
         position_series = _build_arm_position_series(
             frame,
@@ -244,32 +343,86 @@ def run_ensemble_backtest(
                 position_col: position_series.astype(float),
             }
         )
-        arm_frame[returns_col] = arm_frame[position_col].shift(1).fillna(0.0) * arm_frame["returns"]
-        arm_frame[equity_col] = (1.0 + arm_frame[returns_col]).cumprod()
+        arm_frame[gross_returns_col] = arm_frame[position_col].shift(1).fillna(0.0) * arm_frame["returns"]
+        (
+            arm_frame[turnover_col],
+            arm_frame[cost_returns_col],
+            arm_frame[net_returns_col],
+            one_way_cost_bps,
+        ) = _compute_cost_adjusted_returns(
+            position=arm_frame[position_col],
+            gross_returns=arm_frame[gross_returns_col],
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+        )
+        arm_frame[returns_col] = arm_frame[net_returns_col]
+        arm_frame[gross_equity_col] = (1.0 + arm_frame[gross_returns_col]).cumprod()
+        arm_frame[net_equity_col] = (1.0 + arm_frame[net_returns_col]).cumprod()
+        arm_frame[equity_col] = arm_frame[net_equity_col]
         frame[position_col] = arm_frame[position_col]
         arm_metrics[arm] = _metrics_from_position(
             arm_frame,
             position_column=position_col,
-            returns_column=returns_col,
-            equity_column=equity_col,
+            gross_returns_column=gross_returns_col,
+            gross_equity_column=gross_equity_col,
+            net_returns_column=net_returns_col,
+            net_equity_column=net_equity_col,
+            turnover_column=turnover_col,
+            cost_returns_column=cost_returns_col,
+            one_way_cost_bps=one_way_cost_bps,
             timeframe=timeframe,
         )
         arm_metrics[arm]["weight"] = float(resolved_weights.get(arm, 0.0))
         arm_attribution[position_col] = arm_frame[position_col]
+        arm_attribution[gross_returns_col] = arm_frame[gross_returns_col]
+        arm_attribution[cost_returns_col] = arm_frame[cost_returns_col]
+        arm_attribution[turnover_col] = arm_frame[turnover_col]
+        arm_attribution[net_returns_col] = arm_frame[net_returns_col]
         arm_attribution[returns_col] = arm_frame[returns_col]
 
     frame["ensemble_position"] = 0.0
     for arm in resolved_arms:
         frame["ensemble_position"] += frame[f"{arm}_position"] * float(resolved_weights.get(arm, 0.0))
     frame["ensemble_position"] = frame["ensemble_position"].clip(lower=0.0, upper=1.0)
-    frame["ensemble_strategy_returns"] = frame["ensemble_position"].shift(1).fillna(0.0) * frame["returns"]
-    frame["equity_curve"] = (1.0 + frame["ensemble_strategy_returns"]).cumprod()
+    frame["ensemble_strategy_returns_gross"] = frame["ensemble_position"].shift(1).fillna(0.0) * frame["returns"]
+    (
+        frame["ensemble_turnover_units"],
+        frame["ensemble_cost_returns"],
+        frame["ensemble_strategy_returns_net"],
+        ensemble_one_way_cost_bps,
+    ) = _compute_cost_adjusted_returns(
+        position=frame["ensemble_position"],
+        gross_returns=frame["ensemble_strategy_returns_gross"],
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+    frame["ensemble_strategy_returns"] = frame["ensemble_strategy_returns_net"]
+    frame["equity_curve_gross"] = (1.0 + frame["ensemble_strategy_returns_gross"]).cumprod()
+    frame["equity_curve_net"] = (1.0 + frame["ensemble_strategy_returns_net"]).cumprod()
+    frame["equity_curve"] = frame["equity_curve_net"]
 
     ensemble_metrics = _metrics_from_position(
-        frame[["timestamp", "close", "ensemble_position", "ensemble_strategy_returns", "equity_curve"]].copy(),
+        frame[
+            [
+                "timestamp",
+                "close",
+                "ensemble_position",
+                "ensemble_strategy_returns_gross",
+                "ensemble_strategy_returns_net",
+                "ensemble_turnover_units",
+                "ensemble_cost_returns",
+                "equity_curve_gross",
+                "equity_curve_net",
+            ]
+        ].copy(),
         position_column="ensemble_position",
-        returns_column="ensemble_strategy_returns",
-        equity_column="equity_curve",
+        gross_returns_column="ensemble_strategy_returns_gross",
+        gross_equity_column="equity_curve_gross",
+        net_returns_column="ensemble_strategy_returns_net",
+        net_equity_column="equity_curve_net",
+        turnover_column="ensemble_turnover_units",
+        cost_returns_column="ensemble_cost_returns",
+        one_way_cost_bps=ensemble_one_way_cost_bps,
         timeframe=timeframe,
     )
     ensemble_metrics["strategy"] = ENSEMBLE_STRATEGY_NAME
@@ -289,10 +442,18 @@ def run_ensemble_backtest(
             "close",
             "ensemble_position",
             "ensemble_strategy_returns",
+            "ensemble_strategy_returns_gross",
+            "ensemble_cost_returns",
+            "ensemble_turnover_units",
             "equity_curve",
+            "equity_curve_gross",
         ]
     ].to_parquet(equity_path, index=False)
     arm_attribution["ensemble_position"] = frame["ensemble_position"]
+    arm_attribution["ensemble_strategy_returns_gross"] = frame["ensemble_strategy_returns_gross"]
+    arm_attribution["ensemble_cost_returns"] = frame["ensemble_cost_returns"]
+    arm_attribution["ensemble_turnover_units"] = frame["ensemble_turnover_units"]
+    arm_attribution["ensemble_strategy_returns_net"] = frame["ensemble_strategy_returns_net"]
     arm_attribution["ensemble_strategy_returns"] = frame["ensemble_strategy_returns"]
     arm_attribution.to_parquet(arm_attribution_path, index=False)
 
@@ -306,6 +467,11 @@ def run_ensemble_backtest(
         **ensemble_metrics,
         "arm_metrics": arm_metrics,
         "arm_weights": {arm: float(resolved_weights.get(arm, 0.0)) for arm in resolved_arms},
+        "cost_model": {
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+            "one_way_trading_cost_bps": fee_bps + slippage_bps,
+        },
         "arm_attribution_path": str(arm_attribution_path),
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -323,6 +489,8 @@ def run_ensemble_backtest(
             "enabled_arms": list(resolved_arms),
             "arm_weights": {arm: float(resolved_weights.get(arm, 0.0)) for arm in resolved_arms},
             "llm_recommendation": llm_recommendation,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
         },
         "source_data": {
             "path": str(source_file),
@@ -369,6 +537,8 @@ def run_sma_backtest(
     timeframe: str,
     fast_window: int = 20,
     slow_window: int = 50,
+    fee_bps: float = 0.0,
+    slippage_bps: float = 0.0,
     source_data_path: Path | None = None,
     archive_run: bool = False,
 ) -> BacktestResult:
@@ -394,21 +564,49 @@ def run_sma_backtest(
     df["ma_slow"] = df["close"].rolling(window=slow_window).mean()
     df["signal"] = (df["ma_fast"] > df["ma_slow"]).astype(float)
     df["position"] = df["signal"].shift(1).fillna(0.0)
-    df["strategy_returns"] = df["position"] * df["returns"]
-    df["equity_curve"] = (1.0 + df["strategy_returns"]).cumprod()
-
-    periods_per_year = _periods_per_year(timeframe)
-    total_return = float(df["equity_curve"].iloc[-1] - 1.0)
-    bars = len(df)
-    annualized_return = float((1 + total_return) ** (periods_per_year / bars) - 1) if bars else 0.0
-    ret_mean = float(df["strategy_returns"].mean())
-    ret_std = float(df["strategy_returns"].std(ddof=0))
-    sharpe = float(np.sqrt(periods_per_year) * ret_mean / ret_std) if ret_std > 0 else 0.0
-    rolling_peak = df["equity_curve"].cummax()
-    drawdown = (df["equity_curve"] / rolling_peak) - 1.0
-    max_drawdown = float(drawdown.min())
-    buy_hold_return = float(df["close"].iloc[-1] / df["close"].iloc[0] - 1.0)
-    trade_flips = int(df["signal"].diff().abs().fillna(0).sum())
+    fee_bps = max(0.0, float(fee_bps))
+    slippage_bps = max(0.0, float(slippage_bps))
+    df["strategy_returns_gross"] = df["position"] * df["returns"]
+    (
+        df["turnover_units"],
+        df["cost_returns"],
+        df["strategy_returns_net"],
+        one_way_cost_bps,
+    ) = _compute_cost_adjusted_returns(
+        position=df["position"],
+        gross_returns=df["strategy_returns_gross"],
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+    df["strategy_returns"] = df["strategy_returns_net"]
+    df["equity_curve_gross"] = (1.0 + df["strategy_returns_gross"]).cumprod()
+    df["equity_curve_net"] = (1.0 + df["strategy_returns_net"]).cumprod()
+    df["equity_curve"] = df["equity_curve_net"]
+    computed_metrics = _metrics_from_position(
+        df[
+            [
+                "timestamp",
+                "close",
+                "position",
+                "strategy_returns_gross",
+                "strategy_returns_net",
+                "turnover_units",
+                "cost_returns",
+                "equity_curve_gross",
+                "equity_curve_net",
+            ]
+        ].copy(),
+        position_column="position",
+        gross_returns_column="strategy_returns_gross",
+        gross_equity_column="equity_curve_gross",
+        net_returns_column="strategy_returns_net",
+        net_equity_column="equity_curve_net",
+        turnover_column="turnover_units",
+        cost_returns_column="cost_returns",
+        one_way_cost_bps=one_way_cost_bps,
+        timeframe=timeframe,
+    )
+    bars = int(computed_metrics["bars"])
 
     run_dir = new_backtest_run_dir(settings.quant_data_root, STRATEGY_NAME)
     equity_path = run_dir / "equity_curve.parquet"
@@ -423,7 +621,11 @@ def run_sma_backtest(
             "ma_slow",
             "position",
             "strategy_returns",
+            "strategy_returns_gross",
+            "cost_returns",
+            "turnover_units",
             "equity_curve",
+            "equity_curve_gross",
         ]
     ].to_parquet(equity_path, index=False)
 
@@ -437,14 +639,9 @@ def run_sma_backtest(
         "bars": bars,
         "fast_window": fast_window,
         "slow_window": slow_window,
-        "total_return": total_return,
-        "annualized_return": annualized_return,
-        "sharpe": sharpe,
-        "max_drawdown": max_drawdown,
-        "buy_and_hold_return": buy_hold_return,
-        "signal_flips": trade_flips,
-        "data_start": str(df["timestamp"].min()),
-        "data_end": str(df["timestamp"].max()),
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
+        **computed_metrics,
     }
 
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -458,6 +655,8 @@ def run_sma_backtest(
             "timeframe": timeframe,
             "fast_window": fast_window,
             "slow_window": slow_window,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
         },
         "source_data": {
             "path": str(source_file),

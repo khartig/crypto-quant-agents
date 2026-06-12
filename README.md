@@ -29,13 +29,13 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
    - `fast_window`, `slow_window`
    - `rationale`
 4. **Backtest**  
-   Deterministic SMA backtest runs using the proposed windows.
+   Deterministic SMA/ensemble backtests run using proposed windows with gross and net (cost-adjusted) metrics.
 5. **Risk decision**  
    Deterministic gate checks data-quality status + backtest metrics + signal confidence.
 6. **Execution gateway**  
    If approved, emit actionable paper intent (`buy`/`sell`); otherwise block.
 7. **Paper execution**  
-   Deterministic paper execution updates portfolio state and fills log.
+   Deterministic paper execution updates portfolio state and fills log (long-only; `sell` closes/reduces existing long inventory).
 8. **Ops report + manifest**  
    Generate markdown summary and run manifest with artifact pointers.
 9. **(OpenClaw path) strict verification gate**  
@@ -54,11 +54,13 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
 - The model output is schema-constrained JSON and normalized by code.
 - If model output is invalid/unavailable, strategy falls back to deterministic `hold`.
 - A proposed `buy`/`sell` is **not executable by itself**; it must pass deterministic risk checks first.
+- `sell` in this system is long-only reduction/close behavior; execution does not open synthetic short positions.
 - Risk checks include:
   - data quality validity,
   - backtest success,
-  - threshold checks (return, sharpe, drawdown),
-  - minimum signal confidence.
+  - threshold checks (return, sharpe, drawdown, cost drag),
+  - minimum signal confidence,
+  - minimum walk-forward quality score for actionable (`buy`/`sell`) recommendations.
 
 ## How models are used
 Models are assistive, not authoritative:
@@ -124,11 +126,19 @@ Key environment variables (see `.env.example`):
   - `AGENT_ENSEMBLE_ARMS`
   - `AGENT_ENSEMBLE_DECAY_HORIZON`
   - `AGENT_ENSEMBLE_EXPLORATION_WEIGHT`
+  - `AGENT_ENSEMBLE_TURNOVER_PENALTY_BPS`
+- Backtest/walk-forward cost model:
+  - `BACKTEST_FEE_BPS`
+  - `BACKTEST_SLIPPAGE_BPS`
+  - `WALK_FORWARD_FEE_BPS`
+  - `WALK_FORWARD_SLIPPAGE_BPS`
 - Trigger model:
   - `TRIGGER_MODEL_HORIZON_BARS`
   - `TRIGGER_MODEL_BUY_THRESHOLD`
   - `TRIGGER_MODEL_SELL_THRESHOLD`
   - `TRIGGER_MODEL_MIN_TRAIN_SAMPLES`
+  - `TRIGGER_MODEL_COST_BPS`
+  - `TRIGGER_MODEL_OPTIMIZE_THRESHOLDS`
 - Trigger monitor:
   - `TRIGGER_MONITOR_POLL_SECONDS`
   - `TRIGGER_MONITOR_SIGNAL_CONFIDENCE`
@@ -138,16 +148,29 @@ Key environment variables (see `.env.example`):
   - `RISK_MIN_TOTAL_RETURN`
   - `RISK_MIN_SHARPE`
   - `RISK_MAX_DRAWDOWN`
+  - `RISK_MAX_COST_RETURN_DRAG`
   - `RISK_MIN_SIGNAL_CONFIDENCE`
+  - `RISK_MIN_WALKFORWARD_QUALITY_SCORE`
 - Paper execution:
   - `PAPER_TRADE_NOTIONAL_USD`
   - `PAPER_TRADE_STARTING_CASH_USD`
   - `PAPER_TRADE_FEE_BPS`
+  - `PAPER_TRADE_SLIPPAGE_BPS`
 - Paper account connectivity probe:
   - `PAPER_ACCOUNT_PROVIDER`
   - `PAPER_ACCOUNT_EXCHANGE`
   - `PAPER_ACCOUNT_SANDBOX`
   - `PAPER_ACCOUNT_API_KEY`, `PAPER_ACCOUNT_API_SECRET`, `PAPER_ACCOUNT_API_PASSPHRASE`
+
+### Recommended tuned defaults (current production profile: SMA 24/60)
+- Strategy windows: `fast_window=24`, `slow_window=60`
+- Risk thresholds:
+  - `RISK_MAX_COST_RETURN_DRAG=0.06`
+  - `RISK_MIN_WALKFORWARD_QUALITY_SCORE=0.43`
+  - `RISK_MIN_SIGNAL_CONFIDENCE=0.55`
+- Cost model:
+  - `BACKTEST_FEE_BPS=5.0`, `BACKTEST_SLIPPAGE_BPS=2.5`
+  - `WALK_FORWARD_FEE_BPS=5.0`, `WALK_FORWARD_SLIPPAGE_BPS=2.5`
 
 ## Commands
 The main CLI command is `quant-agents`.
@@ -162,6 +185,7 @@ quant-agents doctor --require-secrets
 ```bash path=null start=null
 quant-agents ingest --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000
 quant-agents backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --fast-window 20 --slow-window 50
+quant-agents backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --fast-window 20 --slow-window 50 --fee-bps 5 --slippage-bps 2.5
 quant-agents backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --input-file /mnt/quant-data/raw/exchange=kraken/symbol=BTC-USDT/interval=1h/year=2026/month=06/ohlcv_YYYYMMDDTHHMMSSZ.parquet
 quant-agents archive-backtest --strategy sma_crossover
 ```
@@ -170,6 +194,7 @@ quant-agents archive-backtest --strategy sma_crossover
 ```bash path=null start=null
 quant-agents report --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000
+quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000 --fee-bps 5 --slippage-bps 2.5
 quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limit 1000 --archive-backtest
 ```
 
@@ -177,8 +202,9 @@ quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limi
 ```bash path=null start=null
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
-quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5
-quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --ensemble-mode adaptive --ensemble-arms sma_baseline,technical_composite,llm_context --ensemble-decay-horizon 48 --ensemble-exploration-weight 0.15
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --max-cost-return-drag 0.06 --min-walkforward-quality-score 0.43 --backtest-fee-bps 5 --backtest-slippage-bps 2.5 --walkforward-fee-bps 5 --walkforward-slippage-bps 2.5
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5 --paper-slippage-bps 1
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --ensemble-mode adaptive --ensemble-arms sma_baseline,technical_composite,llm_context --ensemble-decay-horizon 48 --ensemble-exploration-weight 0.15 --ensemble-turnover-penalty-bps 8
 ```
 
 ### Paper-account connectivity checks
@@ -195,12 +221,12 @@ quant-agents visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orches
 
 ### Trigger model and continuous monitoring
 ```bash path=null start=null
-quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --cost-bps 7.5 --optimize-thresholds
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
-quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --cost-bps 9 --no-optimize-thresholds --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet
 ```
 
 ### OpenClaw-native orchestration commands
@@ -247,7 +273,7 @@ All paths below are relative to `QUANT_DATA_ROOT`.
 
 - Raw market data: `raw/exchange=<exchange>/symbol=<pair>/interval=<tf>/year=<yyyy>/month=<mm>/`
 - Backtests: `backtests/<strategy_name>/<run_id>/`  
-  Includes `metrics.json`, `equity_curve.parquet`, `run_manifest.json`; adaptive ensemble runs also include `arm_attribution.parquet`.
+  Includes `metrics.json`, `equity_curve.parquet`, `run_manifest.json`; `metrics.json` carries gross+net return diagnostics (including turnover and cost drag), and adaptive ensemble runs also include `arm_attribution.parquet`.
 - Orchestration runs: `logs/agents/openclaw-orchestrator/<yyyy-mm-dd>/<run_id>/`  
   Includes:
   - `data_quality_signal.json`
@@ -285,4 +311,5 @@ All paths below are relative to `QUANT_DATA_ROOT`.
 - If models are unavailable, strategy/report steps retry and may fall back; inspect warnings in `strategy_proposal_signal.json` and `ops_report_contract.json`.
 - If data quality fails due to low history, ingest more candles or lower `AGENT_MINIMUM_BARS` for controlled testing.
 - If risk gate fails, intent stays blocked and paper execution is skipped by design.
+- If a `sell` intent is emitted while no long inventory is open, execution is rejected with `reason=no_long_position_to_sell` by design.
 - TradingView built-in paper trading is not exposed as a direct public trading API; use TradingView alerts/webhooks plus a broker/testnet API path.

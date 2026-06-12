@@ -49,6 +49,9 @@ class TriggerModelTrainingResult:
     accuracy: float
     label_distribution: dict[str, int]
     confusion_matrix: dict[str, dict[str, int]]
+    selected_buy_threshold: float
+    selected_sell_threshold: float
+    net_expectancy_per_actionable: float
 
 
 @dataclass(frozen=True)
@@ -333,6 +336,261 @@ def _classification_metrics(expected: list[str], predicted: list[str]) -> tuple[
     return accuracy, confusion
 
 
+def _safe_div(numerator: float, denominator: float) -> float:
+    return float(numerator / denominator) if denominator > 0 else 0.0
+
+
+def _derive_per_class_metrics(confusion: dict[str, dict[str, int]]) -> dict[str, dict[str, float | int]]:
+    per_class: dict[str, dict[str, float | int]] = {}
+    for label in TRIGGER_LABELS:
+        tp = int(confusion.get(label, {}).get(label, 0))
+        fp = int(sum(confusion.get(other, {}).get(label, 0) for other in TRIGGER_LABELS if other != label))
+        fn = int(sum(confusion.get(label, {}).get(other, 0) for other in TRIGGER_LABELS if other != label))
+        support = int(sum(confusion.get(label, {}).values()))
+        precision = _safe_div(tp, tp + fp)
+        recall = _safe_div(tp, tp + fn)
+        f1 = _safe_div(2.0 * precision * recall, precision + recall)
+        per_class[label] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": support,
+        }
+    macro_precision = float(np.mean([float(item["precision"]) for item in per_class.values()])) if per_class else 0.0
+    macro_recall = float(np.mean([float(item["recall"]) for item in per_class.values()])) if per_class else 0.0
+    macro_f1 = float(np.mean([float(item["f1"]) for item in per_class.values()])) if per_class else 0.0
+    total_support = float(sum(int(item["support"]) for item in per_class.values()))
+    weighted_f1 = (
+        float(
+            sum(float(item["f1"]) * int(item["support"]) for item in per_class.values()) / total_support
+        )
+        if total_support > 0
+        else 0.0
+    )
+    return {
+        "classes": per_class,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+    }
+
+
+def _derive_actionable_metrics(expected: list[str], predicted: list[str]) -> dict[str, float | int]:
+    actionable_truth = [label in {"buy", "sell"} for label in expected]
+    actionable_pred = [label in {"buy", "sell"} for label in predicted]
+    tp = sum(1 for truth, pred in zip(actionable_truth, actionable_pred) if truth and pred)
+    fp = sum(1 for truth, pred in zip(actionable_truth, actionable_pred) if (not truth) and pred)
+    fn = sum(1 for truth, pred in zip(actionable_truth, actionable_pred) if truth and (not pred))
+    actionable_count = int(sum(1 for pred in actionable_pred if pred))
+    actionable_rate = _safe_div(float(actionable_count), float(len(predicted)))
+    actionable_hits = sum(
+        1
+        for truth, pred in zip(expected, predicted)
+        if pred in {"buy", "sell"} and truth == pred
+    )
+    actionable_accuracy = _safe_div(float(actionable_hits), float(actionable_count))
+    directional_hit_rate = actionable_accuracy
+    return {
+        "actionable_count": actionable_count,
+        "actionable_rate": actionable_rate,
+        "binary_actionable_precision": _safe_div(float(tp), float(tp + fp)),
+        "binary_actionable_recall": _safe_div(float(tp), float(tp + fn)),
+        "actionable_accuracy": actionable_accuracy,
+        "directional_hit_rate": directional_hit_rate,
+    }
+
+
+def _derive_calibration_metrics(
+    *,
+    expected: list[str],
+    predicted: list[str],
+    probabilities: list[dict[str, float]],
+) -> dict[str, Any]:
+    if not expected or not probabilities:
+        return {
+            "avg_confidence": 0.0,
+            "accuracy": 0.0,
+            "brier_score": 0.0,
+            "log_loss": 0.0,
+            "expected_calibration_error": 0.0,
+            "confidence_bins": [],
+        }
+    confidence_values = [float(max(prob.values())) for prob in probabilities]
+    correctness = [1.0 if truth == pred else 0.0 for truth, pred in zip(expected, predicted)]
+    brier_rows: list[float] = []
+    log_loss_rows: list[float] = []
+    epsilon = 1e-12
+    for index, truth in enumerate(expected):
+        prob = probabilities[index]
+        row_brier = 0.0
+        for label in TRIGGER_LABELS:
+            p = float(prob.get(label, 0.0))
+            y = 1.0 if truth == label else 0.0
+            row_brier += (p - y) ** 2
+        brier_rows.append(row_brier)
+        truth_prob = float(prob.get(truth, 0.0))
+        log_loss_rows.append(-math.log(max(epsilon, truth_prob)))
+    bins: list[dict[str, Any]] = []
+    ece = 0.0
+    for index in range(10):
+        lower = index / 10.0
+        upper = (index + 1) / 10.0
+        selected_indices = [
+            row_index
+            for row_index, conf in enumerate(confidence_values)
+            if ((lower <= conf <= upper) if index == 9 else (lower <= conf < upper))
+        ]
+        if selected_indices:
+            avg_conf = float(np.mean([confidence_values[row_index] for row_index in selected_indices]))
+            avg_acc = float(np.mean([correctness[row_index] for row_index in selected_indices]))
+            frac = float(len(selected_indices) / len(confidence_values))
+            ece += abs(avg_conf - avg_acc) * frac
+        else:
+            avg_conf = 0.0
+            avg_acc = 0.0
+        bins.append(
+            {
+                "bin": f"{lower:.1f}-{upper:.1f}",
+                "count": len(selected_indices),
+                "avg_confidence": avg_conf,
+                "avg_accuracy": avg_acc,
+            }
+        )
+    return {
+        "avg_confidence": float(np.mean(confidence_values)),
+        "accuracy": float(np.mean(correctness)),
+        "brier_score": float(np.mean(brier_rows)),
+        "log_loss": float(np.mean(log_loss_rows)),
+        "expected_calibration_error": float(ece),
+        "confidence_bins": bins,
+    }
+
+
+def _derive_expectancy_metrics(
+    *,
+    predicted: list[str],
+    forward_returns: np.ndarray,
+    one_way_cost_bps: float,
+) -> dict[str, float | int]:
+    cost_rate = max(0.0, float(one_way_cost_bps)) / 10_000.0
+    gross_returns: list[float] = []
+    net_returns: list[float] = []
+    actionable_gross_returns: list[float] = []
+    actionable_net_returns: list[float] = []
+    for label, forward_return in zip(predicted, forward_returns):
+        gross = 0.0
+        if label == "buy":
+            gross = float(forward_return)
+        elif label == "sell":
+            gross = float(-forward_return)
+        is_actionable = label in {"buy", "sell"}
+        net = gross - (cost_rate if is_actionable else 0.0)
+        gross_returns.append(gross)
+        net_returns.append(net)
+        if is_actionable:
+            actionable_gross_returns.append(gross)
+            actionable_net_returns.append(net)
+    actionable_count = len(actionable_net_returns)
+    actionable_rate = _safe_div(float(actionable_count), float(len(predicted)))
+    actionable_gross_expectancy = (
+        float(np.mean(actionable_gross_returns)) if actionable_gross_returns else 0.0
+    )
+    actionable_net_expectancy = (
+        float(np.mean(actionable_net_returns)) if actionable_net_returns else 0.0
+    )
+    break_even_one_way_cost_bps = max(0.0, actionable_gross_expectancy * 10_000.0)
+    return {
+        "gross_expectancy_per_bar": float(np.mean(gross_returns)) if gross_returns else 0.0,
+        "net_expectancy_per_bar": float(np.mean(net_returns)) if net_returns else 0.0,
+        "gross_expectancy_per_actionable": actionable_gross_expectancy,
+        "net_expectancy_per_actionable": actionable_net_expectancy,
+        "cumulative_gross_return": float(np.prod(np.asarray(gross_returns) + 1.0) - 1.0)
+        if gross_returns
+        else 0.0,
+        "cumulative_net_return": float(np.prod(np.asarray(net_returns) + 1.0) - 1.0)
+        if net_returns
+        else 0.0,
+        "actionable_count": int(actionable_count),
+        "actionable_rate": actionable_rate,
+        "one_way_cost_bps": float(max(0.0, one_way_cost_bps)),
+        "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
+    }
+
+
+def _evaluate_model(
+    *,
+    model_payload: dict[str, Any],
+    test_frame: pd.DataFrame,
+    one_way_cost_bps: float,
+) -> dict[str, Any]:
+    expected = test_frame["label"].astype(str).tolist()
+    forward_returns = test_frame["forward_return"].to_numpy(dtype=float)
+    feature_matrix = test_frame[list(FEATURE_COLUMNS)].to_numpy(dtype=float)
+    predicted: list[str] = []
+    probability_rows: list[dict[str, float]] = []
+    for row in feature_matrix:
+        label, probabilities = _predict_probabilities(model_payload, row)
+        predicted.append(label)
+        probability_rows.append(probabilities)
+    accuracy, confusion = _classification_metrics(expected, predicted)
+    per_class = _derive_per_class_metrics(confusion)
+    actionable = _derive_actionable_metrics(expected, predicted)
+    calibration = _derive_calibration_metrics(
+        expected=expected,
+        predicted=predicted,
+        probabilities=probability_rows,
+    )
+    expectancy = _derive_expectancy_metrics(
+        predicted=predicted,
+        forward_returns=forward_returns,
+        one_way_cost_bps=one_way_cost_bps,
+    )
+    return {
+        "accuracy": accuracy,
+        "confusion_matrix": confusion,
+        "per_class_metrics": per_class,
+        "actionable_metrics": actionable,
+        "calibration_metrics": calibration,
+        "expectancy_metrics": expectancy,
+    }
+
+
+def _split_train_test(
+    labeled: pd.DataFrame,
+    *,
+    min_train_samples: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, int, int]:
+    min_train = max(20, int(min_train_samples))
+    test_count = max(10, int(round(len(labeled) * 0.2)))
+    if len(labeled) - test_count < min_train:
+        test_count = max(1, len(labeled) - min_train)
+    train_count = len(labeled) - test_count
+    if train_count < min_train:
+        raise RuntimeError(
+            f"Unable to satisfy min_train_samples={min_train}; available labeled samples={len(labeled)}"
+        )
+    train_frame = labeled.iloc[:train_count].reset_index(drop=True)
+    test_frame = labeled.iloc[train_count:].reset_index(drop=True)
+    return train_frame, test_frame, train_count, test_count
+
+
+def _candidate_threshold_pairs(
+    *,
+    buy_threshold: float,
+    sell_threshold: float,
+) -> list[tuple[float, float]]:
+    base_values = {0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.010}
+    base_values.add(float(max(0.0005, buy_threshold)))
+    base_values.add(float(max(0.0005, abs(sell_threshold))))
+    ordered = sorted(base_values)
+    pairs: list[tuple[float, float]] = []
+    for buy_value in ordered:
+        for sell_value in ordered:
+            pairs.append((float(buy_value), float(sell_value)))
+    return pairs
+
+
 def _feature_reasons(
     model_payload: dict[str, Any],
     feature_vector: np.ndarray,
@@ -401,6 +659,8 @@ def train_trigger_model(
     buy_threshold: float,
     sell_threshold: float,
     min_train_samples: int,
+    cost_bps: float = 0.0,
+    optimize_thresholds: bool = True,
 ) -> TriggerModelTrainingResult:
     source_data_path = (
         input_file.expanduser().resolve()
@@ -413,35 +673,102 @@ def train_trigger_model(
 
     frame = _coerce_frame(source_data_path)
     feature_frame = _build_feature_frame(frame)
+    resolved_horizon = int(max(1, horizon_bars))
+    resolved_buy_threshold = float(max(0.0005, buy_threshold))
+    resolved_sell_threshold = float(max(0.0005, abs(sell_threshold)))
+    resolved_cost_bps = float(max(0.0, cost_bps))
+    required_rows = max(30, int(min_train_samples) + 5)
+
+    threshold_candidates: list[dict[str, Any]] = []
+    selected_buy_threshold = resolved_buy_threshold
+    selected_sell_threshold = resolved_sell_threshold
+    if optimize_thresholds:
+        for candidate_buy, candidate_sell in _candidate_threshold_pairs(
+            buy_threshold=resolved_buy_threshold,
+            sell_threshold=resolved_sell_threshold,
+        ):
+            candidate_labeled = _label_training_frame(
+                feature_frame,
+                horizon_bars=resolved_horizon,
+                buy_threshold=candidate_buy,
+                sell_threshold=candidate_sell,
+            )
+            if len(candidate_labeled) < required_rows:
+                continue
+            try:
+                candidate_train, candidate_test, candidate_train_count, candidate_test_count = _split_train_test(
+                    candidate_labeled,
+                    min_train_samples=min_train_samples,
+                )
+            except RuntimeError:
+                continue
+            candidate_model = _fit_gaussian_model(candidate_train)
+            candidate_eval = _evaluate_model(
+                model_payload=candidate_model,
+                test_frame=candidate_test,
+                one_way_cost_bps=resolved_cost_bps,
+            )
+            expectancy = dict(candidate_eval.get("expectancy_metrics", {}))
+            actionable = dict(candidate_eval.get("actionable_metrics", {}))
+            threshold_candidates.append(
+                {
+                    "buy_threshold": candidate_buy,
+                    "sell_threshold": candidate_sell,
+                    "sample_count": int(len(candidate_labeled)),
+                    "train_count": int(candidate_train_count),
+                    "test_count": int(candidate_test_count),
+                    "accuracy": float(candidate_eval.get("accuracy", 0.0)),
+                    "net_expectancy_per_bar": float(expectancy.get("net_expectancy_per_bar", 0.0)),
+                    "net_expectancy_per_actionable": float(
+                        expectancy.get("net_expectancy_per_actionable", 0.0)
+                    ),
+                    "actionable_rate": float(actionable.get("actionable_rate", 0.0)),
+                    "binary_actionable_precision": float(
+                        actionable.get("binary_actionable_precision", 0.0)
+                    ),
+                }
+            )
+        if threshold_candidates:
+            threshold_candidates.sort(
+                key=lambda item: (
+                    float(item.get("net_expectancy_per_bar", 0.0)),
+                    float(item.get("net_expectancy_per_actionable", 0.0)),
+                    float(item.get("binary_actionable_precision", 0.0)),
+                    float(item.get("actionable_rate", 0.0)),
+                ),
+                reverse=True,
+            )
+            selected_buy_threshold = float(threshold_candidates[0]["buy_threshold"])
+            selected_sell_threshold = float(threshold_candidates[0]["sell_threshold"])
+
     labeled = _label_training_frame(
         feature_frame,
-        horizon_bars=max(1, int(horizon_bars)),
-        buy_threshold=float(buy_threshold),
-        sell_threshold=float(sell_threshold),
+        horizon_bars=resolved_horizon,
+        buy_threshold=selected_buy_threshold,
+        sell_threshold=selected_sell_threshold,
     )
-    if len(labeled) < max(30, int(min_train_samples) + 5):
+    if len(labeled) < required_rows:
         raise RuntimeError(
             f"Insufficient labeled rows for training: {len(labeled)} "
-            f"(need at least {max(30, int(min_train_samples) + 5)})"
+            f"(need at least {required_rows})"
         )
 
-    min_train = max(20, int(min_train_samples))
-    test_count = max(10, int(round(len(labeled) * 0.2)))
-    if len(labeled) - test_count < min_train:
-        test_count = max(1, len(labeled) - min_train)
-    train_count = len(labeled) - test_count
-    if train_count < min_train:
-        raise RuntimeError(
-            f"Unable to satisfy min_train_samples={min_train}; available labeled samples={len(labeled)}"
-        )
-
-    train_frame = labeled.iloc[:train_count].reset_index(drop=True)
-    test_frame = labeled.iloc[train_count:].reset_index(drop=True)
+    train_frame, test_frame, train_count, test_count = _split_train_test(
+        labeled,
+        min_train_samples=min_train_samples,
+    )
     model = _fit_gaussian_model(train_frame)
-
-    expected = test_frame["label"].astype(str).tolist()
-    predicted = _predict_labels(model, test_frame[list(FEATURE_COLUMNS)].to_numpy(dtype=float))
-    accuracy, confusion = _classification_metrics(expected, predicted)
+    evaluation = _evaluate_model(
+        model_payload=model,
+        test_frame=test_frame,
+        one_way_cost_bps=resolved_cost_bps,
+    )
+    accuracy = float(evaluation.get("accuracy", 0.0))
+    confusion = dict(evaluation.get("confusion_matrix", {}))
+    per_class_metrics = dict(evaluation.get("per_class_metrics", {}))
+    actionable_metrics = dict(evaluation.get("actionable_metrics", {}))
+    calibration_metrics = dict(evaluation.get("calibration_metrics", {}))
+    expectancy_metrics = dict(evaluation.get("expectancy_metrics", {}))
 
     distribution = {
         label: int((labeled["label"] == label).sum())
@@ -462,9 +789,9 @@ def train_trigger_model(
         "timeframe": timeframe,
         "source_data_path": str(source_data_path),
         "source_data_sha256": source_data_sha256,
-        "horizon_bars": int(max(1, horizon_bars)),
-        "buy_threshold": float(buy_threshold),
-        "sell_threshold": float(abs(sell_threshold)),
+        "horizon_bars": resolved_horizon,
+        "buy_threshold": float(selected_buy_threshold),
+        "sell_threshold": float(selected_sell_threshold),
         "feature_columns": list(FEATURE_COLUMNS),
         "labels": list(TRIGGER_LABELS),
         "class_stats": model["class_stats"],
@@ -475,6 +802,21 @@ def train_trigger_model(
             "accuracy": accuracy,
             "label_distribution": distribution,
             "confusion_matrix": confusion,
+            "per_class_metrics": per_class_metrics,
+            "actionable_metrics": actionable_metrics,
+            "calibration_metrics": calibration_metrics,
+            "expectancy_metrics": expectancy_metrics,
+            "one_way_cost_bps": resolved_cost_bps,
+        },
+        "threshold_optimization": {
+            "enabled": bool(optimize_thresholds),
+            "objective": "net_expectancy_per_bar",
+            "candidate_count": int(len(threshold_candidates)),
+            "selected": {
+                "buy_threshold": float(selected_buy_threshold),
+                "sell_threshold": float(selected_sell_threshold),
+            },
+            "top_candidates": threshold_candidates[:10],
         },
         "artifacts": {
             "run_dir": str(run_dir),
@@ -499,6 +841,9 @@ def train_trigger_model(
         accuracy=accuracy,
         label_distribution=distribution,
         confusion_matrix=confusion,
+        selected_buy_threshold=float(selected_buy_threshold),
+        selected_sell_threshold=float(selected_sell_threshold),
+        net_expectancy_per_actionable=float(expectancy_metrics.get("net_expectancy_per_actionable", 0.0)),
     )
 
 

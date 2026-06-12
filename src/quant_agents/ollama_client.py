@@ -10,7 +10,13 @@ class OllamaClient:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
-    def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         req = request.Request(
             url=f"{self.base_url}{path}",
@@ -18,8 +24,9 @@ class OllamaClient:
             headers={"Content-Type": "application/json"},
             method=method,
         )
+        effective_timeout = self.timeout_seconds if timeout_seconds is None else max(1.0, float(timeout_seconds))
         try:
-            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+            with request.urlopen(req, timeout=effective_timeout) as response:
                 body = response.read().decode("utf-8")
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -57,8 +64,12 @@ class OllamaClient:
         system: str | None = None,
         temperature: float = 0.1,
         format_json: bool = False,
+        num_predict: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> str:
         options: dict[str, Any] = {"temperature": temperature}
+        if num_predict is not None:
+            options["num_predict"] = max(1, int(num_predict))
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -70,7 +81,7 @@ class OllamaClient:
         if format_json:
             payload["format"] = "json"
 
-        decoded = self._request_json("POST", "/api/generate", payload)
+        decoded = self._request_json("POST", "/api/generate", payload, timeout_seconds=timeout_seconds)
         response = decoded.get("response")
         if not isinstance(response, str):
             raise RuntimeError("Ollama response did not include text output.")

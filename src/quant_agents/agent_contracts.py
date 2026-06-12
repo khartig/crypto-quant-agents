@@ -92,6 +92,14 @@ class BacktestEvaluation:
     annualized_return: float | None
     sharpe: float | None
     max_drawdown: float | None
+    gross_total_return: float | None
+    gross_annualized_return: float | None
+    gross_sharpe: float | None
+    gross_max_drawdown: float | None
+    total_cost_return_drag: float | None
+    turnover_units: float | None
+    break_even_one_way_cost_bps: float | None
+    one_way_trading_cost_bps: float | None
     signal_flips: int | None
     bars: int | None
     error_message: str | None
@@ -158,7 +166,9 @@ class PaperTradeExecution:
     executed_notional_usd: float
     executed_quantity: float
     mark_price: float | None
+    execution_price: float | None
     fee_usd: float
+    slippage_bps: float
     cash_after_usd: float | None
     position_qty_after: float | None
     position_avg_entry_after: float | None
