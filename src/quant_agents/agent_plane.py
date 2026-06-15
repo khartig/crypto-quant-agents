@@ -50,6 +50,7 @@ class RiskThresholds:
     max_drawdown: float
     max_cost_return_drag: float
     min_signal_confidence: float
+    max_cost_pressure_score: float = 0.95
     min_walkforward_quality_score: float = 0.43
     min_regime_confidence: float = 0.45
 
@@ -73,6 +74,13 @@ class AgentPlaneConfig:
     paper_slippage_bps: float
     minimum_bars: int
     regime_detector_mode: str = "score"
+    regime_policy_mode: str = "legacy"
+    regime_policy_min_actionable_confidence: float = 0.50
+    regime_policy_transition_confidence: float = 0.65
+    regime_touchpoint_prompting_enabled: bool = True
+    regime_touchpoint_calibration_enabled: bool = True
+    regime_touchpoint_self_critique_enabled: bool = True
+    regime_touchpoint_risk_gate_enabled: bool = True
     regime_volatility_threshold: float = 0.03
     regime_trend_spread_threshold: float = 0.01
     regime_persistence_bars: int = 3
@@ -85,6 +93,10 @@ class AgentPlaneConfig:
     calibration_confidence_floor: float = 0.05
     calibration_confidence_ceiling: float = 0.95
     calibration_max_contradictions: int = 0
+    calibration_directional_edge_threshold: float = 0.0
+    calibration_quality_penalty_strength: float = 0.25
+    calibration_directional_contradiction_penalty: float = 0.35
+    calibration_cost_pressure_penalty_strength: float = 0.30
     self_critique_min_score: float = 0.55
     self_critique_max_findings: int = 6
     ops_report_verbosity: str = "standard"
@@ -1384,6 +1396,7 @@ def _run_self_critique(
     max_findings: int,
     timeframe: str,
     regime_ablation_mode: bool = False,
+    regime_self_critique_enabled: bool = True,
 ) -> dict[str, Any]:
     severity_rank = {"fail": 0, "block": 1}
     findings: list[dict[str, Any]] = []
@@ -1436,7 +1449,7 @@ def _run_self_critique(
 
     regime = strategy_signal.regime.strip().lower()
     regime_confidence = float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
-    if not regime_ablation_mode:
+    if regime_self_critique_enabled and not regime_ablation_mode:
         if recommendation == "buy" and ("bear" in regime or "downtrend" in regime):
             severity: Literal["block", "fail"] = "fail" if regime_confidence >= 0.70 else "block"
             add_finding(
@@ -1479,20 +1492,43 @@ def _run_self_critique(
             expected=">= 0.34",
         )
 
-    if bool(confidence_calibration.get("contradiction_detected", False)):
+    directional_contradiction = bool(
+        confidence_calibration.get(
+            "directional_contradiction_detected",
+            confidence_calibration.get("contradiction_detected", False),
+        )
+    )
+    quality_contradiction = bool(confidence_calibration.get("quality_contradiction_detected", False))
+    if directional_contradiction:
         contradiction_severity = str(confidence_calibration.get("contradiction_severity", "block")).lower()
         severity: Literal["block", "fail"] = "fail" if contradiction_severity == "fail" else "block"
         add_finding(
-            code="contradiction_confidence_walkforward",
+            code="contradiction_confidence_directional",
             severity=severity,
             category="confidence_calibration",
-            message="Confidence calibration detected a walk-forward contradiction.",
+            message="Confidence calibration detected a directional walk-forward contradiction.",
             observed={
+                "walkforward_total_return": confidence_calibration.get("walkforward_total_return"),
                 "quality_band": confidence_calibration.get("walkforward_quality_band"),
                 "walkforward_sharpe": confidence_calibration.get("walkforward_sharpe"),
                 "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
             },
-            expected="no contradiction between actionable direction and walk-forward evidence",
+            expected="directional recommendation should align with walk-forward return evidence",
+        )
+    if quality_contradiction:
+        contradiction_severity = str(confidence_calibration.get("contradiction_severity", "block")).lower()
+        severity = "fail" if contradiction_severity == "fail" else "block"
+        add_finding(
+            code="quality_penalty_walkforward",
+            severity=severity,
+            category="confidence_calibration",
+            message="Walk-forward quality evidence triggered calibration quality penalties.",
+            observed={
+                "quality_band": confidence_calibration.get("walkforward_quality_band"),
+                "walkforward_sharpe": confidence_calibration.get("walkforward_sharpe"),
+                "contradiction_policy": confidence_calibration.get("contradiction_policy"),
+            },
+            expected="walk-forward quality should remain within actionable quality bands",
         )
 
     frame_timestamps = pd.to_datetime(market_frame["timestamp"], utc=True, errors="coerce").dropna()
@@ -1601,6 +1637,117 @@ def _regime_alignment_adjustment(regime: str, recommendation: Recommendation) ->
             return -0.10
     return 0.0
 
+def _is_bullish_regime(regime: str) -> bool:
+    normalized = regime.strip().lower()
+    return "bull" in normalized or "uptrend" in normalized
+
+def _is_bearish_regime(regime: str) -> bool:
+    normalized = regime.strip().lower()
+    return "bear" in normalized or "downtrend" in normalized or "decline" in normalized
+
+def _normalize_regime_policy_mode(value: Any) -> Literal["legacy", "conditional_v2"]:
+    normalized = str(value).strip().lower()
+    if normalized == "conditional_v2":
+        return "conditional_v2"
+    return "legacy"
+
+def _quality_band_penalty_factor(
+    quality_band: Literal["high", "medium", "low", "very_low"],
+) -> float:
+    if quality_band == "high":
+        return 0.0
+    if quality_band == "medium":
+        return 0.35
+    if quality_band == "low":
+        return 0.65
+    return 1.0
+
+def _compute_cost_pressure_score(backtest_metrics: dict[str, Any]) -> float:
+    break_even_cost_bps = float(backtest_metrics.get("break_even_one_way_cost_bps") or 0.0)
+    configured_cost_bps = float(backtest_metrics.get("one_way_trading_cost_bps") or 0.0)
+    total_cost_drag = float(backtest_metrics.get("total_cost_return_drag") or 0.0)
+    gross_total_return = float(backtest_metrics.get("gross_total_return") or 0.0)
+    if break_even_cost_bps > 0.0:
+        budget_pressure = max(0.0, (configured_cost_bps / break_even_cost_bps) - 1.0)
+    elif configured_cost_bps > 0.0:
+        budget_pressure = 2.0
+    else:
+        budget_pressure = 0.0
+    gross_edge = max(abs(gross_total_return), 1e-9)
+    cost_drag_pressure = max(0.0, (total_cost_drag / gross_edge) - 1.0)
+    score = (0.70 * budget_pressure) + (0.30 * cost_drag_pressure)
+    return float(np.clip(score, 0.0, 3.0))
+
+def _apply_regime_conditional_policy(
+    *,
+    recommendation: Recommendation,
+    confidence: float,
+    regime: str,
+    regime_confidence: float,
+    regime_transition: str,
+    regime_policy_mode: Literal["legacy", "conditional_v2"],
+    min_actionable_confidence: float,
+    transition_confidence: float,
+    policy_enabled: bool,
+) -> dict[str, Any]:
+    adjusted_recommendation: Recommendation = recommendation
+    adjusted_confidence = float(np.clip(confidence, 0.0, 1.0))
+    normalized_regime = regime.strip().lower()
+    normalized_transition = regime_transition.strip().lower()
+    reason_codes: list[str] = []
+    if not policy_enabled or regime_policy_mode != "conditional_v2":
+        return {
+            "recommendation": adjusted_recommendation,
+            "confidence": adjusted_confidence,
+            "reason_codes": reason_codes,
+            "changed": False,
+            "forced_hold": False,
+        }
+
+    actionable = adjusted_recommendation in {"buy", "sell"}
+    forced_hold = False
+    min_conf = float(np.clip(min_actionable_confidence, 0.0, 1.0))
+    transition_conf = float(np.clip(transition_confidence, 0.0, 1.0))
+    if actionable and regime_confidence < min_conf:
+        forced_hold = True
+        reason_codes.append("regime_policy_v2_low_regime_confidence")
+    if actionable and normalized_transition != "none" and regime_confidence < transition_conf:
+        forced_hold = True
+        reason_codes.append("regime_policy_v2_transition_guard")
+    if actionable and adjusted_recommendation == "buy" and _is_bearish_regime(normalized_regime):
+        forced_hold = True
+        reason_codes.append("regime_policy_v2_buy_blocked_by_bear_regime")
+    if actionable and adjusted_recommendation == "sell" and _is_bullish_regime(normalized_regime):
+        forced_hold = True
+        reason_codes.append("regime_policy_v2_sell_blocked_by_bull_regime")
+    if actionable and "volatile" in normalized_regime:
+        forced_hold = True
+        reason_codes.append("regime_policy_v2_action_blocked_in_volatile_regime")
+
+    if forced_hold:
+        adjusted_recommendation = "hold"
+        adjusted_confidence = float(np.clip(max(0.55, regime_confidence), 0.0, 1.0))
+        reason_codes.append("regime_policy_v2_forced_hold")
+    elif actionable:
+        aligned = (
+            (adjusted_recommendation == "buy" and _is_bullish_regime(normalized_regime))
+            or (adjusted_recommendation == "sell" and _is_bearish_regime(normalized_regime))
+        )
+        if aligned and regime_confidence >= 0.70:
+            adjusted_confidence = float(np.clip(adjusted_confidence + 0.04, 0.0, 1.0))
+            reason_codes.append("regime_policy_v2_alignment_boost")
+
+    changed = adjusted_recommendation != recommendation or abs(adjusted_confidence - confidence) > 1e-9
+    if changed:
+        reason_codes.append("regime_policy_v2_applied")
+    return {
+        "recommendation": adjusted_recommendation,
+        "confidence": adjusted_confidence,
+        "reason_codes": sorted(set(reason_codes)),
+        "changed": changed,
+        "forced_hold": forced_hold,
+    }
+
 def _walkforward_quality_band(quality_score: float) -> Literal["high", "medium", "low", "very_low"]:
     score = float(np.clip(quality_score, 0.0, 1.0))
     if score >= 0.70:
@@ -1647,11 +1794,17 @@ def _calibrate_confidence(
     run_id: str,
     strategy_signal: StrategyProposalSignal,
     walkforward_evaluation: dict[str, Any],
+    backtest_evaluation: BacktestEvaluation,
     min_walkforward_sharpe: float,
     min_regime_confidence: float,
     confidence_floor: float,
     confidence_ceiling: float,
+    directional_edge_threshold: float,
+    quality_penalty_strength: float,
+    directional_contradiction_penalty: float,
+    cost_pressure_penalty_strength: float,
     regime_ablation_mode: bool = False,
+    regime_calibration_enabled: bool = True,
 ) -> dict[str, Any]:
     lower = min(confidence_floor, confidence_ceiling)
     upper = max(confidence_floor, confidence_ceiling)
@@ -1659,23 +1812,24 @@ def _calibrate_confidence(
     walkforward_quality = float(np.clip(walkforward_evaluation.get("quality_score", 0.0), 0.0, 1.0))
     walkforward_quality_band = _walkforward_quality_band(walkforward_quality)
     walkforward_sharpe = float(walkforward_evaluation.get("aggregate_sharpe", 0.0))
+    walkforward_total_return = float(walkforward_evaluation.get("aggregate_total_return", 0.0))
     sharpe_buffer = _quality_band_sharpe_buffer(walkforward_quality_band)
     required_sharpe = min_walkforward_sharpe + sharpe_buffer
-    contradiction_penalty = _quality_band_contradiction_penalty(walkforward_quality_band)
     indicator_alignment = _indicator_alignment_score(
         strategy_signal.indicator_votes,
         strategy_signal.recommendation,
     )
+    regime_calibration_active = bool(regime_calibration_enabled and not regime_ablation_mode)
     regime_adjustment = (
         0.0
-        if regime_ablation_mode
+        if not regime_calibration_active
         else _regime_alignment_adjustment(
             strategy_signal.regime,
             strategy_signal.recommendation,
         )
     )
     regime_confidence = (
-        0.5 if regime_ablation_mode else float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
+        0.5 if not regime_calibration_active else float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
     )
 
     reason_codes: list[str] = []
@@ -1684,30 +1838,67 @@ def _calibrate_confidence(
     calibrated_confidence += (walkforward_quality - 0.5) * 0.35
     calibrated_confidence += regime_adjustment
     calibrated_confidence += (regime_confidence - 0.5) * 0.10
-
-    contradiction_detected = False
+    quality_penalty_strength_clamped = float(np.clip(quality_penalty_strength, 0.0, 1.0))
+    quality_penalty_factor = _quality_band_penalty_factor(walkforward_quality_band)
+    quality_penalty_multiplier = float(
+        np.clip(
+            1.0 - (quality_penalty_factor * quality_penalty_strength_clamped),
+            0.35,
+            1.0,
+        )
+    )
+    directional_penalty_multiplier = 1.0
+    quality_contradiction_detected = False
+    directional_contradiction_detected = False
     contradiction_count = 0
     contradiction_severity: Literal["none", "block", "fail"] = "none"
     recommendation = strategy_signal.recommendation
+    quality_contradiction_severity: Literal["none", "block", "fail"] = "none"
     if recommendation in {"buy", "sell"}:
+        if quality_penalty_factor > 0.0:
+            calibrated_confidence *= quality_penalty_multiplier
+            reason_codes.append("walkforward_quality_penalty_applied")
+            reason_codes.append(f"walkforward_quality_band_{walkforward_quality_band}")
         if walkforward_quality_band == "very_low":
-            contradiction_detected = True
-            contradiction_count += 1
-            contradiction_severity = "fail"
+            quality_contradiction_detected = True
+            quality_contradiction_severity = "fail"
             reason_codes.append(f"{recommendation}_walkforward_quality_very_low")
         if walkforward_sharpe < required_sharpe:
-            contradiction_detected = True
-            contradiction_count += 1
-            contradiction_severity = _quality_band_contradiction_severity(walkforward_quality_band)
+            quality_contradiction_detected = True
+            quality_contradiction_severity = _quality_band_contradiction_severity(
+                walkforward_quality_band
+            )
             reason_codes.append("walkforward_sharpe_below_threshold")
             reason_codes.append("walkforward_sharpe_below_quality_band_threshold")
             reason_codes.append(
                 f"{recommendation}_walkforward_{walkforward_quality_band}_sharpe_contradiction"
             )
-        if contradiction_detected:
-            calibrated_confidence *= contradiction_penalty
-            reason_codes.append(f"walkforward_contradiction_{contradiction_severity}")
-        if (not regime_ablation_mode) and regime_confidence < min_regime_confidence:
+
+        directional_threshold = max(0.0, float(directional_edge_threshold))
+        if recommendation == "buy" and walkforward_total_return <= directional_threshold:
+            directional_contradiction_detected = True
+            reason_codes.append("directional_contradiction_buy")
+        if recommendation == "sell" and walkforward_total_return >= -directional_threshold:
+            directional_contradiction_detected = True
+            reason_codes.append("directional_contradiction_sell")
+        if directional_contradiction_detected:
+            contradiction_count += 1
+            contradiction_severity = (
+                "fail" if walkforward_quality_band == "very_low" else "block"
+            )
+            directional_penalty_multiplier = float(
+                np.clip(
+                    1.0 - float(np.clip(directional_contradiction_penalty, 0.0, 1.0)),
+                    0.20,
+                    1.0,
+                )
+            )
+            calibrated_confidence *= directional_penalty_multiplier
+            reason_codes.append(f"walkforward_directional_contradiction_{contradiction_severity}")
+        elif quality_contradiction_detected:
+            contradiction_severity = quality_contradiction_severity
+
+        if regime_calibration_active and regime_confidence < min_regime_confidence:
             calibrated_confidence *= float(
                 np.clip(
                     regime_confidence / max(min_regime_confidence, 1e-6),
@@ -1716,6 +1907,25 @@ def _calibrate_confidence(
                 )
             )
             reason_codes.append("regime_confidence_below_threshold")
+    backtest_metrics = {
+        "gross_total_return": backtest_evaluation.gross_total_return,
+        "total_cost_return_drag": backtest_evaluation.total_cost_return_drag,
+        "break_even_one_way_cost_bps": backtest_evaluation.break_even_one_way_cost_bps,
+        "one_way_trading_cost_bps": backtest_evaluation.one_way_trading_cost_bps,
+    }
+    cost_pressure_score = _compute_cost_pressure_score(backtest_metrics)
+    cost_penalty_multiplier = float(
+        np.clip(
+            1.0 - (float(np.clip(cost_pressure_penalty_strength, 0.0, 1.0)) * cost_pressure_score),
+            0.35,
+            1.0,
+        )
+    )
+    if recommendation in {"buy", "sell"} and cost_pressure_score > 0.0:
+        calibrated_confidence *= cost_penalty_multiplier
+        reason_codes.append("cost_pressure_penalty_applied")
+        if cost_pressure_score >= 1.0:
+            reason_codes.append("cost_pressure_above_budget")
 
     if not strategy_signal.feature_snapshot:
         calibrated_confidence *= 0.95
@@ -1723,9 +1933,10 @@ def _calibrate_confidence(
     if not strategy_signal.indicator_votes:
         calibrated_confidence *= 0.95
         reason_codes.append("phase1_indicator_votes_missing")
-    if (not regime_ablation_mode) and strategy_signal.regime in {"", "unknown"}:
+    if regime_calibration_active and strategy_signal.regime in {"", "unknown"}:
         calibrated_confidence *= 0.95
         reason_codes.append("phase1_regime_missing")
+    contradiction_detected = bool(quality_contradiction_detected or directional_contradiction_detected)
 
     calibrated_confidence = float(np.clip(calibrated_confidence, lower, upper))
     diagnostics = {
@@ -1733,6 +1944,8 @@ def _calibrate_confidence(
         "confidence_deciles": walkforward_evaluation.get("diagnostics", {}).get("confidence_deciles", []),
         "contradiction_counts": {
             "current_run": contradiction_count,
+            "directional": 1 if directional_contradiction_detected else 0,
+            "quality": 1 if quality_contradiction_detected else 0,
             "severity_block": 1 if contradiction_detected and contradiction_severity == "block" else 0,
             "severity_fail": 1 if contradiction_detected and contradiction_severity == "fail" else 0,
         },
@@ -1747,12 +1960,19 @@ def _calibrate_confidence(
         "walkforward_quality_score": walkforward_quality,
         "walkforward_quality_band": walkforward_quality_band,
         "walkforward_sharpe": walkforward_sharpe,
+        "walkforward_total_return": walkforward_total_return,
         "contradiction_detected": contradiction_detected,
+        "directional_contradiction_detected": directional_contradiction_detected,
+        "quality_contradiction_detected": quality_contradiction_detected,
         "contradiction_severity": contradiction_severity,
         "contradiction_policy": {
             "required_walkforward_sharpe": required_sharpe,
             "quality_band_sharpe_buffer": sharpe_buffer,
-            "quality_band_penalty_multiplier": contradiction_penalty,
+            "quality_penalty_strength": quality_penalty_strength_clamped,
+            "quality_penalty_multiplier": quality_penalty_multiplier,
+            "directional_edge_threshold": float(max(0.0, directional_edge_threshold)),
+            "directional_penalty_multiplier": directional_penalty_multiplier,
+            "cost_pressure_penalty_strength": float(np.clip(cost_pressure_penalty_strength, 0.0, 1.0)),
         },
         "phase1_inputs": {
             "regime": strategy_signal.regime,
@@ -1760,6 +1980,7 @@ def _calibrate_confidence(
             "regime_transition": strategy_signal.regime_transition,
             "regime_diagnostics": strategy_signal.regime_diagnostics,
             "regime_ablation_mode": bool(regime_ablation_mode),
+            "regime_calibration_enabled": bool(regime_calibration_active),
             "indicator_votes": strategy_signal.indicator_votes,
             "feature_snapshot": strategy_signal.feature_snapshot,
             "reason_codes": strategy_signal.reason_codes,
@@ -1769,8 +1990,14 @@ def _calibrate_confidence(
             "regime_adjustment": regime_adjustment,
             "regime_confidence": regime_confidence,
             "regime_ablation_mode": bool(regime_ablation_mode),
+            "regime_calibration_enabled": bool(regime_calibration_active),
             "walkforward_quality": walkforward_quality,
+            "quality_penalty_multiplier": quality_penalty_multiplier,
+            "directional_penalty_multiplier": directional_penalty_multiplier,
+            "cost_penalty_multiplier": cost_penalty_multiplier,
+            "cost_pressure_score": cost_pressure_score,
         },
+        "cost_pressure_score": cost_pressure_score,
         "reason_codes": sorted(set(reason_codes)),
         "diagnostics": diagnostics,
     }
@@ -1787,8 +2014,10 @@ def _strategy_prompt(
     source_data_sha256: str,
     preferred_fast_window: int,
     preferred_slow_window: int,
+    regime_prompting_enabled: bool = True,
     regime_ablation_mode: bool = False,
 ) -> str:
+    prompt_phase1_context = dict(phase1_context)
     rules = [
         "- confidence must be between 0 and 1.",
         "- regime_confidence must be between 0 and 1.",
@@ -1803,6 +2032,28 @@ def _strategy_prompt(
                 '- Set regime="unknown", regime_confidence=0.5, regime_transition="none".',
                 '- Set regime_diagnostics={"ablation_mode": true}.',
             ]
+        )
+    elif not regime_prompting_enabled:
+        rules.extend(
+            [
+                "- Regime prompting touchpoint is disabled: do not use regime context to choose recommendation.",
+                "- Keep recommendation anchored to indicator_votes and feature_snapshot only.",
+            ]
+        )
+        prompt_phase1_context = dict(phase1_context)
+        prompt_phase1_context["regime"] = "unknown"
+        prompt_phase1_context["regime_confidence"] = 0.5
+        prompt_phase1_context["regime_transition"] = "none"
+        prompt_phase1_context["regime_diagnostics"] = {"prompting_touchpoint_disabled": True}
+        prompt_phase1_context["reason_codes"] = sorted(
+            set(
+                [
+                    str(code)
+                    for code in list(prompt_phase1_context.get("reason_codes", []))
+                    if str(code).strip()
+                ]
+                + ["regime_prompting_touchpoint_disabled"]
+            )
         )
     return "\n".join(
         [
@@ -1826,7 +2077,7 @@ def _strategy_prompt(
             f"Source data path: {source_data_path}",
             f"Source data sha256: {source_data_sha256}",
             f"Market snapshot: {json.dumps(snapshot, sort_keys=True)}",
-            f"Phase-1 feature context (must be consumed): {json.dumps(phase1_context, sort_keys=True)}",
+            f"Phase-1 feature context (must be consumed): {json.dumps(prompt_phase1_context, sort_keys=True)}",
         ]
     )
 
@@ -1986,8 +2237,12 @@ def _compact_ops_prompt_context(context: dict[str, Any]) -> dict[str, Any]:
             "walkforward_quality_score": calibration.get("walkforward_quality_score"),
             "walkforward_quality_band": calibration.get("walkforward_quality_band"),
             "walkforward_sharpe": calibration.get("walkforward_sharpe"),
+            "walkforward_total_return": calibration.get("walkforward_total_return"),
             "contradiction_detected": calibration.get("contradiction_detected"),
+            "directional_contradiction_detected": calibration.get("directional_contradiction_detected"),
+            "quality_contradiction_detected": calibration.get("quality_contradiction_detected"),
             "contradiction_severity": calibration.get("contradiction_severity"),
+            "cost_pressure_score": calibration.get("cost_pressure_score"),
             "reason_codes": list(calibration.get("reason_codes", []))[:12],
         },
         "self_critique": {
@@ -2157,6 +2412,13 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         timeout_seconds=settings.ollama_timeout_seconds,
     )
     step_records: list[StepExecutionRecord] = []
+    regime_policy_mode = _normalize_regime_policy_mode(config.regime_policy_mode)
+    regime_touchpoints = {
+        "prompting": bool((not config.regime_ablation_mode) and config.regime_touchpoint_prompting_enabled),
+        "calibration": bool((not config.regime_ablation_mode) and config.regime_touchpoint_calibration_enabled),
+        "self_critique": bool((not config.regime_ablation_mode) and config.regime_touchpoint_self_critique_enabled),
+        "risk_gate": bool((not config.regime_ablation_mode) and config.regime_touchpoint_risk_gate_enabled),
+    }
 
     data_quality_path = run_dir / "data_quality_signal.json"
     phase1_feature_context_path = run_dir / "phase1_feature_context.json"
@@ -2276,6 +2538,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             source_data_sha256=source_data_sha256,
             preferred_fast_window=strategy_fast_window,
             preferred_slow_window=strategy_slow_window,
+            regime_prompting_enabled=bool(regime_touchpoints["prompting"]),
             regime_ablation_mode=bool(config.regime_ablation_mode),
         )
         raw_response = ollama.generate(
@@ -2455,6 +2718,37 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     ensemble_reason_codes = sorted(
         set([*weight_reason_codes, *combine_reason_codes, f"ensemble_mode_{ensemble_mode}"])
     )
+    regime_policy_result = _apply_regime_conditional_policy(
+        recommendation=ensemble_recommendation,
+        confidence=ensemble_confidence,
+        regime=llm_strategy_signal.regime,
+        regime_confidence=float(np.clip(llm_strategy_signal.regime_confidence, 0.0, 1.0)),
+        regime_transition=llm_strategy_signal.regime_transition,
+        regime_policy_mode=regime_policy_mode,
+        min_actionable_confidence=float(
+            np.clip(config.regime_policy_min_actionable_confidence, 0.0, 1.0)
+        ),
+        transition_confidence=float(np.clip(config.regime_policy_transition_confidence, 0.0, 1.0)),
+        policy_enabled=bool(regime_touchpoints["prompting"]),
+    )
+    final_recommendation = regime_policy_result["recommendation"]
+    final_confidence = float(np.clip(regime_policy_result["confidence"], 0.0, 1.0))
+    policy_reason_codes = [str(code) for code in list(regime_policy_result.get("reason_codes", []))]
+    strategy_rationale = (
+        f"Ensemble decision ({ensemble_mode}) over arms {selected_arms}. "
+        f"LLM context recommendation was {llm_strategy_signal.recommendation}. "
+        f"{llm_strategy_signal.rationale}"
+    )
+    if regime_policy_result.get("changed"):
+        strategy_rationale = (
+            strategy_rationale
+            + f" Regime policy ({regime_policy_mode}) adjusted final recommendation to `{final_recommendation}`."
+        )
+    regime_diagnostics = dict(llm_strategy_signal.regime_diagnostics)
+    regime_diagnostics["policy_mode"] = regime_policy_mode
+    regime_diagnostics["policy_enabled"] = bool(regime_touchpoints["prompting"])
+    regime_diagnostics["policy_changed_recommendation"] = bool(regime_policy_result.get("changed"))
+    regime_diagnostics["policy_forced_hold"] = bool(regime_policy_result.get("forced_hold"))
     strategy_signal = StrategyProposalSignal(
         contract="strategy_proposal_signal.v1",
         run_id=llm_strategy_signal.run_id,
@@ -2466,25 +2760,22 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         timeframe=llm_strategy_signal.timeframe,
         input_data_path=llm_strategy_signal.input_data_path,
         input_data_sha256=llm_strategy_signal.input_data_sha256,
-        recommendation=ensemble_recommendation,
-        confidence=ensemble_confidence,
+        recommendation=final_recommendation,
+        confidence=final_confidence,
         fast_window=llm_strategy_signal.fast_window,
         slow_window=llm_strategy_signal.slow_window,
-        rationale=(
-            f"Ensemble decision ({ensemble_mode}) over arms {selected_arms}. "
-            f"LLM context recommendation was {llm_strategy_signal.recommendation}. "
-            f"{llm_strategy_signal.rationale}"
-        ),
+        rationale=strategy_rationale,
         raw_model_response=llm_strategy_signal.raw_model_response,
-        warnings=list(llm_strategy_signal.warnings),
+        warnings=list(llm_strategy_signal.warnings)
+        + (["regime_policy_v2_applied"] if regime_policy_result.get("changed") else []),
         indicator_votes=ensemble_action_scores,
         regime=llm_strategy_signal.regime,
         regime_confidence=llm_strategy_signal.regime_confidence,
         regime_transition=llm_strategy_signal.regime_transition,
-        regime_diagnostics=dict(llm_strategy_signal.regime_diagnostics),
+        regime_diagnostics=regime_diagnostics,
         feature_snapshot=dict(llm_strategy_signal.feature_snapshot),
         reason_codes=sorted(
-            set([*llm_strategy_signal.reason_codes, *ensemble_reason_codes])
+            set([*llm_strategy_signal.reason_codes, *ensemble_reason_codes, *policy_reason_codes])
         ),
         arm_votes=arm_votes,
         arm_weights=arm_weights,
@@ -2674,11 +2965,17 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             run_id=run_id,
             strategy_signal=strategy_signal,
             walkforward_evaluation=walkforward_evaluation,
+            backtest_evaluation=backtest_evaluation,
             min_walkforward_sharpe=config.calibration_min_walkforward_sharpe,
             min_regime_confidence=config.thresholds.min_regime_confidence,
             confidence_floor=config.calibration_confidence_floor,
             confidence_ceiling=config.calibration_confidence_ceiling,
+            directional_edge_threshold=config.calibration_directional_edge_threshold,
+            quality_penalty_strength=config.calibration_quality_penalty_strength,
+            directional_contradiction_penalty=config.calibration_directional_contradiction_penalty,
+            cost_pressure_penalty_strength=config.calibration_cost_pressure_penalty_strength,
             regime_ablation_mode=bool(config.regime_ablation_mode),
+            regime_calibration_enabled=bool(regime_touchpoints["calibration"]),
         )
 
     def calibration_fallback(errors: list[str]) -> dict[str, Any]:
@@ -2698,20 +2995,27 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "walkforward_quality_score": walkforward_quality,
             "walkforward_quality_band": walkforward_quality_band,
             "walkforward_sharpe": 0.0,
+            "walkforward_total_return": 0.0,
             "contradiction_detected": False,
+            "directional_contradiction_detected": False,
+            "quality_contradiction_detected": False,
             "contradiction_severity": "none",
             "contradiction_policy": {
                 "required_walkforward_sharpe": config.calibration_min_walkforward_sharpe,
                 "quality_band_sharpe_buffer": _quality_band_sharpe_buffer(walkforward_quality_band),
-                "quality_band_penalty_multiplier": _quality_band_contradiction_penalty(
-                    walkforward_quality_band
-                ),
+                "quality_penalty_strength": config.calibration_quality_penalty_strength,
+                "quality_penalty_multiplier": 1.0,
+                "directional_edge_threshold": config.calibration_directional_edge_threshold,
+                "directional_penalty_multiplier": 1.0,
+                "cost_pressure_penalty_strength": config.calibration_cost_pressure_penalty_strength,
             },
             "phase1_inputs": {
                 "regime": strategy_signal.regime,
                 "regime_confidence": strategy_signal.regime_confidence,
                 "regime_transition": strategy_signal.regime_transition,
                 "regime_diagnostics": strategy_signal.regime_diagnostics,
+                "regime_ablation_mode": bool(config.regime_ablation_mode),
+                "regime_calibration_enabled": bool(regime_touchpoints["calibration"]),
                 "indicator_votes": strategy_signal.indicator_votes,
                 "feature_snapshot": strategy_signal.feature_snapshot,
                 "reason_codes": strategy_signal.reason_codes,
@@ -2721,13 +3025,20 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                 "regime_adjustment": 0.0,
                 "regime_confidence": strategy_signal.regime_confidence,
                 "walkforward_quality": 0.0,
+                "quality_penalty_multiplier": 1.0,
+                "directional_penalty_multiplier": 1.0,
+                "cost_penalty_multiplier": 1.0,
+                "cost_pressure_score": 0.0,
             },
+            "cost_pressure_score": 0.0,
             "reason_codes": ["calibration_fallback", *errors],
             "diagnostics": {
                 "reliability_bins": [],
                 "confidence_deciles": [],
                 "contradiction_counts": {
                     "current_run": 0,
+                    "directional": 0,
+                    "quality": 0,
                     "severity_block": 0,
                     "severity_fail": 0,
                 },
@@ -2755,6 +3066,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             max_findings=max(1, config.self_critique_max_findings),
             timeframe=config.timeframe,
             regime_ablation_mode=bool(config.regime_ablation_mode),
+            regime_self_critique_enabled=bool(regime_touchpoints["self_critique"]),
         )
 
     def self_critique_fallback(errors: list[str]) -> dict[str, Any]:
@@ -2808,13 +3120,25 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         walkforward_quality_band = str(
             confidence_calibration.get("walkforward_quality_band", _walkforward_quality_band(walkforward_quality_score))
         )
-        contradiction_detected = bool(confidence_calibration.get("contradiction_detected", False))
+        directional_contradiction_detected = bool(
+            confidence_calibration.get(
+                "directional_contradiction_detected",
+                confidence_calibration.get("contradiction_detected", False),
+            )
+        )
+        quality_contradiction_detected = bool(
+            confidence_calibration.get("quality_contradiction_detected", False)
+        )
+        contradiction_detected = bool(
+            directional_contradiction_detected or quality_contradiction_detected
+        )
         contradiction_severity = str(confidence_calibration.get("contradiction_severity", "none")).lower()
         contradiction_count = int(
             confidence_calibration.get("diagnostics", {})
             .get("contradiction_counts", {})
             .get("current_run", 0)
         )
+        cost_pressure_score = float(confidence_calibration.get("cost_pressure_score", 0.0))
         regime_confidence = float(np.clip(strategy_signal.regime_confidence, 0.0, 1.0))
         regime_transition = str(strategy_signal.regime_transition or "none")
         self_critique_pass = bool(self_critique_signal.get("pass", False))
@@ -2904,14 +3228,19 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "walkforward_quality_band": walkforward_quality_band,
             "walkforward_sharpe": confidence_calibration.get("walkforward_sharpe"),
             "walkforward_window_count": walkforward_evaluation.get("window_count", 0),
+            "walkforward_total_return": confidence_calibration.get("walkforward_total_return"),
             "contradiction_detected": contradiction_detected,
+            "directional_contradiction_detected": directional_contradiction_detected,
+            "quality_contradiction_detected": quality_contradiction_detected,
             "contradiction_severity": contradiction_severity,
             "contradiction_count": contradiction_count,
+            "cost_pressure_score": cost_pressure_score,
             "phase1_regime": strategy_signal.regime,
             "phase1_regime_confidence": regime_confidence,
             "phase1_regime_transition": regime_transition,
             "phase1_regime_diagnostics": strategy_signal.regime_diagnostics,
             "phase1_regime_ablation_mode": bool(config.regime_ablation_mode),
+            "phase1_regime_touchpoint_risk_gate_enabled": bool(regime_touchpoints["risk_gate"]),
             "phase1_indicator_votes": strategy_signal.indicator_votes,
             "phase1_feature_snapshot": strategy_signal.feature_snapshot,
             "self_critique_pass": self_critique_pass,
@@ -2928,12 +3257,18 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "min_sharpe": config.thresholds.min_sharpe,
             "max_drawdown": config.thresholds.max_drawdown,
             "max_cost_return_drag": config.thresholds.max_cost_return_drag,
+            "max_cost_pressure_score": config.thresholds.max_cost_pressure_score,
             "min_signal_confidence": config.thresholds.min_signal_confidence,
             "min_walkforward_sharpe": config.calibration_min_walkforward_sharpe,
             "max_contradictions": float(config.calibration_max_contradictions),
             "min_walkforward_quality_score": config.thresholds.min_walkforward_quality_score,
             "min_regime_confidence": config.thresholds.min_regime_confidence,
             "regime_ablation_mode": bool(config.regime_ablation_mode),
+            "regime_policy_mode": regime_policy_mode,
+            "regime_touchpoint_prompting_enabled": bool(regime_touchpoints["prompting"]),
+            "regime_touchpoint_calibration_enabled": bool(regime_touchpoints["calibration"]),
+            "regime_touchpoint_self_critique_enabled": bool(regime_touchpoints["self_critique"]),
+            "regime_touchpoint_risk_gate_enabled": bool(regime_touchpoints["risk_gate"]),
             "walkforward_quality_low_cutoff": 0.40,
             "walkforward_quality_medium_cutoff": 0.55,
             "walkforward_quality_high_cutoff": 0.70,
@@ -3094,12 +3429,15 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         )
 
         if actionable:
-            if config.regime_ablation_mode:
+            if (not regime_touchpoints["risk_gate"]) or config.regime_ablation_mode:
                 decision_trace.append(
                     {
                         "gate": "regime",
                         "metric": "ablation_mode",
-                        "observed": True,
+                        "observed": {
+                            "regime_ablation_mode": bool(config.regime_ablation_mode),
+                            "touchpoint_enabled": bool(regime_touchpoints["risk_gate"]),
+                        },
                         "threshold": "regime checks disabled",
                         "pass": True,
                         "severity": "advisory",
@@ -3151,27 +3489,50 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                 failure_detail="Walk-forward quality score fell below the actionable minimum threshold.",
             )
 
-            contradiction_failure_reason = (
-                f"risk_fail_{action}_walkforward_contradiction_{walkforward_quality_band}"
+            quality_failure_reason = (
+                f"risk_fail_{action}_walkforward_quality_contradiction_{walkforward_quality_band}"
                 if contradiction_severity == "fail"
-                else f"risk_block_{action}_walkforward_contradiction_{walkforward_quality_band}"
+                else f"risk_block_{action}_walkforward_quality_contradiction_{walkforward_quality_band}"
+            )
+            quality_failure_severity: Literal["block", "fail"] = (
+                "fail" if contradiction_severity == "fail" else "block"
+            )
+            trace_check(
+                gate="calibration",
+                metric="walkforward_quality_contradiction",
+                observed_value={
+                    "quality_contradiction_detected": quality_contradiction_detected,
+                    "contradiction_severity": contradiction_severity,
+                },
+                threshold={"quality_contradiction_detected": False},
+                passed=not quality_contradiction_detected,
+                failure_reason_code=quality_failure_reason,
+                failure_severity=quality_failure_severity,
+                failure_detail=(
+                    "Confidence calibration quality penalties indicate weak walk-forward evidence."
+                ),
+            )
+            contradiction_failure_reason = (
+                f"risk_fail_{action}_walkforward_directional_contradiction_{walkforward_quality_band}"
+                if contradiction_severity == "fail"
+                else f"risk_block_{action}_walkforward_directional_contradiction_{walkforward_quality_band}"
             )
             contradiction_failure_severity: Literal["block", "fail"] = (
                 "fail" if contradiction_severity == "fail" else "block"
             )
             trace_check(
                 gate="calibration",
-                metric="walkforward_contradiction",
+                metric="walkforward_directional_contradiction",
                 observed_value={
-                    "contradiction_detected": contradiction_detected,
+                    "directional_contradiction_detected": directional_contradiction_detected,
                     "contradiction_severity": contradiction_severity,
                 },
-                threshold={"contradiction_detected": False},
-                passed=not contradiction_detected,
+                threshold={"directional_contradiction_detected": False},
+                passed=not directional_contradiction_detected,
                 failure_reason_code=contradiction_failure_reason,
                 failure_severity=contradiction_failure_severity,
                 failure_detail=(
-                    "Confidence calibration detected an actionable contradiction against walk-forward evidence."
+                    "Confidence calibration detected an actionable directional contradiction."
                 ),
             )
 
@@ -3199,6 +3560,16 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             failure_reason_code="confidence_downgraded_by_calibration",
             failure_severity="block",
             failure_detail="Calibration downgraded confidence below executable threshold.",
+        )
+        trace_check(
+            gate="calibration",
+            metric="cost_pressure_score",
+            observed_value=cost_pressure_score,
+            threshold=f"<= {config.thresholds.max_cost_pressure_score}",
+            passed=cost_pressure_score <= config.thresholds.max_cost_pressure_score,
+            failure_reason_code="cost_pressure_score_above_threshold",
+            failure_severity="block",
+            failure_detail="Estimated cost pressure exceeds configured risk tolerance.",
         )
         trace_check(
             gate="calibration",
@@ -3266,23 +3637,37 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             )
 
         for reason_code in calibration_reason_codes:
+            normalized_reason = reason_code.strip().lower()
+            is_directional = "directional_contradiction" in normalized_reason
+            is_cost = normalized_reason.startswith("cost_pressure")
+            is_regime_gate_reason = (
+                normalized_reason == "regime_confidence_below_threshold"
+                and bool(regime_touchpoints["calibration"])
+            )
+            should_gate = bool(
+                is_directional
+                or is_cost
+                or is_regime_gate_reason
+                or normalized_reason == "calibration_fallback"
+            )
             severity: Literal["block", "fail"] = (
-                "fail" if "very_low" in reason_code or "contradiction_fail" in reason_code else "block"
+                "fail" if ("very_low" in normalized_reason and is_directional) else "block"
             )
-            register_reason(
-                reason_code=reason_code,
-                severity=severity,
-                detail=f"Confidence calibration propagated reason code `{reason_code}`.",
-            )
+            if should_gate:
+                register_reason(
+                    reason_code=reason_code,
+                    severity=severity,
+                    detail=f"Confidence calibration propagated reason code `{reason_code}`.",
+                )
             decision_trace.append(
                 {
                     "gate": "calibration_reason",
                     "metric": reason_code,
                     "observed": severity,
                     "threshold": "none",
-                    "pass": False,
-                    "severity": severity,
-                    "reason_code": reason_code,
+                    "pass": not should_gate,
+                    "severity": severity if should_gate else "advisory",
+                    "reason_code": reason_code if should_gate else None,
                 }
             )
         for reason_code in ensemble_reason_codes:
@@ -3633,10 +4018,25 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "calibration_confidence_floor": config.calibration_confidence_floor,
             "calibration_confidence_ceiling": config.calibration_confidence_ceiling,
             "calibration_max_contradictions": config.calibration_max_contradictions,
+            "calibration_directional_edge_threshold": config.calibration_directional_edge_threshold,
+            "calibration_quality_penalty_strength": config.calibration_quality_penalty_strength,
+            "calibration_directional_contradiction_penalty": config.calibration_directional_contradiction_penalty,
+            "calibration_cost_pressure_penalty_strength": config.calibration_cost_pressure_penalty_strength,
             "self_critique_min_score": config.self_critique_min_score,
             "self_critique_max_findings": config.self_critique_max_findings,
             "ops_report_verbosity": _normalize_report_verbosity(config.ops_report_verbosity),
             "regime_detector_mode": str(config.regime_detector_mode).strip().lower(),
+            "regime_policy_mode": regime_policy_mode,
+            "regime_policy_min_actionable_confidence": float(
+                np.clip(config.regime_policy_min_actionable_confidence, 0.0, 1.0)
+            ),
+            "regime_policy_transition_confidence": float(
+                np.clip(config.regime_policy_transition_confidence, 0.0, 1.0)
+            ),
+            "regime_touchpoint_prompting_enabled": bool(regime_touchpoints["prompting"]),
+            "regime_touchpoint_calibration_enabled": bool(regime_touchpoints["calibration"]),
+            "regime_touchpoint_self_critique_enabled": bool(regime_touchpoints["self_critique"]),
+            "regime_touchpoint_risk_gate_enabled": bool(regime_touchpoints["risk_gate"]),
             "regime_volatility_threshold": max(0.0001, float(config.regime_volatility_threshold)),
             "regime_trend_spread_threshold": max(
                 0.0001,
@@ -3696,7 +4096,17 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "phase1_regime_confidence": strategy_signal.regime_confidence,
             "phase1_regime_transition": strategy_signal.regime_transition,
             "phase1_regime_ablation_mode": bool(config.regime_ablation_mode),
+            "regime_policy_mode": regime_policy_mode,
+            "regime_touchpoints": dict(regime_touchpoints),
             "walkforward_quality_score": confidence_calibration.get("walkforward_quality_score"),
+            "walkforward_total_return": confidence_calibration.get("walkforward_total_return"),
+            "directional_contradiction_detected": confidence_calibration.get(
+                "directional_contradiction_detected"
+            ),
+            "quality_contradiction_detected": confidence_calibration.get(
+                "quality_contradiction_detected"
+            ),
+            "cost_pressure_score": confidence_calibration.get("cost_pressure_score"),
             "self_critique_score": self_critique_signal.get("score"),
             "self_critique_pass": self_critique_signal.get("pass"),
             "decision_trace_entries": len(risk_decision.decision_trace),

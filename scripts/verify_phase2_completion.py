@@ -116,6 +116,8 @@ def _run_phase2_suite() -> tuple[list[dict[str, Any]], list[str]]:
             "sharpe": 0.18,
             "expect_approved": True,
             "expect_contradiction": False,
+            "expect_directional_contradiction": False,
+            "expect_quality_contradiction": False,
             "required_reason": None,
         },
         {
@@ -124,7 +126,9 @@ def _run_phase2_suite() -> tuple[list[dict[str, Any]], list[str]]:
             "sharpe": 0.03,
             "expect_approved": False,
             "expect_contradiction": True,
-            "required_reason": "risk_block_buy_walkforward_contradiction_high",
+            "expect_directional_contradiction": False,
+            "expect_quality_contradiction": True,
+            "required_reason": "risk_block_buy_walkforward_quality_contradiction_high",
         },
     ]
 
@@ -206,8 +210,15 @@ def _run_phase2_suite() -> tuple[list[dict[str, Any]], list[str]]:
                     "approved": bool(risk_a.get("approved", False)),
                     "quality_band": str(calibration_a.get("walkforward_quality_band")),
                     "contradiction": bool(calibration_a.get("contradiction_detected", False)),
+                    "directional_contradiction": bool(
+                        calibration_a.get("directional_contradiction_detected", False)
+                    ),
+                    "quality_contradiction": bool(
+                        calibration_a.get("quality_contradiction_detected", False)
+                    ),
                     "contradiction_severity": str(calibration_a.get("contradiction_severity")),
                     "calibrated_confidence": calibration_a.get("calibrated_confidence"),
+                    "cost_pressure_score": calibration_a.get("cost_pressure_score"),
                     "risk_reason_codes": list(risk_a.get("reason_codes", [])),
                 }
                 results.append(observed)
@@ -220,6 +231,14 @@ def _run_phase2_suite() -> tuple[list[dict[str, Any]], list[str]]:
                     failures.append(
                         f"{scenario['name']}: expected contradiction={scenario['expect_contradiction']} got {observed['contradiction']}"
                     )
+                if observed["directional_contradiction"] != scenario["expect_directional_contradiction"]:
+                    failures.append(
+                        f"{scenario['name']}: expected directional_contradiction={scenario['expect_directional_contradiction']} got {observed['directional_contradiction']}"
+                    )
+                if observed["quality_contradiction"] != scenario["expect_quality_contradiction"]:
+                    failures.append(
+                        f"{scenario['name']}: expected quality_contradiction={scenario['expect_quality_contradiction']} got {observed['quality_contradiction']}"
+                    )
                 required_reason = scenario["required_reason"]
                 if required_reason and required_reason not in observed["risk_reason_codes"]:
                     failures.append(
@@ -230,6 +249,9 @@ def _run_phase2_suite() -> tuple[list[dict[str, Any]], list[str]]:
                     "calibrated_confidence",
                     "walkforward_quality_score",
                     "walkforward_sharpe",
+                    "directional_contradiction_detected",
+                    "quality_contradiction_detected",
+                    "cost_pressure_score",
                     "diagnostics",
                     "reason_codes",
                 ):

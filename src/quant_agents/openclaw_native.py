@@ -84,6 +84,13 @@ class OpenClawOrchestrationRequest:
     step_retries: int
     minimum_bars: int
     regime_detector_mode: str
+    regime_policy_mode: str
+    regime_policy_min_actionable_confidence: float
+    regime_policy_transition_confidence: float
+    regime_touchpoint_prompting_enabled: bool
+    regime_touchpoint_calibration_enabled: bool
+    regime_touchpoint_self_critique_enabled: bool
+    regime_touchpoint_risk_gate_enabled: bool
     regime_volatility_threshold: float
     regime_trend_spread_threshold: float
     regime_persistence_bars: int
@@ -92,6 +99,7 @@ class OpenClawOrchestrationRequest:
     min_sharpe: float
     max_drawdown: float
     max_cost_return_drag: float
+    max_cost_pressure_score: float
     min_signal_confidence: float
     min_walkforward_quality_score: float
     min_regime_confidence: float
@@ -107,6 +115,10 @@ class OpenClawOrchestrationRequest:
     calibration_confidence_floor: float
     calibration_confidence_ceiling: float
     calibration_max_contradictions: int
+    calibration_directional_edge_threshold: float
+    calibration_quality_penalty_strength: float
+    calibration_directional_contradiction_penalty: float
+    calibration_cost_pressure_penalty_strength: float
     self_critique_min_score: float
     self_critique_max_findings: int
     ops_report_verbosity: str
@@ -134,6 +146,49 @@ class OpenClawOrchestrationRequest:
             regime_detector_mode=str(
                 payload.get("regime_detector_mode", settings.regime_detector_mode)
             ).strip().lower(),
+            regime_policy_mode=str(
+                payload.get("regime_policy_mode", settings.regime_policy_mode)
+            ).strip().lower(),
+            regime_policy_min_actionable_confidence=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "regime_policy_min_actionable_confidence",
+                            settings.regime_policy_min_actionable_confidence,
+                        )
+                    ),
+                ),
+            ),
+            regime_policy_transition_confidence=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "regime_policy_transition_confidence",
+                            settings.regime_policy_transition_confidence,
+                        )
+                    ),
+                ),
+            ),
+            regime_touchpoint_prompting_enabled=_coerce_bool(
+                payload.get("regime_touchpoint_prompting_enabled"),
+                default=bool(settings.regime_touchpoint_prompting_enabled),
+            ),
+            regime_touchpoint_calibration_enabled=_coerce_bool(
+                payload.get("regime_touchpoint_calibration_enabled"),
+                default=bool(settings.regime_touchpoint_calibration_enabled),
+            ),
+            regime_touchpoint_self_critique_enabled=_coerce_bool(
+                payload.get("regime_touchpoint_self_critique_enabled"),
+                default=bool(settings.regime_touchpoint_self_critique_enabled),
+            ),
+            regime_touchpoint_risk_gate_enabled=_coerce_bool(
+                payload.get("regime_touchpoint_risk_gate_enabled"),
+                default=bool(settings.regime_touchpoint_risk_gate_enabled),
+            ),
             regime_volatility_threshold=max(
                 0.0001,
                 float(
@@ -170,6 +225,10 @@ class OpenClawOrchestrationRequest:
             max_drawdown=float(payload.get("max_drawdown", settings.risk_max_drawdown)),
             max_cost_return_drag=float(
                 payload.get("max_cost_return_drag", settings.risk_max_cost_return_drag)
+            ),
+            max_cost_pressure_score=max(
+                0.0,
+                float(payload.get("max_cost_pressure_score", settings.risk_max_cost_pressure_score)),
             ),
             min_signal_confidence=float(
                 payload.get("min_signal_confidence", settings.risk_min_signal_confidence)
@@ -231,6 +290,48 @@ class OpenClawOrchestrationRequest:
                         "calibration_max_contradictions",
                         settings.calibration_max_contradictions,
                     )
+                ),
+            ),
+            calibration_directional_edge_threshold=float(
+                payload.get(
+                    "calibration_directional_edge_threshold",
+                    settings.calibration_directional_edge_threshold,
+                )
+            ),
+            calibration_quality_penalty_strength=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "calibration_quality_penalty_strength",
+                            settings.calibration_quality_penalty_strength,
+                        )
+                    ),
+                ),
+            ),
+            calibration_directional_contradiction_penalty=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "calibration_directional_contradiction_penalty",
+                            settings.calibration_directional_contradiction_penalty,
+                        )
+                    ),
+                ),
+            ),
+            calibration_cost_pressure_penalty_strength=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "calibration_cost_pressure_penalty_strength",
+                            settings.calibration_cost_pressure_penalty_strength,
+                        )
+                    ),
                 ),
             ),
             ensemble_turnover_penalty_bps=max(
@@ -296,6 +397,7 @@ class OpenClawOrchestrationRequest:
             max_drawdown=self.max_drawdown,
             max_cost_return_drag=self.max_cost_return_drag,
             min_signal_confidence=self.min_signal_confidence,
+            max_cost_pressure_score=max(0.0, float(self.max_cost_pressure_score)),
             min_walkforward_quality_score=max(0.0, min(1.0, float(self.min_walkforward_quality_score))),
             min_regime_confidence=max(0.0, min(1.0, float(self.min_regime_confidence))),
         )
@@ -319,6 +421,23 @@ class OpenClawOrchestrationRequest:
             regime_detector_mode=(
                 self.regime_detector_mode if self.regime_detector_mode in {"heuristic", "score"} else "score"
             ),
+            regime_policy_mode=(
+                self.regime_policy_mode
+                if self.regime_policy_mode in {"legacy", "conditional_v2"}
+                else "legacy"
+            ),
+            regime_policy_min_actionable_confidence=max(
+                0.0,
+                min(1.0, float(self.regime_policy_min_actionable_confidence)),
+            ),
+            regime_policy_transition_confidence=max(
+                0.0,
+                min(1.0, float(self.regime_policy_transition_confidence)),
+            ),
+            regime_touchpoint_prompting_enabled=bool(self.regime_touchpoint_prompting_enabled),
+            regime_touchpoint_calibration_enabled=bool(self.regime_touchpoint_calibration_enabled),
+            regime_touchpoint_self_critique_enabled=bool(self.regime_touchpoint_self_critique_enabled),
+            regime_touchpoint_risk_gate_enabled=bool(self.regime_touchpoint_risk_gate_enabled),
             regime_volatility_threshold=max(0.0001, float(self.regime_volatility_threshold)),
             regime_trend_spread_threshold=max(0.0001, float(self.regime_trend_spread_threshold)),
             regime_persistence_bars=max(1, int(self.regime_persistence_bars)),
@@ -331,6 +450,19 @@ class OpenClawOrchestrationRequest:
             calibration_confidence_floor=self.calibration_confidence_floor,
             calibration_confidence_ceiling=self.calibration_confidence_ceiling,
             calibration_max_contradictions=self.calibration_max_contradictions,
+            calibration_directional_edge_threshold=float(self.calibration_directional_edge_threshold),
+            calibration_quality_penalty_strength=max(
+                0.0,
+                min(1.0, float(self.calibration_quality_penalty_strength)),
+            ),
+            calibration_directional_contradiction_penalty=max(
+                0.0,
+                min(1.0, float(self.calibration_directional_contradiction_penalty)),
+            ),
+            calibration_cost_pressure_penalty_strength=max(
+                0.0,
+                min(1.0, float(self.calibration_cost_pressure_penalty_strength)),
+            ),
             self_critique_min_score=self.self_critique_min_score,
             self_critique_max_findings=self.self_critique_max_findings,
             ops_report_verbosity=self.ops_report_verbosity,
@@ -753,6 +885,15 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             config_has_ensemble_arms = "ensemble_enabled_arms" in manifest_config
             config_has_ensemble_decay = "ensemble_decay_horizon" in manifest_config
             config_has_ensemble_exploration = "ensemble_exploration_weight" in manifest_config
+            config_has_regime_policy_mode = "regime_policy_mode" in manifest_config
+            config_has_regime_touchpoint_prompting = "regime_touchpoint_prompting_enabled" in manifest_config
+            config_has_regime_touchpoint_calibration = "regime_touchpoint_calibration_enabled" in manifest_config
+            config_has_regime_touchpoint_self_critique = "regime_touchpoint_self_critique_enabled" in manifest_config
+            config_has_regime_touchpoint_risk = "regime_touchpoint_risk_gate_enabled" in manifest_config
+            config_has_calibration_directional_edge = "calibration_directional_edge_threshold" in manifest_config
+            config_has_calibration_quality_strength = "calibration_quality_penalty_strength" in manifest_config
+            config_has_calibration_directional_penalty = "calibration_directional_contradiction_penalty" in manifest_config
+            config_has_calibration_cost_penalty = "calibration_cost_pressure_penalty_strength" in manifest_config
             checks["manifest:config_self_critique_min_score_present"] = config_has_min_score
             checks["manifest:config_self_critique_max_findings_present"] = config_has_max_findings
             checks["manifest:config_ops_report_verbosity_present"] = config_has_report_verbosity
@@ -760,6 +901,15 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             checks["manifest:config_ensemble_arms_present"] = config_has_ensemble_arms
             checks["manifest:config_ensemble_decay_present"] = config_has_ensemble_decay
             checks["manifest:config_ensemble_exploration_present"] = config_has_ensemble_exploration
+            checks["manifest:config_regime_policy_mode_present"] = config_has_regime_policy_mode
+            checks["manifest:config_regime_touchpoint_prompting_present"] = config_has_regime_touchpoint_prompting
+            checks["manifest:config_regime_touchpoint_calibration_present"] = config_has_regime_touchpoint_calibration
+            checks["manifest:config_regime_touchpoint_self_critique_present"] = config_has_regime_touchpoint_self_critique
+            checks["manifest:config_regime_touchpoint_risk_present"] = config_has_regime_touchpoint_risk
+            checks["manifest:config_calibration_directional_edge_present"] = config_has_calibration_directional_edge
+            checks["manifest:config_calibration_quality_strength_present"] = config_has_calibration_quality_strength
+            checks["manifest:config_calibration_directional_penalty_present"] = config_has_calibration_directional_penalty
+            checks["manifest:config_calibration_cost_penalty_present"] = config_has_calibration_cost_penalty
             if not config_has_min_score:
                 errors.append("manifest_config_self_critique_min_score_missing")
             if not config_has_max_findings:
@@ -774,6 +924,24 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_config_ensemble_decay_missing")
             if not config_has_ensemble_exploration:
                 errors.append("manifest_config_ensemble_exploration_missing")
+            if not config_has_regime_policy_mode:
+                errors.append("manifest_config_regime_policy_mode_missing")
+            if not config_has_regime_touchpoint_prompting:
+                errors.append("manifest_config_regime_touchpoint_prompting_missing")
+            if not config_has_regime_touchpoint_calibration:
+                errors.append("manifest_config_regime_touchpoint_calibration_missing")
+            if not config_has_regime_touchpoint_self_critique:
+                errors.append("manifest_config_regime_touchpoint_self_critique_missing")
+            if not config_has_regime_touchpoint_risk:
+                errors.append("manifest_config_regime_touchpoint_risk_missing")
+            if not config_has_calibration_directional_edge:
+                errors.append("manifest_config_calibration_directional_edge_missing")
+            if not config_has_calibration_quality_strength:
+                errors.append("manifest_config_calibration_quality_strength_missing")
+            if not config_has_calibration_directional_penalty:
+                errors.append("manifest_config_calibration_directional_penalty_missing")
+            if not config_has_calibration_cost_penalty:
+                errors.append("manifest_config_calibration_cost_penalty_missing")
         else:
             checks["manifest:config_present"] = False
             errors.append("manifest_config_missing")
@@ -789,6 +957,19 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 list(outcome.get("selected_arms") or [])
             ) > 0
             manifest_ensemble_reasons_present = isinstance(outcome.get("ensemble_reason_codes"), list)
+            manifest_touchpoints_present = isinstance(outcome.get("regime_touchpoints"), dict)
+            manifest_cost_pressure_present = isinstance(
+                outcome.get("cost_pressure_score"),
+                (int, float),
+            )
+            manifest_directional_contradiction_present = isinstance(
+                outcome.get("directional_contradiction_detected"),
+                bool,
+            )
+            manifest_quality_contradiction_present = isinstance(
+                outcome.get("quality_contradiction_detected"),
+                bool,
+            )
             try:
                 manifest_decision_trace_entries = int(outcome.get("decision_trace_entries", 0))
             except (TypeError, ValueError):
@@ -801,6 +982,12 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             checks["manifest:decision_trace_entries_positive"] = manifest_decision_trace_entries > 0
             checks["manifest:selected_arms_present"] = manifest_selected_arms_present
             checks["manifest:ensemble_reason_codes_present"] = manifest_ensemble_reasons_present
+            checks["manifest:regime_touchpoints_present"] = manifest_touchpoints_present
+            checks["manifest:cost_pressure_present"] = manifest_cost_pressure_present
+            checks["manifest:directional_contradiction_present"] = (
+                manifest_directional_contradiction_present
+            )
+            checks["manifest:quality_contradiction_present"] = manifest_quality_contradiction_present
             if not manifest_gate_pass:
                 errors.append("manifest_gate_not_pass")
             if not manifest_risk_approved:
@@ -817,6 +1004,14 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_selected_arms_missing")
             if not manifest_ensemble_reasons_present:
                 errors.append("manifest_ensemble_reason_codes_invalid")
+            if not manifest_touchpoints_present:
+                errors.append("manifest_regime_touchpoints_missing")
+            if not manifest_cost_pressure_present:
+                errors.append("manifest_cost_pressure_missing")
+            if not manifest_directional_contradiction_present:
+                errors.append("manifest_directional_contradiction_missing")
+            if not manifest_quality_contradiction_present:
+                errors.append("manifest_quality_contradiction_missing")
         else:
             checks["manifest:outcome_present"] = False
             errors.append("manifest_outcome_missing")

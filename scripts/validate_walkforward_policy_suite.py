@@ -107,6 +107,8 @@ def _run_suite() -> tuple[list[dict[str, Any]], list[str]]:
             "expect_band": "high",
             "expect_approved": True,
             "expect_contradiction": False,
+            "expect_directional_contradiction": False,
+            "expect_quality_contradiction": False,
             "required_reason": None,
         },
         {
@@ -116,7 +118,9 @@ def _run_suite() -> tuple[list[dict[str, Any]], list[str]]:
             "expect_band": "high",
             "expect_approved": False,
             "expect_contradiction": True,
-            "required_reason": "risk_block_buy_walkforward_contradiction_high",
+            "expect_directional_contradiction": False,
+            "expect_quality_contradiction": True,
+            "required_reason": "risk_block_buy_walkforward_quality_contradiction_high",
         },
         {
             "name": "medium_sharpe_contradiction_block",
@@ -125,7 +129,9 @@ def _run_suite() -> tuple[list[dict[str, Any]], list[str]]:
             "expect_band": "medium",
             "expect_approved": False,
             "expect_contradiction": True,
-            "required_reason": "risk_block_buy_walkforward_contradiction_medium",
+            "expect_directional_contradiction": False,
+            "expect_quality_contradiction": True,
+            "required_reason": "risk_block_buy_walkforward_quality_contradiction_medium",
         },
         {
             "name": "low_quality_block",
@@ -134,6 +140,8 @@ def _run_suite() -> tuple[list[dict[str, Any]], list[str]]:
             "expect_band": "low",
             "expect_approved": False,
             "expect_contradiction": False,
+            "expect_directional_contradiction": False,
+            "expect_quality_contradiction": False,
             "required_reason": "risk_block_buy_walkforward_quality_low",
         },
         {
@@ -143,6 +151,8 @@ def _run_suite() -> tuple[list[dict[str, Any]], list[str]]:
             "expect_band": "very_low",
             "expect_approved": False,
             "expect_contradiction": True,
+            "expect_directional_contradiction": False,
+            "expect_quality_contradiction": True,
             "required_reason": "risk_fail_buy_walkforward_quality_very_low",
         },
     ]
@@ -220,7 +230,14 @@ def _run_suite() -> tuple[list[dict[str, Any]], list[str]]:
                     "approved": bool(risk.get("approved", False)),
                     "quality_band": str(calibration.get("walkforward_quality_band")),
                     "contradiction": bool(calibration.get("contradiction_detected", False)),
+                    "directional_contradiction": bool(
+                        calibration.get("directional_contradiction_detected", False)
+                    ),
+                    "quality_contradiction": bool(
+                        calibration.get("quality_contradiction_detected", False)
+                    ),
                     "contradiction_severity": str(calibration.get("contradiction_severity")),
+                    "cost_pressure_score": calibration.get("cost_pressure_score"),
                     "reason_codes": list(risk.get("reason_codes", [])),
                 }
                 results.append(observed)
@@ -237,11 +254,21 @@ def _run_suite() -> tuple[list[dict[str, Any]], list[str]]:
                     failures.append(
                         f"{scenario['name']}: expected contradiction={scenario['expect_contradiction']} got {observed['contradiction']}"
                     )
+                if observed["directional_contradiction"] != scenario["expect_directional_contradiction"]:
+                    failures.append(
+                        f"{scenario['name']}: expected directional_contradiction={scenario['expect_directional_contradiction']} got {observed['directional_contradiction']}"
+                    )
+                if observed["quality_contradiction"] != scenario["expect_quality_contradiction"]:
+                    failures.append(
+                        f"{scenario['name']}: expected quality_contradiction={scenario['expect_quality_contradiction']} got {observed['quality_contradiction']}"
+                    )
                 required_reason = scenario["required_reason"]
                 if required_reason and required_reason not in observed["reason_codes"]:
                     failures.append(
                         f"{scenario['name']}: missing reason code {required_reason}; got {observed['reason_codes']}"
                     )
+                if calibration.get("cost_pressure_score") is None:
+                    failures.append(f"{scenario['name']}: missing calibration cost_pressure_score")
     finally:
         agent_plane.OllamaClient = original_ollama_client
         agent_plane._run_walkforward_evaluation = original_walkforward_runner

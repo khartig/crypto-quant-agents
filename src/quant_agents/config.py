@@ -32,6 +32,13 @@ class Settings:
     agent_step_retries: int
     agent_minimum_bars: int
     regime_detector_mode: str
+    regime_policy_mode: str
+    regime_policy_min_actionable_confidence: float
+    regime_policy_transition_confidence: float
+    regime_touchpoint_prompting_enabled: bool
+    regime_touchpoint_calibration_enabled: bool
+    regime_touchpoint_self_critique_enabled: bool
+    regime_touchpoint_risk_gate_enabled: bool
     regime_volatility_threshold: float
     regime_trend_spread_threshold: float
     regime_persistence_bars: int
@@ -40,6 +47,7 @@ class Settings:
     risk_min_sharpe: float
     risk_max_drawdown: float
     risk_max_cost_return_drag: float
+    risk_max_cost_pressure_score: float
     risk_min_signal_confidence: float
     risk_min_walkforward_quality_score: float
     risk_min_regime_confidence: float
@@ -55,6 +63,10 @@ class Settings:
     calibration_confidence_floor: float
     calibration_confidence_ceiling: float
     calibration_max_contradictions: int
+    calibration_directional_edge_threshold: float
+    calibration_quality_penalty_strength: float
+    calibration_directional_contradiction_penalty: float
+    calibration_cost_pressure_penalty_strength: float
     self_critique_min_score: float
     self_critique_max_findings: int
     ops_report_verbosity: str
@@ -126,6 +138,14 @@ def _as_regime_mode(value: str | None, default: str = "score") -> str:
         return normalized
     return default
 
+def _as_regime_policy_mode(value: str | None, default: str = "legacy") -> str:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"legacy", "conditional_v2"}:
+        return normalized
+    return default
+
 
 def _as_csv_tuple(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
     if value is None:
@@ -165,6 +185,46 @@ def load_settings() -> Settings:
             os.getenv("REGIME_DETECTOR_MODE"),
             default="score",
         ),
+        regime_policy_mode=_as_regime_policy_mode(
+            os.getenv("REGIME_POLICY_MODE"),
+            default="legacy",
+        ),
+        regime_policy_min_actionable_confidence=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("REGIME_POLICY_MIN_ACTIONABLE_CONFIDENCE"),
+                    default=0.50,
+                ),
+            ),
+        ),
+        regime_policy_transition_confidence=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("REGIME_POLICY_TRANSITION_CONFIDENCE"),
+                    default=0.65,
+                ),
+            ),
+        ),
+        regime_touchpoint_prompting_enabled=_as_bool(
+            os.getenv("REGIME_TOUCHPOINT_PROMPTING_ENABLED"),
+            default=True,
+        ),
+        regime_touchpoint_calibration_enabled=_as_bool(
+            os.getenv("REGIME_TOUCHPOINT_CALIBRATION_ENABLED"),
+            default=True,
+        ),
+        regime_touchpoint_self_critique_enabled=_as_bool(
+            os.getenv("REGIME_TOUCHPOINT_SELF_CRITIQUE_ENABLED"),
+            default=True,
+        ),
+        regime_touchpoint_risk_gate_enabled=_as_bool(
+            os.getenv("REGIME_TOUCHPOINT_RISK_GATE_ENABLED"),
+            default=True,
+        ),
         regime_volatility_threshold=max(
             0.0001,
             _as_float(os.getenv("REGIME_VOLATILITY_THRESHOLD"), default=0.03),
@@ -186,7 +246,11 @@ def load_settings() -> Settings:
         risk_max_drawdown=_as_float(os.getenv("RISK_MAX_DRAWDOWN"), default=-0.20),
         risk_max_cost_return_drag=max(
             0.0,
-            _as_float(os.getenv("RISK_MAX_COST_RETURN_DRAG"), default=0.06),
+            _as_float(os.getenv("RISK_MAX_COST_RETURN_DRAG"), default=0.05),
+        ),
+        risk_max_cost_pressure_score=max(
+            0.0,
+            _as_float(os.getenv("RISK_MAX_COST_PRESSURE_SCORE"), default=0.95),
         ),
         risk_min_signal_confidence=_as_float(os.getenv("RISK_MIN_SIGNAL_CONFIDENCE"), default=0.55),
         risk_min_walkforward_quality_score=min(
@@ -256,6 +320,40 @@ def load_settings() -> Settings:
         calibration_max_contradictions=max(
             0,
             _as_int(os.getenv("CALIBRATION_MAX_CONTRADICTIONS"), default=0),
+        ),
+        calibration_directional_edge_threshold=_as_float(
+            os.getenv("CALIBRATION_DIRECTIONAL_EDGE_THRESHOLD"),
+            default=0.0,
+        ),
+        calibration_quality_penalty_strength=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("CALIBRATION_QUALITY_PENALTY_STRENGTH"),
+                    default=0.25,
+                ),
+            ),
+        ),
+        calibration_directional_contradiction_penalty=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("CALIBRATION_DIRECTIONAL_CONTRADICTION_PENALTY"),
+                    default=0.35,
+                ),
+            ),
+        ),
+        calibration_cost_pressure_penalty_strength=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("CALIBRATION_COST_PRESSURE_PENALTY_STRENGTH"),
+                    default=0.30,
+                ),
+            ),
         ),
         self_critique_min_score=min(
             1.0,

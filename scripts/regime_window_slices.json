@@ -1,0 +1,38 @@
+{
+  "contract": "regime_window_config.v1",
+  "name": "canonical_btc_usdt_regime_slices",
+  "description": "Canonical regime windows used by the Priority 0 decision-gate benchmark. Keep this file versioned and stable across experiments.",
+  "minimum_bars": 120,
+  "windows": [
+    {
+      "name": "uptrend_2025q2",
+      "start_utc": "2025-04-01T00:00:00Z",
+      "end_utc": "2025-08-01T00:00:00Z",
+      "priority": true
+    },
+    {
+      "name": "flat_2025nov_to_2026jan",
+      "start_utc": "2025-11-01T00:00:00Z",
+      "end_utc": "2026-02-01T00:00:00Z",
+      "priority": true
+    },
+    {
+      "name": "drawdown_2026latejan_to_mar",
+      "start_utc": "2026-01-25T00:00:00Z",
+      "end_utc": "2026-04-01T00:00:00Z",
+      "priority": true
+    },
+    {
+      "name": "rebound_2026apr",
+      "start_utc": "2026-04-01T00:00:00Z",
+      "end_utc": "2026-05-01T00:00:00Z",
+      "priority": true
+    },
+    {
+      "name": "decline_2026may_to_2026jun12",
+      "start_utc": "2026-05-01T00:00:00Z",
+      "end_utc": "2026-06-12T00:00:00Z",
+      "priority": true
+    }
+  ]
+}

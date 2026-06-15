@@ -1,0 +1,27 @@
+{
+  "contract": "regime_benchmark_baseline.v1",
+  "accepted_at_utc": "2026-06-12T22:12:14Z",
+  "benchmark_id": "regime-window-20260612T221214Z",
+  "source_summary_path": "/mnt/quant-data/logs/analysis/regime-window-evals/2026-06-12/20260612T221214Z/summary.json",
+  "notes": "Baseline captured after true regime ablation comparison across available canonical windows.",
+  "profile_metrics": {
+    "regime_enabled": {
+      "approval_rate": 0.0,
+      "contradiction_rate": 0.0,
+      "mean_net_total_return": -0.0741,
+      "mean_sharpe": 0.0,
+      "mean_max_drawdown": -0.1099,
+      "mean_total_cost_return_drag": 0.0706,
+      "reason_code_distribution": {}
+    },
+    "regime_ablated": {
+      "approval_rate": 0.0,
+      "contradiction_rate": 0.0,
+      "mean_net_total_return": -0.0594,
+      "mean_sharpe": 0.0,
+      "mean_max_drawdown": -0.0868,
+      "mean_total_cost_return_drag": 0.0556,
+      "reason_code_distribution": {}
+    }
+  }
+}

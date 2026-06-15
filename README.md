@@ -155,9 +155,16 @@ Key environment variables (see `.env.example`):
   - `RISK_MIN_SHARPE`
   - `RISK_MAX_DRAWDOWN`
   - `RISK_MAX_COST_RETURN_DRAG`
+  - `RISK_MAX_COST_PRESSURE_SCORE`
   - `RISK_MIN_SIGNAL_CONFIDENCE`
   - `RISK_MIN_WALKFORWARD_QUALITY_SCORE`
   - `RISK_MIN_REGIME_CONFIDENCE`
+- Calibration/contradiction policy:
+  - `CALIBRATION_MAX_CONTRADICTIONS`
+  - `CALIBRATION_DIRECTIONAL_EDGE_THRESHOLD`
+  - `CALIBRATION_QUALITY_PENALTY_STRENGTH`
+  - `CALIBRATION_DIRECTIONAL_CONTRADICTION_PENALTY`
+  - `CALIBRATION_COST_PRESSURE_PENALTY_STRENGTH`
 - Paper execution:
   - `PAPER_TRADE_NOTIONAL_USD`
   - `PAPER_TRADE_STARTING_CASH_USD`
@@ -178,10 +185,17 @@ Key environment variables (see `.env.example`):
   - `REGIME_PERSISTENCE_BARS=3`
   - `REGIME_ABLATION_MODE=0`
 - Risk thresholds:
-  - `RISK_MAX_COST_RETURN_DRAG=0.06`
+  - `RISK_MAX_COST_RETURN_DRAG=0.05`
+  - `RISK_MAX_COST_PRESSURE_SCORE=0.95`
   - `RISK_MIN_WALKFORWARD_QUALITY_SCORE=0.43`
   - `RISK_MIN_SIGNAL_CONFIDENCE=0.55`
   - `RISK_MIN_REGIME_CONFIDENCE=0.45`
+- Calibration/contradiction policy:
+  - `CALIBRATION_MAX_CONTRADICTIONS=0`
+  - `CALIBRATION_DIRECTIONAL_EDGE_THRESHOLD=0.0`
+  - `CALIBRATION_QUALITY_PENALTY_STRENGTH=0.25`
+  - `CALIBRATION_DIRECTIONAL_CONTRADICTION_PENALTY=0.35`
+  - `CALIBRATION_COST_PRESSURE_PENALTY_STRENGTH=0.30`
 - Cost model:
   - `BACKTEST_FEE_BPS=5.0`, `BACKTEST_SLIPPAGE_BPS=2.5`
   - `WALK_FORWARD_FEE_BPS=5.0`, `WALK_FORWARD_SLIPPAGE_BPS=2.5`
@@ -216,7 +230,7 @@ quant-agents run-daily --exchange kraken --symbol BTC/USDT --timeframe 1h --limi
 ```bash path=null start=null
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
-quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --max-cost-return-drag 0.06 --min-walkforward-quality-score 0.43 --backtest-fee-bps 5 --backtest-slippage-bps 2.5 --walkforward-fee-bps 5 --walkforward-slippage-bps 2.5
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --max-cost-return-drag 0.05 --max-cost-pressure-score 0.95 --min-walkforward-quality-score 0.43 --backtest-fee-bps 5 --backtest-slippage-bps 2.5 --walkforward-fee-bps 5 --walkforward-slippage-bps 2.5
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --regime-detector-mode score --regime-volatility-threshold 0.03 --regime-trend-spread-threshold 0.01 --regime-persistence-bars 3 --min-regime-confidence 0.45
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --regime-ablation-mode
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5 --paper-slippage-bps 1
@@ -244,6 +258,48 @@ quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
 quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --cost-bps 9 --no-optimize-thresholds --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet
 ```
+
+### Historical backfill for canonical regime coverage
+Use this to close missing historical ranges (for example 2025 Q2) before benchmark gating:
+```bash path=null start=null
+python scripts/backfill_ohlcv_history.py --exchange binanceus --symbol BTC/USDT --timeframe 1h --start-utc 2025-01-01T00:00:00Z --end-utc 2026-06-13T00:00:00Z
+```
+
+### Priority 0 regime benchmark decision gate
+Single command to run the standardized benchmark harness (`regime_enabled` vs `regime_ablated`) with:
+- canonical window config (`scripts/regime_window_slices.json`),
+- strict coverage checks for all priority windows,
+- dataset manifest (min/max timestamps + source hashes),
+- deterministic benchmark artifact links,
+- JSON + markdown benchmark summaries,
+- metric snapshot + baseline delta + reason-code drift.
+
+```bash path=null start=null
+python scripts/run_regime_benchmark_gate.py
+```
+
+Optional baseline promotion after review:
+```bash path=null start=null
+python scripts/run_regime_benchmark_gate.py --accept-as-baseline
+```
+
+Presubmit/CI artifact contract validation:
+```bash path=null start=null
+python scripts/validate_regime_benchmark_gate.py
+```
+
+Pass/fail criteria document:
+- [doc/REGIME_BENCHMARK_PASS_FAIL_CRITERIA.md](doc/REGIME_BENCHMARK_PASS_FAIL_CRITERIA.md)
+
+### Priority 1 policy redesign evaluation pack
+Run the extended segmented evaluator with regime-touchpoint ablation matrix + cost stress sweeps:
+```bash path=null start=null
+python scripts/evaluate_agent_regime_windows.py --profile-set priority1 --enable-cost-stress --cost-stress-multiplier 1.5 --cost-stress-multiplier 2.0 --cost-stress-multiplier 3.0
+```
+The resulting summary JSON includes:
+- `ablation_matrix` (component-level lift/drag vs reference profile),
+- `cost_decomposition` (cost-drag by arm and regime bucket),
+- `cost_stress` (fee/slippage sensitivity summary and stress decomposition).
 
 ### OpenClaw-native orchestration commands
 ```bash path=null start=null

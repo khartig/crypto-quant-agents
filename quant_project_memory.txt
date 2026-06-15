@@ -1,5 +1,5 @@
 QUANT PROJECT MEMORY
-Last updated: 2026-06-10
+Last updated: 2026-06-13
 
 External storage identity
 - Disk: /dev/sdb (Seagate ST4000LM024-2U817V, ~3.6T)
@@ -319,3 +319,18 @@ Latest project updates (2026-06-10)
     - ensemble config keys and CLI examples
     - dashboard multi-select and performance-tab notes
     - link to metric definitions/results doc
+
+Latest project updates (2026-06-13)
+- Roadmap documentation update:
+  - Added:
+    - doc/NEXT_STEPS_BUILD_ROADMAP.md
+  - Purpose:
+    - captures prioritized future development tasks, sequencing, deliverables, and readiness criteria for the next build phases.
+
+- Commit and push status (user-run git commands):
+  - Commit recorded:
+    - [main 352dc4c] next steps
+    - 1 file changed, 141 insertions(+)
+    - create mode 100644 doc/NEXT_STEPS_BUILD_ROADMAP.md
+  - Push verified:
+    - origin/main advanced 74b4ea6..352dc4c

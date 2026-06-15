@@ -206,6 +206,78 @@ def _base_parser() -> argparse.ArgumentParser:
     )
     agent_plane.set_defaults(regime_ablation_mode=None)
     agent_plane.add_argument(
+        "--regime-policy-mode",
+        choices=["legacy", "conditional_v2"],
+        default=None,
+        help="Regime policy behavior at recommendation time (legacy additive behavior vs explicit conditional policy v2).",
+    )
+    agent_plane.add_argument(
+        "--regime-policy-min-actionable-confidence",
+        type=float,
+        default=None,
+        help="Conditional regime policy: minimum regime confidence before actionable recommendations remain buy/sell.",
+    )
+    agent_plane.add_argument(
+        "--regime-policy-transition-confidence",
+        type=float,
+        default=None,
+        help="Conditional regime policy: minimum regime confidence required during transitions before allowing actionable recommendations.",
+    )
+    agent_plane.add_argument(
+        "--regime-touchpoint-prompting-enabled",
+        dest="regime_touchpoint_prompting_enabled",
+        action="store_true",
+        help="Enable regime influence at prompting/recommendation touchpoint.",
+    )
+    agent_plane.add_argument(
+        "--no-regime-touchpoint-prompting-enabled",
+        dest="regime_touchpoint_prompting_enabled",
+        action="store_false",
+        help="Disable regime influence at prompting/recommendation touchpoint.",
+    )
+    agent_plane.add_argument(
+        "--regime-touchpoint-calibration-enabled",
+        dest="regime_touchpoint_calibration_enabled",
+        action="store_true",
+        help="Enable regime influence in confidence calibration.",
+    )
+    agent_plane.add_argument(
+        "--no-regime-touchpoint-calibration-enabled",
+        dest="regime_touchpoint_calibration_enabled",
+        action="store_false",
+        help="Disable regime influence in confidence calibration.",
+    )
+    agent_plane.add_argument(
+        "--regime-touchpoint-self-critique-enabled",
+        dest="regime_touchpoint_self_critique_enabled",
+        action="store_true",
+        help="Enable regime contradiction checks in self-critique.",
+    )
+    agent_plane.add_argument(
+        "--no-regime-touchpoint-self-critique-enabled",
+        dest="regime_touchpoint_self_critique_enabled",
+        action="store_false",
+        help="Disable regime contradiction checks in self-critique.",
+    )
+    agent_plane.add_argument(
+        "--regime-touchpoint-risk-gate-enabled",
+        dest="regime_touchpoint_risk_gate_enabled",
+        action="store_true",
+        help="Enable regime confidence gate checks in deterministic risk stage.",
+    )
+    agent_plane.add_argument(
+        "--no-regime-touchpoint-risk-gate-enabled",
+        dest="regime_touchpoint_risk_gate_enabled",
+        action="store_false",
+        help="Disable regime confidence gate checks in deterministic risk stage.",
+    )
+    agent_plane.set_defaults(
+        regime_touchpoint_prompting_enabled=None,
+        regime_touchpoint_calibration_enabled=None,
+        regime_touchpoint_self_critique_enabled=None,
+        regime_touchpoint_risk_gate_enabled=None,
+    )
+    agent_plane.add_argument(
         "--fast-window",
         type=int,
         default=None,
@@ -240,6 +312,12 @@ def _base_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Deterministic risk gate: maximum allowed cost drag in return units.",
+    )
+    agent_plane.add_argument(
+        "--max-cost-pressure-score",
+        type=float,
+        default=None,
+        help="Deterministic risk gate: maximum allowed calibration cost-pressure score.",
     )
     agent_plane.add_argument(
         "--min-signal-confidence",
@@ -330,6 +408,30 @@ def _base_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Phase 2: maximum allowed contradiction events before risk block.",
+    )
+    agent_plane.add_argument(
+        "--calibration-directional-edge-threshold",
+        type=float,
+        default=None,
+        help="Minimum walk-forward return edge magnitude required to avoid directional contradiction penalties.",
+    )
+    agent_plane.add_argument(
+        "--calibration-quality-penalty-strength",
+        type=float,
+        default=None,
+        help="Strength (0..1) of quality-band confidence penalty in calibration.",
+    )
+    agent_plane.add_argument(
+        "--calibration-directional-contradiction-penalty",
+        type=float,
+        default=None,
+        help="Penalty multiplier strength (0..1) applied when directional contradiction is detected.",
+    )
+    agent_plane.add_argument(
+        "--calibration-cost-pressure-penalty-strength",
+        type=float,
+        default=None,
+        help="Penalty multiplier strength (0..1) applied as cost-pressure score increases.",
     )
     agent_plane.add_argument(
         "--self-critique-min-score",
@@ -870,6 +972,12 @@ def main(argv: list[str] | None = None) -> None:
                 if args.max_cost_return_drag is not None
                 else settings.risk_max_cost_return_drag
             ),
+            max_cost_pressure_score=max(
+                0.0,
+                args.max_cost_pressure_score
+                if args.max_cost_pressure_score is not None
+                else settings.risk_max_cost_pressure_score,
+            ),
             min_signal_confidence=(
                 args.min_signal_confidence
                 if args.min_signal_confidence is not None
@@ -962,6 +1070,49 @@ def main(argv: list[str] | None = None) -> None:
                 if args.regime_detector_mode is not None
                 else settings.regime_detector_mode
             ),
+            regime_policy_mode=(
+                args.regime_policy_mode
+                if args.regime_policy_mode is not None
+                else settings.regime_policy_mode
+            ),
+            regime_policy_min_actionable_confidence=min(
+                1.0,
+                max(
+                    0.0,
+                    args.regime_policy_min_actionable_confidence
+                    if args.regime_policy_min_actionable_confidence is not None
+                    else settings.regime_policy_min_actionable_confidence,
+                ),
+            ),
+            regime_policy_transition_confidence=min(
+                1.0,
+                max(
+                    0.0,
+                    args.regime_policy_transition_confidence
+                    if args.regime_policy_transition_confidence is not None
+                    else settings.regime_policy_transition_confidence,
+                ),
+            ),
+            regime_touchpoint_prompting_enabled=(
+                bool(args.regime_touchpoint_prompting_enabled)
+                if args.regime_touchpoint_prompting_enabled is not None
+                else bool(settings.regime_touchpoint_prompting_enabled)
+            ),
+            regime_touchpoint_calibration_enabled=(
+                bool(args.regime_touchpoint_calibration_enabled)
+                if args.regime_touchpoint_calibration_enabled is not None
+                else bool(settings.regime_touchpoint_calibration_enabled)
+            ),
+            regime_touchpoint_self_critique_enabled=(
+                bool(args.regime_touchpoint_self_critique_enabled)
+                if args.regime_touchpoint_self_critique_enabled is not None
+                else bool(settings.regime_touchpoint_self_critique_enabled)
+            ),
+            regime_touchpoint_risk_gate_enabled=(
+                bool(args.regime_touchpoint_risk_gate_enabled)
+                if args.regime_touchpoint_risk_gate_enabled is not None
+                else bool(settings.regime_touchpoint_risk_gate_enabled)
+            ),
             regime_volatility_threshold=max(
                 0.0001,
                 args.regime_volatility_threshold
@@ -1031,6 +1182,38 @@ def main(argv: list[str] | None = None) -> None:
                 args.calibration_max_contradictions
                 if args.calibration_max_contradictions is not None
                 else settings.calibration_max_contradictions,
+            ),
+            calibration_directional_edge_threshold=(
+                args.calibration_directional_edge_threshold
+                if args.calibration_directional_edge_threshold is not None
+                else settings.calibration_directional_edge_threshold
+            ),
+            calibration_quality_penalty_strength=min(
+                1.0,
+                max(
+                    0.0,
+                    args.calibration_quality_penalty_strength
+                    if args.calibration_quality_penalty_strength is not None
+                    else settings.calibration_quality_penalty_strength,
+                ),
+            ),
+            calibration_directional_contradiction_penalty=min(
+                1.0,
+                max(
+                    0.0,
+                    args.calibration_directional_contradiction_penalty
+                    if args.calibration_directional_contradiction_penalty is not None
+                    else settings.calibration_directional_contradiction_penalty,
+                ),
+            ),
+            calibration_cost_pressure_penalty_strength=min(
+                1.0,
+                max(
+                    0.0,
+                    args.calibration_cost_pressure_penalty_strength
+                    if args.calibration_cost_pressure_penalty_strength is not None
+                    else settings.calibration_cost_pressure_penalty_strength,
+                ),
             ),
             self_critique_min_score=min(
                 1.0,
