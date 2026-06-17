@@ -18,9 +18,12 @@ import pandas as pd
 from quant_agents.config import Settings
 from quant_agents.ingestion import fetch_ohlcv_to_parquet
 from quant_agents.priority2_features import (
+    DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS,
     PRIORITY2_FEATURE_COLUMNS,
     Priority2FeatureBundle,
+    apply_priority2_feature_column_selection,
     build_priority2_feature_bundle,
+    normalize_priority2_feature_columns,
     write_priority2_feature_artifacts,
 )
 from quant_agents.priority2_retrieval import latest_priority2_external_features_path
@@ -163,6 +166,7 @@ def _build_feature_frame(
     *,
     priority2_features_enabled: bool = True,
     priority2_external_features_path: Path | None = None,
+    priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
 ) -> tuple[pd.DataFrame, Priority2FeatureBundle]:
     close = frame["close"].astype(float)
     high = frame["high"].astype(float)
@@ -204,6 +208,10 @@ def _build_feature_frame(
         frame,
         features_enabled=bool(priority2_features_enabled),
         external_features_path=priority2_external_features_path,
+    )
+    priority2_bundle = apply_priority2_feature_column_selection(
+        bundle=priority2_bundle,
+        selected_feature_columns=priority2_feature_columns,
     )
     priority2_frame = priority2_bundle.feature_frame.copy()
     priority2_frame["timestamp"] = pd.to_datetime(
@@ -890,10 +898,16 @@ def _candidate_threshold_pairs(
     buy_threshold: float,
     sell_threshold: float,
 ) -> list[tuple[float, float]]:
-    base_values = {0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.010}
-    base_values.add(float(max(0.0005, buy_threshold)))
-    base_values.add(float(max(0.0005, abs(sell_threshold))))
-    ordered = sorted(base_values)
+    min_threshold = 0.004
+    max_threshold = 0.012
+    base_values = {0.004, 0.005, 0.006, 0.008, 0.010, 0.012}
+    base_values.add(float(np.clip(max(0.0005, buy_threshold), min_threshold, max_threshold)))
+    base_values.add(float(np.clip(max(0.0005, abs(sell_threshold)), min_threshold, max_threshold)))
+    ordered = sorted(
+        value
+        for value in base_values
+        if min_threshold <= float(value) <= max_threshold
+    )
     pairs: list[tuple[float, float]] = []
     for buy_value in ordered:
         for sell_value in ordered:
@@ -934,6 +948,14 @@ def _select_action_confidence_frontier(
         )
         expectancy = dict(evaluation.get("expectancy_metrics", {}))
         actionable = dict(evaluation.get("actionable_metrics", {}))
+        net_expectancy_per_bar = float(expectancy.get("net_expectancy_per_bar", 0.0))
+        net_expectancy_per_actionable = float(expectancy.get("net_expectancy_per_actionable", 0.0))
+        break_even_one_way_cost_bps = float(expectancy.get("break_even_one_way_cost_bps", 0.0))
+        cost_aware_gate_pass = (
+            net_expectancy_per_bar > 0.0
+            and net_expectancy_per_actionable > 0.0
+            and break_even_one_way_cost_bps >= float(max(0.0, one_way_cost_bps))
+        )
         row = {
             "threshold": float(threshold),
             "accuracy": float(evaluation.get("accuracy", 0.0)),
@@ -944,23 +966,42 @@ def _select_action_confidence_frontier(
                 actionable.get("binary_actionable_precision", 0.0)
             ),
             "binary_actionable_recall": float(actionable.get("binary_actionable_recall", 0.0)),
-            "net_expectancy_per_bar": float(expectancy.get("net_expectancy_per_bar", 0.0)),
-            "net_expectancy_per_actionable": float(
-                expectancy.get("net_expectancy_per_actionable", 0.0)
-            ),
+            "net_expectancy_per_bar": net_expectancy_per_bar,
+            "net_expectancy_per_actionable": net_expectancy_per_actionable,
+            "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
+            "cost_aware_gate_pass": bool(cost_aware_gate_pass),
         }
         frontier_rows.append(row)
         rank = (
+            1.0 if cost_aware_gate_pass else 0.0,
             row["net_expectancy_per_bar"],
             row["net_expectancy_per_actionable"],
             row["binary_actionable_precision"],
             row["actionable_rate"],
-            row["accuracy"],
         )
         if best_rank is None or rank > best_rank:
             best_rank = rank
             selected_threshold = float(threshold)
             selected_evaluation = evaluation
+
+    if selected_evaluation is not None and candidate_thresholds:
+        selected_expectancy = dict(selected_evaluation.get("expectancy_metrics", {}))
+        selected_cost_gate_pass = (
+            float(selected_expectancy.get("net_expectancy_per_bar", 0.0)) > 0.0
+            and float(selected_expectancy.get("net_expectancy_per_actionable", 0.0)) > 0.0
+            and float(selected_expectancy.get("break_even_one_way_cost_bps", 0.0))
+            >= float(max(0.0, one_way_cost_bps))
+        )
+        if optimize_thresholds and not selected_cost_gate_pass:
+            strict_threshold = float(max(candidate_thresholds))
+            strict_evaluation = _evaluate_model(
+                model_payload=model_payload,
+                test_frame=test_frame,
+                one_way_cost_bps=one_way_cost_bps,
+                action_confidence_threshold=strict_threshold,
+            )
+            selected_threshold = strict_threshold
+            selected_evaluation = strict_evaluation
 
     if selected_evaluation is None:
         selected_evaluation = _evaluate_model(
@@ -1068,6 +1109,7 @@ def train_trigger_model(
     action_confidence_threshold: float = 0.55,
     priority2_features_enabled: bool = True,
     priority2_external_features_path: Path | None = None,
+    priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
 ) -> TriggerModelTrainingResult:
     source_data_path = (
         input_file.expanduser().resolve()
@@ -1087,12 +1129,23 @@ def train_trigger_model(
             requested_path=priority2_external_features_path,
         )
     )
+    resolved_priority2_feature_columns = normalize_priority2_feature_columns(
+        priority2_feature_columns
+        if priority2_feature_columns is not None
+        else DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS
+    )
+    resolved_priority2_feature_columns = normalize_priority2_feature_columns(
+        priority2_feature_columns
+        if priority2_feature_columns is not None
+        else DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS
+    )
 
     frame = _coerce_frame(source_data_path)
     feature_frame, priority2_bundle = _build_feature_frame(
         frame,
         priority2_features_enabled=bool(priority2_features_enabled),
         priority2_external_features_path=resolved_priority2_external_features_path,
+        priority2_feature_columns=resolved_priority2_feature_columns,
     )
     resolved_labeling_mode = _resolve_labeling_mode(labeling_mode)
     resolved_horizon = int(max(1, horizon_bars))
@@ -1260,6 +1313,7 @@ def train_trigger_model(
             if resolved_priority2_external_features_path is not None
             else None
         ),
+        "priority2_feature_columns": list(resolved_priority2_feature_columns),
         "priority2_external_features_path_resolution": priority2_external_resolution,
         "priority2_reason_codes": list(priority2_bundle.reason_codes),
         "priority2_diagnostics": dict(priority2_bundle.diagnostics),
@@ -1378,6 +1432,7 @@ def predict_trigger_signal(
     action_confidence_threshold: float | None = None,
     priority2_features_enabled: bool = True,
     priority2_external_features_path: Path | None = None,
+    priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
 ) -> TriggerPredictionResult:
     resolved_model_path = (
         model_path.expanduser().resolve()
@@ -1401,12 +1456,18 @@ def predict_trigger_signal(
             requested_path=priority2_external_features_path,
         )
     )
+    resolved_priority2_feature_columns = normalize_priority2_feature_columns(
+        priority2_feature_columns
+        if priority2_feature_columns is not None
+        else DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS
+    )
 
     frame = _coerce_frame(source_data_path)
     feature_frame, priority2_bundle = _build_feature_frame(
         frame,
         priority2_features_enabled=bool(priority2_features_enabled),
         priority2_external_features_path=resolved_priority2_external_features_path,
+        priority2_feature_columns=resolved_priority2_feature_columns,
     )
     feature_frame = feature_frame.dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
     if feature_frame.empty:
@@ -1425,6 +1486,30 @@ def predict_trigger_signal(
     if recommendation in {"buy", "sell"} and confidence < resolved_action_confidence_threshold:
         recommendation = "hold"
         confidence_gate_applied = True
+    expectancy_metrics = (
+        model_payload.get("training_metrics", {}).get("expectancy_metrics", {})
+        if isinstance(model_payload.get("training_metrics", {}), dict)
+        else {}
+    )
+    model_net_expectancy_per_actionable = float(
+        expectancy_metrics.get("net_expectancy_per_actionable", 0.0)
+    ) if isinstance(expectancy_metrics, dict) else 0.0
+    model_break_even_one_way_cost_bps = float(
+        expectancy_metrics.get("break_even_one_way_cost_bps", 0.0)
+    ) if isinstance(expectancy_metrics, dict) else 0.0
+    model_one_way_cost_bps = float(
+        expectancy_metrics.get("one_way_cost_bps", 0.0)
+    ) if isinstance(expectancy_metrics, dict) else 0.0
+    cost_gate_applied = False
+    if (
+        recommendation in {"buy", "sell"}
+        and (
+            model_net_expectancy_per_actionable <= 0.0
+            or model_break_even_one_way_cost_bps < model_one_way_cost_bps
+        )
+    ):
+        recommendation = "hold"
+        cost_gate_applied = True
     top_reasons, reason_details = _feature_reasons(
         model_payload,
         vector,
@@ -1445,6 +1530,25 @@ def predict_trigger_signal(
                 "supports": "hold",
                 "vs_alternative": raw_recommendation,
                 "reason": "confidence_gate_demoted_to_hold",
+            },
+            *reason_details,
+        ]
+    if cost_gate_applied:
+        gate_reason = (
+            f"cost_gate_demoted_to_hold net_expectancy_per_actionable="
+            f"{model_net_expectancy_per_actionable:.6f} break_even_bps="
+            f"{model_break_even_one_way_cost_bps:.3f} one_way_cost_bps="
+            f"{model_one_way_cost_bps:.3f}"
+        )
+        top_reasons = [gate_reason, *top_reasons]
+        reason_details = [
+            {
+                "feature": "cost_aware_action_gate",
+                "value": float(model_net_expectancy_per_actionable),
+                "impact": float(model_break_even_one_way_cost_bps - model_one_way_cost_bps),
+                "supports": "hold",
+                "vs_alternative": raw_recommendation,
+                "reason": "cost_gate_demoted_to_hold",
             },
             *reason_details,
         ]
@@ -1477,6 +1581,12 @@ def predict_trigger_signal(
                 "confidence": confidence,
                 "action_confidence_threshold": float(resolved_action_confidence_threshold),
                 "confidence_gate_applied": bool(confidence_gate_applied),
+                "cost_gate_applied": bool(cost_gate_applied),
+                "cost_gate_inputs": {
+                    "model_net_expectancy_per_actionable": model_net_expectancy_per_actionable,
+                    "model_break_even_one_way_cost_bps": model_break_even_one_way_cost_bps,
+                    "model_one_way_cost_bps": model_one_way_cost_bps,
+                },
                 "probabilities": probabilities,
                 "close_price": close_price,
                 "sma_fast": sma_fast,
@@ -1499,6 +1609,7 @@ def predict_trigger_signal(
                     if resolved_priority2_external_features_path is not None
                     else None
                 ),
+                "priority2_feature_columns": list(resolved_priority2_feature_columns),
                 "priority2_external_features_path_resolution": priority2_external_resolution,
                 "priority2_reason_codes": list(priority2_bundle.reason_codes),
                 "priority2_diagnostics": dict(priority2_bundle.diagnostics),
@@ -1576,6 +1687,9 @@ def monitor_trigger_signals(
     webhook_url: str | None,
     notify_on_hold: bool,
     max_cycles: int | None,
+    priority2_features_enabled: bool = True,
+    priority2_external_features_path: Path | None = None,
+    priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
 ) -> TriggerMonitorResult:
     cycle_count = 0
     alert_count = 0
@@ -1623,6 +1737,9 @@ def monitor_trigger_signals(
             model_path=model_path,
             input_file=ingested_file,
             write_artifact=True,
+            priority2_features_enabled=bool(priority2_features_enabled),
+            priority2_external_features_path=priority2_external_features_path,
+            priority2_feature_columns=priority2_feature_columns,
         )
 
         is_actionable = prediction.recommendation in {"buy", "sell"}

@@ -16,6 +16,11 @@ from quant_agents.ingestion import fetch_ohlcv_to_parquet
 from quant_agents.logging_utils import configure_logging
 from quant_agents.metrics import tracked_operation
 from quant_agents.paper_account import run_paper_account_probe
+from quant_agents.priority2_features import (
+    DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS,
+    PRIORITY2_FEATURE_COLUMNS,
+    normalize_priority2_feature_columns,
+)
 from quant_agents.priority2_retrieval import retrieve_priority2_external_features
 from quant_agents.reporting import generate_daily_report
 from quant_agents.storage import ensure_phase1_tree, latest_backtest_run_dir
@@ -40,6 +45,31 @@ def _parse_ensemble_arms(value: str | tuple[str, ...] | list[str] | None) -> tup
         items = tuple(part.strip() for part in str(value).split(","))
     normalized = tuple(item.strip().lower() for item in items if item and item.strip())
     return normalized
+
+def _parse_priority2_feature_columns(
+    value: str | tuple[str, ...] | list[str] | None,
+    *,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    fallback = normalize_priority2_feature_columns(default)
+    if value is None:
+        return fallback
+    if isinstance(value, tuple):
+        items = value
+    elif isinstance(value, list):
+        items = tuple(str(item).strip() for item in value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return fallback
+        lowered = raw.lower()
+        if lowered in {"all", "*"}:
+            return tuple(PRIORITY2_FEATURE_COLUMNS)
+        if lowered in {"stable", "default"}:
+            return tuple(DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS)
+        items = tuple(part.strip() for part in raw.split(","))
+    normalized = normalize_priority2_feature_columns(items)
+    return normalized or fallback
 
 
 def _base_parser() -> argparse.ArgumentParser:
@@ -677,6 +707,15 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Optional external Priority 2 feature file used during training.",
     )
     trigger_train.add_argument(
+        "--priority2-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated Priority 2 feature columns to enable "
+            "(for example open_interest_feature,participant_positioning_feature). "
+            "Use 'stable' for the default stable pair or 'all' for full Priority 2 set."
+        ),
+    )
+    trigger_train.add_argument(
         "--horizon-bars",
         type=int,
         default=None,
@@ -752,6 +791,15 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Optional external Priority 2 feature file used during prediction.",
     )
     trigger_predict.add_argument(
+        "--priority2-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated Priority 2 feature columns to enable "
+            "(for example open_interest_feature,participant_positioning_feature). "
+            "Use 'stable' for the default stable pair or 'all' for full Priority 2 set."
+        ),
+    )
+    trigger_predict.add_argument(
         "--model-path",
         default=None,
         help="Optional explicit model.json path. Defaults to latest model for scope.",
@@ -770,6 +818,32 @@ def _base_parser() -> argparse.ArgumentParser:
     trigger_monitor.add_argument("--exchange", default=None)
     trigger_monitor.add_argument("--symbol", default=None)
     trigger_monitor.add_argument("--timeframe", default=None)
+    trigger_monitor.add_argument(
+        "--priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_true",
+        help="Enable Priority 2 feature expansion for monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--no-priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_false",
+        help="Disable Priority 2 feature expansion for monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--priority2-external-features-path",
+        default=None,
+        help="Optional external Priority 2 feature file used during monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--priority2-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated Priority 2 feature columns to enable "
+            "(for example open_interest_feature,participant_positioning_feature). "
+            "Use 'stable' for the default stable pair or 'all' for full Priority 2 set."
+        ),
+    )
     trigger_monitor.add_argument(
         "--model-path",
         default=None,
@@ -809,6 +883,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional finite cycle cap for bounded monitor runs.",
     )
+    trigger_monitor.set_defaults(priority2_features_enabled=None)
 
     doctor = subparsers.add_parser(
         "doctor",
@@ -1023,6 +1098,10 @@ def main(argv: list[str] | None = None) -> None:
                 else None
             )
         )
+        priority2_feature_columns = _parse_priority2_feature_columns(
+            args.priority2_feature_columns,
+            default=tuple(settings.priority2_feature_columns),
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="train-trigger-model",
@@ -1052,6 +1131,7 @@ def main(argv: list[str] | None = None) -> None:
                 ),
                 priority2_features_enabled=bool(priority2_features_enabled),
                 priority2_external_features_path=priority2_external_features_path,
+                priority2_feature_columns=priority2_feature_columns,
             )
             metric["model_path"] = str(result.model_path)
             metric["run_dir"] = str(result.run_dir)
@@ -1096,6 +1176,10 @@ def main(argv: list[str] | None = None) -> None:
                 else None
             )
         )
+        priority2_feature_columns = _parse_priority2_feature_columns(
+            args.priority2_feature_columns,
+            default=tuple(settings.priority2_feature_columns),
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="predict-trigger",
@@ -1119,6 +1203,7 @@ def main(argv: list[str] | None = None) -> None:
                 ),
                 priority2_features_enabled=bool(priority2_features_enabled),
                 priority2_external_features_path=priority2_external_features_path,
+                priority2_feature_columns=priority2_feature_columns,
             )
             metric["model_path"] = str(result.model_path)
             metric["source_data_path"] = str(result.source_data_path)
@@ -1655,6 +1740,24 @@ def main(argv: list[str] | None = None) -> None:
             if args.poll_seconds is not None
             else settings.trigger_monitor_poll_seconds
         )
+        priority2_features_enabled = (
+            bool(args.priority2_features_enabled)
+            if args.priority2_features_enabled is not None
+            else bool(settings.priority2_features_enabled)
+        )
+        priority2_external_features_path = (
+            Path(args.priority2_external_features_path).expanduser().resolve()
+            if args.priority2_external_features_path
+            else (
+                Path(settings.priority2_external_features_path).expanduser().resolve()
+                if settings.priority2_external_features_path
+                else None
+            )
+        )
+        priority2_feature_columns = _parse_priority2_feature_columns(
+            args.priority2_feature_columns,
+            default=tuple(settings.priority2_feature_columns),
+        )
         confidence_threshold = (
             args.confidence_threshold
             if args.confidence_threshold is not None
@@ -1683,6 +1786,9 @@ def main(argv: list[str] | None = None) -> None:
                 webhook_url=webhook_url,
                 notify_on_hold=notify_on_hold,
                 max_cycles=args.max_cycles,
+                priority2_features_enabled=bool(priority2_features_enabled),
+                priority2_external_features_path=priority2_external_features_path,
+                priority2_feature_columns=priority2_feature_columns,
             )
             metric["cycles_completed"] = result.cycles_completed
             metric["alerts_emitted"] = result.alerts_emitted

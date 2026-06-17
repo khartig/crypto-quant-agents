@@ -96,6 +96,7 @@ def main() -> None:
         frame,
         priority2_features_enabled=bool(settings.priority2_features_enabled),
         priority2_external_features_path=priority2_external_features_path,
+        priority2_feature_columns=tuple(settings.priority2_feature_columns),
     )
     feature_frame = feature_frame.dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
     if feature_frame.empty:

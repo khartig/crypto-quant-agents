@@ -131,6 +131,7 @@ Key environment variables (see `.env.example`):
   - `REGIME_ABLATION_MODE`
   - `PRIORITY2_FEATURES_ENABLED`
   - `PRIORITY2_EXTERNAL_FEATURES_PATH`
+  - `PRIORITY2_FEATURE_COLUMNS`
   - `PRIORITY2_RETRIEVAL_PROVIDER`
   - `PRIORITY2_RETRIEVAL_TIMEOUT_SECONDS`
   - `PRIORITY2_RETRIEVAL_MAX_POINTS`
@@ -197,6 +198,7 @@ Key environment variables (see `.env.example`):
   - `REGIME_ENABLED=1`
   - `REGIME_ABLATION_MODE=0`
   - `PRIORITY2_FEATURES_ENABLED=1`
+  - `PRIORITY2_FEATURE_COLUMNS=open_interest_feature,participant_positioning_feature` (stable default combo)
 - Risk thresholds:
   - `RISK_MAX_COST_RETURN_DRAG=0.05`
   - `RISK_MAX_COST_PRESSURE_SCORE=0.95`
@@ -287,9 +289,13 @@ quant-agents visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orches
 ```bash path=null start=null
 quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --cost-bps 7.5 --optimize-thresholds
 quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --labeling-mode triple_barrier_v2 --trade-quality-min-score 0.55 --action-confidence-threshold 0.60 --priority2-features-enabled
+quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns open_interest_feature,participant_positioning_feature
+quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns funding_rate_feature,open_interest_feature,basis_feature
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h --action-confidence-threshold 0.60 --priority2-features-enabled
+quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns all
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
+quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns stable --max-cycles 3
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
 quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --cost-bps 9 --no-optimize-thresholds --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet

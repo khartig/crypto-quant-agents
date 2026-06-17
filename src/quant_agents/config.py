@@ -46,6 +46,7 @@ class Settings:
     regime_ablation_mode: bool
     priority2_features_enabled: bool
     priority2_external_features_path: str | None
+    priority2_feature_columns: tuple[str, ...]
     priority2_retrieval_provider: str
     priority2_retrieval_timeout_seconds: float
     priority2_retrieval_max_points: int
@@ -270,6 +271,13 @@ def load_settings() -> Settings:
             default=True,
         ),
         priority2_external_features_path=os.getenv("PRIORITY2_EXTERNAL_FEATURES_PATH") or None,
+        priority2_feature_columns=_as_csv_tuple(
+            os.getenv("PRIORITY2_FEATURE_COLUMNS"),
+            default=(
+                "open_interest_feature",
+                "participant_positioning_feature",
+            ),
+        ),
         priority2_retrieval_provider=os.getenv(
             "PRIORITY2_RETRIEVAL_PROVIDER",
             "okx_public",

@@ -27,6 +27,11 @@ PRIORITY2_FEATURE_COLUMNS: tuple[str, ...] = (
     "concentration_spike_feature",
 )
 
+DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS: tuple[str, ...] = (
+    "open_interest_feature",
+    "participant_positioning_feature",
+)
+
 _EXTERNAL_FEATURE_COLUMN_MAP: dict[str, str] = {
     "funding_rate": "funding_rate_feature",
     "funding_rate_feature": "funding_rate_feature",
@@ -69,6 +74,74 @@ class Priority2FeatureBundle:
 class Priority2FeatureArtifactPaths:
     parquet_path: Path
     contract_path: Path
+
+
+def normalize_priority2_feature_columns(
+    selected_feature_columns: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    if not selected_feature_columns:
+        return tuple(PRIORITY2_FEATURE_COLUMNS)
+    normalized: list[str] = []
+    for column in selected_feature_columns:
+        value = str(column).strip()
+        if not value:
+            continue
+        if value not in PRIORITY2_FEATURE_COLUMNS:
+            continue
+        if value not in normalized:
+            normalized.append(value)
+    return tuple(normalized) if normalized else tuple(PRIORITY2_FEATURE_COLUMNS)
+
+
+def apply_priority2_feature_column_selection(
+    *,
+    bundle: Priority2FeatureBundle,
+    selected_feature_columns: tuple[str, ...] | list[str] | None,
+) -> Priority2FeatureBundle:
+    selected_columns = normalize_priority2_feature_columns(selected_feature_columns)
+    disabled_columns = [column for column in PRIORITY2_FEATURE_COLUMNS if column not in selected_columns]
+    diagnostics = dict(bundle.diagnostics)
+    diagnostics["selected_priority2_feature_columns"] = list(selected_columns)
+    diagnostics["disabled_priority2_feature_columns"] = list(disabled_columns)
+    if not disabled_columns:
+        return Priority2FeatureBundle(
+            contract=bundle.contract,
+            created_at_utc=bundle.created_at_utc,
+            features_enabled=bundle.features_enabled,
+            external_features_path=bundle.external_features_path,
+            feature_frame=bundle.feature_frame.copy(),
+            feature_snapshot=dict(bundle.feature_snapshot),
+            reason_codes=list(bundle.reason_codes),
+            diagnostics=diagnostics,
+        )
+    adjusted_frame = bundle.feature_frame.copy()
+    for column in PRIORITY2_FEATURE_COLUMNS:
+        if column not in adjusted_frame.columns:
+            adjusted_frame[column] = 0.0
+    for column in disabled_columns:
+        adjusted_frame[column] = 0.0
+    adjusted_frame = adjusted_frame.loc[:, ["timestamp", *PRIORITY2_FEATURE_COLUMNS]].copy()
+    adjusted_snapshot = {
+        column: float(pd.to_numeric(adjusted_frame[column], errors="coerce").fillna(0.0).iloc[-1])
+        if not adjusted_frame.empty
+        else 0.0
+        for column in PRIORITY2_FEATURE_COLUMNS
+    }
+    source_selection = dict(diagnostics.get("source_selection", {}))
+    for column in disabled_columns:
+        source_selection[column] = "disabled_by_feature_selection"
+    diagnostics["source_selection"] = source_selection
+    reason_codes = sorted(set([*bundle.reason_codes, "priority2_feature_column_selection_applied"]))
+    return Priority2FeatureBundle(
+        contract=bundle.contract,
+        created_at_utc=bundle.created_at_utc,
+        features_enabled=bundle.features_enabled,
+        external_features_path=bundle.external_features_path,
+        feature_frame=adjusted_frame,
+        feature_snapshot=adjusted_snapshot,
+        reason_codes=reason_codes,
+        diagnostics=diagnostics,
+    )
 
 
 def _utc_now_iso() -> str:
