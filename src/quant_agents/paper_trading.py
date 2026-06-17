@@ -101,46 +101,20 @@ def _append_fill_record(fills_log_path: Path, payload: dict[str, Any]) -> None:
     with fills_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
-
-def execute_paper_trade_intent(
+def simulate_paper_trade_execution_step(
     *,
-    quant_data_root: Path,
-    run_id: str,
-    created_at_utc: str,
-    exchange: str,
+    state: dict[str, Any],
     symbol: str,
-    timeframe: str,
-    intent: PaperTradeIntent,
+    intent_status: str,
+    intent_action: Recommendation,
+    requested_notional_usd: float,
     mark_price: float | None,
-    starting_cash_usd: float,
     fee_bps: float,
     slippage_bps: float,
-) -> PaperTradeExecution:
-    try:
-        created_at = datetime.fromisoformat(created_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError:
-        created_at = datetime.now(timezone.utc)
-
-    day_dir = quant_data_root / "paper-trading" / f"{created_at:%Y-%m-%d}"
-    state_path = quant_data_root / "paper-trading" / "state" / "portfolio_state.json"
-    fills_log_path = day_dir / "fills.jsonl"
-    execution_record_path = day_dir / f"paper_trade_execution_{run_id}.json"
-
-    state = _load_state(
-        state_path,
-        starting_cash_usd=max(0.0, float(starting_cash_usd)),
-        fee_bps=max(0.0, float(fee_bps)),
-    )
+) -> dict[str, Any]:
     position = _ensure_position(state, symbol)
     fee_rate = max(0.0, float(fee_bps)) / 10_000.0
-    requested_notional_usd = max(0.0, float(intent.notional_usd))
-    arm_votes = dict(intent.arm_votes)
-    arm_weights = {
-        str(arm): max(0.0, _coerce_float(weight, 0.0))
-        for arm, weight in dict(intent.arm_weights).items()
-    }
-    selected_arms = [str(arm) for arm in list(intent.selected_arms) if str(arm).strip()]
-    ensemble_reason_codes = [str(code) for code in list(intent.ensemble_reason_codes)]
+    requested_notional_usd = max(0.0, float(requested_notional_usd))
 
     execution_status = "skipped"
     executed_action: Recommendation = "hold"
@@ -154,9 +128,9 @@ def execute_paper_trade_intent(
     valid_price = mark_price is not None and mark_price > 0
     slippage_rate = max(0.0, float(slippage_bps)) / 10_000.0
 
-    if intent.status != "emitted":
-        reason = f"intent_{intent.status}"
-    elif intent.action == "buy":
+    if intent_status != "emitted":
+        reason = f"intent_{intent_status}"
+    elif intent_action == "buy":
         if not valid_price:
             execution_status = "rejected"
             reason = "invalid_mark_price"
@@ -189,7 +163,7 @@ def execute_paper_trade_intent(
                 )
                 position["quantity"] = new_qty
                 position["avg_entry_price"] = new_avg
-    elif intent.action == "sell":
+    elif intent_action == "sell":
         if not valid_price:
             execution_status = "rejected"
             reason = "invalid_mark_price"
@@ -235,6 +209,80 @@ def execute_paper_trade_intent(
         "realized_pnl_usd": _coerce_float(position.get("realized_pnl_usd"), 0.0),
     }
     state["positions"] = state_positions
+    state["fee_bps"] = max(0.0, float(fee_bps))
+
+    position_after = state["positions"].get(symbol, {})
+    return {
+        "execution_status": execution_status,
+        "executed_action": executed_action,
+        "requested_notional_usd": requested_notional_usd,
+        "executed_notional_usd": executed_notional_usd,
+        "executed_quantity": executed_quantity,
+        "execution_price": execution_price,
+        "fee_usd": fee_usd,
+        "realized_pnl_delta_usd": realized_pnl_delta_usd,
+        "reason": reason,
+        "cash_after_usd": _coerce_float(state.get("cash_usd"), 0.0),
+        "position_qty_after": _coerce_float(position_after.get("quantity"), 0.0),
+        "position_avg_entry_after": _coerce_float(position_after.get("avg_entry_price"), 0.0),
+    }
+
+
+def execute_paper_trade_intent(
+    *,
+    quant_data_root: Path,
+    run_id: str,
+    created_at_utc: str,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    intent: PaperTradeIntent,
+    mark_price: float | None,
+    starting_cash_usd: float,
+    fee_bps: float,
+    slippage_bps: float,
+) -> PaperTradeExecution:
+    try:
+        created_at = datetime.fromisoformat(created_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        created_at = datetime.now(timezone.utc)
+
+    day_dir = quant_data_root / "paper-trading" / f"{created_at:%Y-%m-%d}"
+    state_path = quant_data_root / "paper-trading" / "state" / "portfolio_state.json"
+    fills_log_path = day_dir / "fills.jsonl"
+    execution_record_path = day_dir / f"paper_trade_execution_{run_id}.json"
+
+    state = _load_state(
+        state_path,
+        starting_cash_usd=max(0.0, float(starting_cash_usd)),
+        fee_bps=max(0.0, float(fee_bps)),
+    )
+    requested_notional_usd = max(0.0, float(intent.notional_usd))
+    arm_votes = dict(intent.arm_votes)
+    arm_weights = {
+        str(arm): max(0.0, _coerce_float(weight, 0.0))
+        for arm, weight in dict(intent.arm_weights).items()
+    }
+    selected_arms = [str(arm) for arm in list(intent.selected_arms) if str(arm).strip()]
+    ensemble_reason_codes = [str(code) for code in list(intent.ensemble_reason_codes)]
+    execution_result = simulate_paper_trade_execution_step(
+        state=state,
+        symbol=symbol,
+        intent_status=str(intent.status),
+        intent_action=intent.action,
+        requested_notional_usd=requested_notional_usd,
+        mark_price=mark_price,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+    execution_status = str(execution_result.get("execution_status", "skipped"))
+    executed_action = str(execution_result.get("executed_action", "hold"))
+    executed_notional_usd = _coerce_float(execution_result.get("executed_notional_usd"), 0.0)
+    executed_quantity = _coerce_float(execution_result.get("executed_quantity"), 0.0)
+    execution_price = execution_result.get("execution_price")
+    fee_usd = _coerce_float(execution_result.get("fee_usd"), 0.0)
+    realized_pnl_delta_usd = _coerce_float(execution_result.get("realized_pnl_delta_usd"), 0.0)
+    reason = str(execution_result.get("reason", "unknown"))
     state["updated_at_utc"] = created_at_utc
     state["fee_bps"] = max(0.0, float(fee_bps))
     _write_state(state_path, state)
@@ -263,7 +311,7 @@ def execute_paper_trade_intent(
             },
         )
 
-    position_after = state["positions"].get(symbol, {})
+    position_after = state.get("positions", {}).get(symbol, {})
     resolved_selected_arms = selected_arms or sorted(arm_weights.keys())
     total_selected_weight = sum(max(0.0, arm_weights.get(arm, 0.0)) for arm in resolved_selected_arms)
     arm_attribution: dict[str, dict[str, Any]] = {}
@@ -303,9 +351,9 @@ def execute_paper_trade_intent(
         execution_price=_round(float(execution_price)) if execution_price is not None else None,
         fee_usd=_round(fee_usd),
         slippage_bps=_round(max(0.0, float(slippage_bps))),
-        cash_after_usd=_round(_coerce_float(state.get("cash_usd"), 0.0)),
-        position_qty_after=_round(_coerce_float(position_after.get("quantity"), 0.0)),
-        position_avg_entry_after=_round(_coerce_float(position_after.get("avg_entry_price"), 0.0)),
+        cash_after_usd=_round(_coerce_float(execution_result.get("cash_after_usd"), 0.0)),
+        position_qty_after=_round(_coerce_float(execution_result.get("position_qty_after"), 0.0)),
+        position_avg_entry_after=_round(_coerce_float(execution_result.get("position_avg_entry_after"), 0.0)),
         realized_pnl_delta_usd=_round(realized_pnl_delta_usd),
         reason=reason,
         portfolio_state_path=str(state_path),

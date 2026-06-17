@@ -162,6 +162,7 @@ Key environment variables (see `.env.example`):
   - `TRIGGER_MONITOR_SIGNAL_CONFIDENCE`
   - `TRIGGER_MONITOR_WEBHOOK_URL`
   - `TRIGGER_MONITOR_NOTIFY_ON_HOLD`
+  - `TRIGGER_MONITOR_PAPER_TRADING_ENABLED`
 - Risk thresholds:
   - `RISK_MIN_TOTAL_RETURN`
   - `RISK_MIN_SHARPE`
@@ -296,6 +297,7 @@ quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h 
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns all
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns stable --max-cycles 3
+quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns stable --paper-trading-enabled --paper-notional-usd 100 --paper-fee-bps 5 --paper-slippage-bps 1 --max-cycles 3
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
 quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --cost-bps 9 --no-optimize-thresholds --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet

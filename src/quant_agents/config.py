@@ -109,6 +109,7 @@ class Settings:
     trigger_monitor_signal_confidence: float
     trigger_monitor_webhook_url: str | None
     trigger_monitor_notify_on_hold: bool
+    trigger_monitor_paper_trading_enabled: bool
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -537,6 +538,10 @@ def load_settings() -> Settings:
         trigger_monitor_webhook_url=os.getenv("TRIGGER_MONITOR_WEBHOOK_URL") or None,
         trigger_monitor_notify_on_hold=_as_bool(
             os.getenv("TRIGGER_MONITOR_NOTIFY_ON_HOLD"),
+            default=False,
+        ),
+        trigger_monitor_paper_trading_enabled=_as_bool(
+            os.getenv("TRIGGER_MONITOR_PAPER_TRADING_ENABLED"),
             default=False,
         ),
     )

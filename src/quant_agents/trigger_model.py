@@ -7,6 +7,7 @@ import math
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,9 +15,14 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from quant_agents.agent_contracts import PaperTradeIntent, Recommendation, write_contract
 
 from quant_agents.config import Settings
 from quant_agents.ingestion import fetch_ohlcv_to_parquet
+from quant_agents.paper_trading import (
+    execute_paper_trade_intent,
+    simulate_paper_trade_execution_step,
+)
 from quant_agents.priority2_features import (
     DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS,
     PRIORITY2_FEATURE_COLUMNS,
@@ -46,6 +52,7 @@ BASE_FEATURE_COLUMNS: tuple[str, ...] = (
     "hl_range_14",
 )
 FEATURE_COLUMNS: tuple[str, ...] = BASE_FEATURE_COLUMNS + PRIORITY2_FEATURE_COLUMNS
+EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "execution_backtest_realized_pnl_delta_usd"
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,8 @@ class TriggerModelTrainingResult:
     selected_trade_quality_threshold: float
     selected_action_confidence_threshold: float
     net_expectancy_per_actionable: float
+    execution_backtest_equity_return: float
+    execution_backtest_realized_pnl_delta_usd: float
 
 
 @dataclass(frozen=True)
@@ -94,7 +103,10 @@ class TriggerPredictionResult:
 class TriggerMonitorResult:
     cycles_completed: int
     alerts_emitted: int
+    paper_trades_attempted: int
+    paper_trades_executed: int
     latest_alert_path: Path | None
+    latest_paper_execution_path: Path | None
     state_path: Path
 
 
@@ -803,6 +815,99 @@ def _derive_expectancy_metrics(
         "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
     }
 
+def _run_execution_aligned_backtest(
+    *,
+    predicted: list[str],
+    close_prices: np.ndarray,
+    symbol: str,
+    paper_notional_usd: float,
+    paper_starting_cash_usd: float,
+    paper_fee_bps: float,
+    paper_slippage_bps: float,
+) -> dict[str, Any]:
+    starting_cash = max(0.0, float(paper_starting_cash_usd))
+    state: dict[str, Any] = {
+        "contract": "paper_portfolio_state.v1",
+        "updated_at_utc": _utc_now_iso(),
+        "starting_cash_usd": starting_cash,
+        "cash_usd": starting_cash,
+        "fee_bps": max(0.0, float(paper_fee_bps)),
+        "positions": {},
+    }
+
+    status_counts: Counter[str] = Counter()
+    action_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    attempted = 0
+    executed = 0
+
+    first_mark_price = 0.0
+    last_mark_price = 0.0
+    for label, mark_price_raw in zip(predicted, close_prices):
+        mark_price = (
+            float(mark_price_raw)
+            if np.isfinite(mark_price_raw)
+            else None
+        )
+        if mark_price is not None and mark_price > 0:
+            if first_mark_price <= 0.0:
+                first_mark_price = mark_price
+            last_mark_price = mark_price
+        if label not in {"buy", "sell"}:
+            continue
+        attempted += 1
+        execution = simulate_paper_trade_execution_step(
+            state=state,
+            symbol=symbol,
+            intent_status="emitted",
+            intent_action=label,
+            requested_notional_usd=max(0.0, float(paper_notional_usd)),
+            mark_price=mark_price,
+            fee_bps=max(0.0, float(paper_fee_bps)),
+            slippage_bps=max(0.0, float(paper_slippage_bps)),
+        )
+        execution_status = str(execution.get("execution_status", "skipped"))
+        executed_action = str(execution.get("executed_action", "hold"))
+        reason = str(execution.get("reason", "unknown"))
+        status_counts.update([execution_status])
+        action_counts.update([executed_action])
+        reason_counts.update([reason])
+        if execution_status == "executed":
+            executed += 1
+
+    position = dict(state.get("positions", {})).get(symbol, {})
+    final_cash = float(state.get("cash_usd", starting_cash))
+    final_quantity = float(position.get("quantity", 0.0))
+    realized_pnl_usd = float(position.get("realized_pnl_usd", 0.0))
+    if last_mark_price <= 0.0:
+        last_mark_price = first_mark_price if first_mark_price > 0.0 else 0.0
+    final_equity = final_cash + (final_quantity * last_mark_price)
+    equity_delta = final_equity - starting_cash
+    rejection_count = int(status_counts.get("rejected", 0))
+    return {
+        "paper_trades_attempted": int(attempted),
+        "paper_trades_executed": int(executed),
+        "paper_trades_rejected": rejection_count,
+        "fill_rate": _safe_div(float(executed), float(attempted)),
+        "rejection_rate": _safe_div(float(rejection_count), float(attempted)),
+        "status_counts": dict(status_counts),
+        "action_counts": dict(action_counts),
+        "reason_counts": dict(reason_counts),
+        "starting_cash_usd": float(starting_cash),
+        "final_cash_usd": float(final_cash),
+        "final_quantity": float(final_quantity),
+        "realized_pnl_delta_usd": float(realized_pnl_usd),
+        "equity_before_usd": float(starting_cash),
+        "equity_after_usd": float(final_equity),
+        "equity_delta_usd": float(equity_delta),
+        "equity_return": _safe_div(float(equity_delta), float(starting_cash)),
+        "first_mark_price": float(first_mark_price),
+        "last_mark_price": float(last_mark_price),
+        "paper_notional_usd": float(max(0.0, paper_notional_usd)),
+        "paper_fee_bps": float(max(0.0, paper_fee_bps)),
+        "paper_slippage_bps": float(max(0.0, paper_slippage_bps)),
+    }
+
 def _apply_action_confidence_gate(
     *,
     predicted: list[str],
@@ -827,8 +932,13 @@ def _evaluate_model(
     *,
     model_payload: dict[str, Any],
     test_frame: pd.DataFrame,
+    symbol: str,
     one_way_cost_bps: float,
     action_confidence_threshold: float,
+    paper_notional_usd: float,
+    paper_starting_cash_usd: float,
+    paper_fee_bps: float,
+    paper_slippage_bps: float,
 ) -> dict[str, Any]:
     expected = test_frame["label"].astype(str).tolist()
     forward_returns = test_frame["forward_return"].to_numpy(dtype=float)
@@ -857,6 +967,15 @@ def _evaluate_model(
         forward_returns=forward_returns,
         one_way_cost_bps=one_way_cost_bps,
     )
+    execution_backtest = _run_execution_aligned_backtest(
+        predicted=predicted,
+        close_prices=test_frame["close"].to_numpy(dtype=float),
+        symbol=symbol,
+        paper_notional_usd=paper_notional_usd,
+        paper_starting_cash_usd=paper_starting_cash_usd,
+        paper_fee_bps=paper_fee_bps,
+        paper_slippage_bps=paper_slippage_bps,
+    )
     return {
         "accuracy": accuracy,
         "confusion_matrix": confusion,
@@ -864,6 +983,7 @@ def _evaluate_model(
         "actionable_metrics": actionable,
         "calibration_metrics": calibration,
         "expectancy_metrics": expectancy,
+        "execution_backtest_metrics": execution_backtest,
         "action_confidence_threshold": float(np.clip(action_confidence_threshold, 0.0, 1.0)),
         "demoted_action_count": int(demoted_action_count),
         "raw_actionable_count": int(sum(1 for label in raw_predicted if label in {"buy", "sell"})),
@@ -918,14 +1038,53 @@ def _candidate_threshold_pairs(
 def _candidate_action_confidence_thresholds(minimum_threshold: float) -> list[float]:
     floor = float(np.clip(minimum_threshold, 0.0, 1.0))
     base = {0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, floor}
-    return [value for value in sorted(float(np.clip(item, 0.0, 1.0)) for item in base) if value >= floor]
+    return [
+        value
+        for value in sorted(float(np.clip(item, 0.0, 1.0)) for item in base)
+        if value >= floor
+    ]
+
+
+def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, float, float, float, float, float, float]:
+    execution_realized_pnl_delta_usd = float(
+        metrics.get(
+            "execution_realized_pnl_delta_usd",
+            metrics.get("realized_pnl_delta_usd", 0.0),
+        )
+    )
+    execution_equity_return = float(
+        metrics.get("execution_equity_return", metrics.get("equity_return", 0.0))
+    )
+    execution_equity_delta_usd = float(
+        metrics.get("execution_equity_delta_usd", metrics.get("equity_delta_usd", 0.0))
+    )
+    binary_actionable_precision = float(metrics.get("binary_actionable_precision", 0.0))
+    actionable_rate = float(metrics.get("actionable_rate", 0.0))
+    execution_fill_rate = float(metrics.get("execution_fill_rate", metrics.get("fill_rate", 0.0)))
+    execution_rejection_rate = float(
+        metrics.get("execution_rejection_rate", metrics.get("rejection_rate", 0.0))
+    )
+    return (
+        execution_realized_pnl_delta_usd,
+        execution_equity_return,
+        execution_equity_delta_usd,
+        binary_actionable_precision,
+        actionable_rate,
+        execution_fill_rate,
+        -execution_rejection_rate,
+    )
 
 
 def _select_action_confidence_frontier(
     *,
     model_payload: dict[str, Any],
     test_frame: pd.DataFrame,
+    symbol: str,
     one_way_cost_bps: float,
+    paper_notional_usd: float,
+    paper_starting_cash_usd: float,
+    paper_fee_bps: float,
+    paper_slippage_bps: float,
     minimum_threshold: float,
     optimize_thresholds: bool,
 ) -> tuple[float, dict[str, Any], list[dict[str, Any]]]:
@@ -937,25 +1096,32 @@ def _select_action_confidence_frontier(
     selected_threshold = float(np.clip(minimum_threshold, 0.0, 1.0))
     selected_evaluation: dict[str, Any] | None = None
     frontier_rows: list[dict[str, Any]] = []
-    best_rank: tuple[float, float, float, float, float] | None = None
+    best_rank: tuple[float, float, float, float, float, float, float] | None = None
 
     for threshold in candidate_thresholds:
         evaluation = _evaluate_model(
             model_payload=model_payload,
             test_frame=test_frame,
+            symbol=symbol,
             one_way_cost_bps=one_way_cost_bps,
             action_confidence_threshold=threshold,
+            paper_notional_usd=paper_notional_usd,
+            paper_starting_cash_usd=paper_starting_cash_usd,
+            paper_fee_bps=paper_fee_bps,
+            paper_slippage_bps=paper_slippage_bps,
         )
         expectancy = dict(evaluation.get("expectancy_metrics", {}))
         actionable = dict(evaluation.get("actionable_metrics", {}))
+        execution_backtest = dict(evaluation.get("execution_backtest_metrics", {}))
         net_expectancy_per_bar = float(expectancy.get("net_expectancy_per_bar", 0.0))
         net_expectancy_per_actionable = float(expectancy.get("net_expectancy_per_actionable", 0.0))
-        break_even_one_way_cost_bps = float(expectancy.get("break_even_one_way_cost_bps", 0.0))
-        cost_aware_gate_pass = (
-            net_expectancy_per_bar > 0.0
-            and net_expectancy_per_actionable > 0.0
-            and break_even_one_way_cost_bps >= float(max(0.0, one_way_cost_bps))
+        execution_equity_return = float(execution_backtest.get("equity_return", 0.0))
+        execution_equity_delta_usd = float(execution_backtest.get("equity_delta_usd", 0.0))
+        execution_realized_pnl_delta_usd = float(
+            execution_backtest.get("realized_pnl_delta_usd", 0.0)
         )
+        execution_fill_rate = float(execution_backtest.get("fill_rate", 0.0))
+        execution_rejection_rate = float(execution_backtest.get("rejection_rate", 0.0))
         row = {
             "threshold": float(threshold),
             "accuracy": float(evaluation.get("accuracy", 0.0)),
@@ -968,50 +1134,34 @@ def _select_action_confidence_frontier(
             "binary_actionable_recall": float(actionable.get("binary_actionable_recall", 0.0)),
             "net_expectancy_per_bar": net_expectancy_per_bar,
             "net_expectancy_per_actionable": net_expectancy_per_actionable,
-            "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
-            "cost_aware_gate_pass": bool(cost_aware_gate_pass),
+            "execution_equity_return": execution_equity_return,
+            "execution_equity_delta_usd": execution_equity_delta_usd,
+            "execution_realized_pnl_delta_usd": execution_realized_pnl_delta_usd,
+            "execution_fill_rate": execution_fill_rate,
+            "execution_rejection_rate": execution_rejection_rate,
         }
         frontier_rows.append(row)
-        rank = (
-            1.0 if cost_aware_gate_pass else 0.0,
-            row["net_expectancy_per_bar"],
-            row["net_expectancy_per_actionable"],
-            row["binary_actionable_precision"],
-            row["actionable_rate"],
-        )
+        rank = _execution_selection_rank(row)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             selected_threshold = float(threshold)
             selected_evaluation = evaluation
 
-    if selected_evaluation is not None and candidate_thresholds:
-        selected_expectancy = dict(selected_evaluation.get("expectancy_metrics", {}))
-        selected_cost_gate_pass = (
-            float(selected_expectancy.get("net_expectancy_per_bar", 0.0)) > 0.0
-            and float(selected_expectancy.get("net_expectancy_per_actionable", 0.0)) > 0.0
-            and float(selected_expectancy.get("break_even_one_way_cost_bps", 0.0))
-            >= float(max(0.0, one_way_cost_bps))
-        )
-        if optimize_thresholds and not selected_cost_gate_pass:
-            strict_threshold = float(max(candidate_thresholds))
-            strict_evaluation = _evaluate_model(
-                model_payload=model_payload,
-                test_frame=test_frame,
-                one_way_cost_bps=one_way_cost_bps,
-                action_confidence_threshold=strict_threshold,
-            )
-            selected_threshold = strict_threshold
-            selected_evaluation = strict_evaluation
-
     if selected_evaluation is None:
         selected_evaluation = _evaluate_model(
             model_payload=model_payload,
             test_frame=test_frame,
+            symbol=symbol,
             one_way_cost_bps=one_way_cost_bps,
             action_confidence_threshold=selected_threshold,
+            paper_notional_usd=paper_notional_usd,
+            paper_starting_cash_usd=paper_starting_cash_usd,
+            paper_fee_bps=paper_fee_bps,
+            paper_slippage_bps=paper_slippage_bps,
         )
         expectancy = dict(selected_evaluation.get("expectancy_metrics", {}))
         actionable = dict(selected_evaluation.get("actionable_metrics", {}))
+        execution_backtest = dict(selected_evaluation.get("execution_backtest_metrics", {}))
         frontier_rows.append(
             {
                 "threshold": float(selected_threshold),
@@ -1029,6 +1179,13 @@ def _select_action_confidence_frontier(
                 "net_expectancy_per_actionable": float(
                     expectancy.get("net_expectancy_per_actionable", 0.0)
                 ),
+                "execution_equity_return": float(execution_backtest.get("equity_return", 0.0)),
+                "execution_equity_delta_usd": float(execution_backtest.get("equity_delta_usd", 0.0)),
+                "execution_realized_pnl_delta_usd": float(
+                    execution_backtest.get("realized_pnl_delta_usd", 0.0)
+                ),
+                "execution_fill_rate": float(execution_backtest.get("fill_rate", 0.0)),
+                "execution_rejection_rate": float(execution_backtest.get("rejection_rate", 0.0)),
             }
         )
     return selected_threshold, selected_evaluation, frontier_rows
@@ -1154,6 +1311,10 @@ def train_trigger_model(
     resolved_cost_bps = float(max(0.0, cost_bps))
     resolved_trade_quality_min_score = float(np.clip(trade_quality_min_score, 0.0, 1.0))
     resolved_action_confidence_threshold = float(np.clip(action_confidence_threshold, 0.0, 1.0))
+    resolved_paper_notional_usd = float(max(0.0, settings.paper_trade_notional_usd))
+    resolved_paper_starting_cash_usd = float(max(0.0, settings.paper_trade_starting_cash_usd))
+    resolved_paper_fee_bps = float(max(0.0, settings.paper_trade_fee_bps))
+    resolved_paper_slippage_bps = float(max(0.0, settings.paper_trade_slippage_bps))
     required_rows = max(30, int(min_train_samples) + 5)
 
     threshold_candidates: list[dict[str, Any]] = []
@@ -1186,11 +1347,17 @@ def train_trigger_model(
             candidate_eval = _evaluate_model(
                 model_payload=candidate_model,
                 test_frame=candidate_test,
+                symbol=symbol,
                 one_way_cost_bps=resolved_cost_bps,
                 action_confidence_threshold=resolved_action_confidence_threshold,
+                paper_notional_usd=resolved_paper_notional_usd,
+                paper_starting_cash_usd=resolved_paper_starting_cash_usd,
+                paper_fee_bps=resolved_paper_fee_bps,
+                paper_slippage_bps=resolved_paper_slippage_bps,
             )
             expectancy = dict(candidate_eval.get("expectancy_metrics", {}))
             actionable = dict(candidate_eval.get("actionable_metrics", {}))
+            execution_backtest = dict(candidate_eval.get("execution_backtest_metrics", {}))
             quality_pass_rate = (
                 float(candidate_labeled["trade_quality_pass"].mean())
                 if "trade_quality_pass" in candidate_labeled and len(candidate_labeled) > 0
@@ -1209,6 +1376,13 @@ def train_trigger_model(
                     "net_expectancy_per_actionable": float(
                         expectancy.get("net_expectancy_per_actionable", 0.0)
                     ),
+                    "execution_equity_return": float(execution_backtest.get("equity_return", 0.0)),
+                    "execution_equity_delta_usd": float(execution_backtest.get("equity_delta_usd", 0.0)),
+                    "execution_realized_pnl_delta_usd": float(
+                        execution_backtest.get("realized_pnl_delta_usd", 0.0)
+                    ),
+                    "execution_fill_rate": float(execution_backtest.get("fill_rate", 0.0)),
+                    "execution_rejection_rate": float(execution_backtest.get("rejection_rate", 0.0)),
                     "actionable_rate": float(actionable.get("actionable_rate", 0.0)),
                     "binary_actionable_precision": float(
                         actionable.get("binary_actionable_precision", 0.0)
@@ -1218,12 +1392,7 @@ def train_trigger_model(
             )
         if threshold_candidates:
             threshold_candidates.sort(
-                key=lambda item: (
-                    float(item.get("net_expectancy_per_bar", 0.0)),
-                    float(item.get("net_expectancy_per_actionable", 0.0)),
-                    float(item.get("binary_actionable_precision", 0.0)),
-                    float(item.get("actionable_rate", 0.0)),
-                ),
+                key=_execution_selection_rank,
                 reverse=True,
             )
             selected_buy_threshold = float(threshold_candidates[0]["buy_threshold"])
@@ -1252,7 +1421,12 @@ def train_trigger_model(
     selected_action_confidence_threshold, evaluation, action_confidence_frontier = _select_action_confidence_frontier(
         model_payload=model,
         test_frame=test_frame,
+        symbol=symbol,
         one_way_cost_bps=resolved_cost_bps,
+        paper_notional_usd=resolved_paper_notional_usd,
+        paper_starting_cash_usd=resolved_paper_starting_cash_usd,
+        paper_fee_bps=resolved_paper_fee_bps,
+        paper_slippage_bps=resolved_paper_slippage_bps,
         minimum_threshold=resolved_action_confidence_threshold,
         optimize_thresholds=bool(optimize_thresholds),
     )
@@ -1262,6 +1436,7 @@ def train_trigger_model(
     actionable_metrics = dict(evaluation.get("actionable_metrics", {}))
     calibration_metrics = dict(evaluation.get("calibration_metrics", {}))
     expectancy_metrics = dict(evaluation.get("expectancy_metrics", {}))
+    execution_backtest_metrics = dict(evaluation.get("execution_backtest_metrics", {}))
 
     distribution = {
         label: int((labeled["label"] == label).sum())
@@ -1343,11 +1518,18 @@ def train_trigger_model(
             "actionable_metrics": actionable_metrics,
             "calibration_metrics": calibration_metrics,
             "expectancy_metrics": expectancy_metrics,
+            "execution_backtest_metrics": execution_backtest_metrics,
+            "execution_backtest_config": {
+                "paper_notional_usd": resolved_paper_notional_usd,
+                "paper_starting_cash_usd": resolved_paper_starting_cash_usd,
+                "paper_fee_bps": resolved_paper_fee_bps,
+                "paper_slippage_bps": resolved_paper_slippage_bps,
+            },
             "one_way_cost_bps": resolved_cost_bps,
         },
         "threshold_optimization": {
             "enabled": bool(optimize_thresholds),
-            "objective": "net_expectancy_per_bar",
+            "objective": EXECUTION_THRESHOLD_SELECTION_OBJECTIVE,
             "candidate_count": int(len(threshold_candidates)),
             "selected": {
                 "buy_threshold": float(selected_buy_threshold),
@@ -1357,7 +1539,7 @@ def train_trigger_model(
             },
             "top_candidates": threshold_candidates[:10],
             "action_confidence_frontier": {
-                "objective": "net_expectancy_per_bar",
+                "objective": EXECUTION_THRESHOLD_SELECTION_OBJECTIVE,
                 "candidate_count": int(len(action_confidence_frontier)),
                 "selected_threshold": float(selected_action_confidence_threshold),
                 "rows": action_confidence_frontier[:20],
@@ -1393,6 +1575,10 @@ def train_trigger_model(
         selected_trade_quality_threshold=float(resolved_trade_quality_min_score),
         selected_action_confidence_threshold=float(selected_action_confidence_threshold),
         net_expectancy_per_actionable=float(expectancy_metrics.get("net_expectancy_per_actionable", 0.0)),
+        execution_backtest_equity_return=float(execution_backtest_metrics.get("equity_return", 0.0)),
+        execution_backtest_realized_pnl_delta_usd=float(
+            execution_backtest_metrics.get("realized_pnl_delta_usd", 0.0)
+        ),
     )
 
 def _resolve_prediction_action_confidence_threshold(
@@ -1486,9 +1672,19 @@ def predict_trigger_signal(
     if recommendation in {"buy", "sell"} and confidence < resolved_action_confidence_threshold:
         recommendation = "hold"
         confidence_gate_applied = True
-    expectancy_metrics = (
-        model_payload.get("training_metrics", {}).get("expectancy_metrics", {})
+    training_metrics_payload = (
+        model_payload.get("training_metrics", {})
         if isinstance(model_payload.get("training_metrics", {}), dict)
+        else {}
+    )
+    expectancy_metrics = (
+        training_metrics_payload.get("expectancy_metrics", {})
+        if isinstance(training_metrics_payload.get("expectancy_metrics", {}), dict)
+        else {}
+    )
+    execution_backtest_metrics = (
+        training_metrics_payload.get("execution_backtest_metrics", {})
+        if isinstance(training_metrics_payload.get("execution_backtest_metrics", {}), dict)
         else {}
     )
     model_net_expectancy_per_actionable = float(
@@ -1500,13 +1696,35 @@ def predict_trigger_signal(
     model_one_way_cost_bps = float(
         expectancy_metrics.get("one_way_cost_bps", 0.0)
     ) if isinstance(expectancy_metrics, dict) else 0.0
+    model_execution_equity_return = float(
+        execution_backtest_metrics.get("equity_return", 0.0)
+    ) if isinstance(execution_backtest_metrics, dict) else 0.0
+    model_execution_realized_pnl_delta_usd = float(
+        execution_backtest_metrics.get("realized_pnl_delta_usd", 0.0)
+    ) if isinstance(execution_backtest_metrics, dict) else 0.0
+    model_execution_fill_rate = float(
+        execution_backtest_metrics.get("fill_rate", 0.0)
+    ) if isinstance(execution_backtest_metrics, dict) else 0.0
+    model_execution_rejection_rate = float(
+        execution_backtest_metrics.get("rejection_rate", 0.0)
+    ) if isinstance(execution_backtest_metrics, dict) else 0.0
+    execution_metric_available = isinstance(execution_backtest_metrics, dict) and bool(execution_backtest_metrics)
+    action_gate_basis = "execution_backtest" if execution_metric_available else "expectancy"
     cost_gate_applied = False
-    if (
-        recommendation in {"buy", "sell"}
-        and (
+    cost_gate_fail = False
+    if action_gate_basis == "execution_backtest":
+        cost_gate_fail = (
+            model_execution_equity_return <= 0.0
+            or model_execution_realized_pnl_delta_usd <= 0.0
+        )
+    else:
+        cost_gate_fail = (
             model_net_expectancy_per_actionable <= 0.0
             or model_break_even_one_way_cost_bps < model_one_way_cost_bps
         )
+    if (
+        recommendation in {"buy", "sell"}
+        and cost_gate_fail
     ):
         recommendation = "hold"
         cost_gate_applied = True
@@ -1534,21 +1752,42 @@ def predict_trigger_signal(
             *reason_details,
         ]
     if cost_gate_applied:
-        gate_reason = (
-            f"cost_gate_demoted_to_hold net_expectancy_per_actionable="
-            f"{model_net_expectancy_per_actionable:.6f} break_even_bps="
-            f"{model_break_even_one_way_cost_bps:.3f} one_way_cost_bps="
-            f"{model_one_way_cost_bps:.3f}"
-        )
+        if action_gate_basis == "execution_backtest":
+            gate_reason = (
+                "cost_gate_demoted_to_hold execution_equity_return="
+                f"{model_execution_equity_return:.6f} execution_realized_pnl_delta_usd="
+                f"{model_execution_realized_pnl_delta_usd:.6f} fill_rate="
+                f"{model_execution_fill_rate:.6f}"
+            )
+        else:
+            gate_reason = (
+                f"cost_gate_demoted_to_hold net_expectancy_per_actionable="
+                f"{model_net_expectancy_per_actionable:.6f} break_even_bps="
+                f"{model_break_even_one_way_cost_bps:.3f} one_way_cost_bps="
+                f"{model_one_way_cost_bps:.3f}"
+            )
         top_reasons = [gate_reason, *top_reasons]
         reason_details = [
             {
-                "feature": "cost_aware_action_gate",
-                "value": float(model_net_expectancy_per_actionable),
-                "impact": float(model_break_even_one_way_cost_bps - model_one_way_cost_bps),
+                "feature": (
+                    "execution_backtest_action_gate"
+                    if action_gate_basis == "execution_backtest"
+                    else "cost_aware_action_gate"
+                ),
+                "value": (
+                    float(model_execution_equity_return)
+                    if action_gate_basis == "execution_backtest"
+                    else float(model_net_expectancy_per_actionable)
+                ),
+                "impact": (
+                    float(model_execution_realized_pnl_delta_usd)
+                    if action_gate_basis == "execution_backtest"
+                    else float(model_break_even_one_way_cost_bps - model_one_way_cost_bps)
+                ),
                 "supports": "hold",
                 "vs_alternative": raw_recommendation,
                 "reason": "cost_gate_demoted_to_hold",
+                "basis": action_gate_basis,
             },
             *reason_details,
         ]
@@ -1583,9 +1822,14 @@ def predict_trigger_signal(
                 "confidence_gate_applied": bool(confidence_gate_applied),
                 "cost_gate_applied": bool(cost_gate_applied),
                 "cost_gate_inputs": {
+                    "basis": action_gate_basis,
                     "model_net_expectancy_per_actionable": model_net_expectancy_per_actionable,
                     "model_break_even_one_way_cost_bps": model_break_even_one_way_cost_bps,
                     "model_one_way_cost_bps": model_one_way_cost_bps,
+                    "model_execution_equity_return": model_execution_equity_return,
+                    "model_execution_realized_pnl_delta_usd": model_execution_realized_pnl_delta_usd,
+                    "model_execution_fill_rate": model_execution_fill_rate,
+                    "model_execution_rejection_rate": model_execution_rejection_rate,
                 },
                 "probabilities": probabilities,
                 "close_price": close_price,
@@ -1674,6 +1918,62 @@ def _send_webhook_notification(url: str, payload: dict[str, Any], timeout_second
         logger.warning("Webhook notification failed url=%s error=%s", url, exc)
 
 
+def _execute_trigger_paper_trade(
+    *,
+    settings: Settings,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    cycle_count: int,
+    prediction: TriggerPredictionResult,
+    notional_usd: float,
+    starting_cash_usd: float,
+    fee_bps: float,
+    slippage_bps: float,
+) -> tuple[PaperTradeIntent, Any]:
+    now = _utc_now()
+    run_id = f"trigger-monitor-{now:%Y%m%dT%H%M%S%fZ}-c{cycle_count:04d}"
+    intent_destination_path = (
+        settings.quant_data_root
+        / "paper-trading"
+        / f"{now:%Y-%m-%d}"
+        / f"paper_trade_intent_{run_id}.json"
+    )
+    action: Recommendation = (
+        prediction.recommendation if prediction.recommendation in {"buy", "sell"} else "hold"
+    )
+    intent = PaperTradeIntent(
+        contract="paper_trade_intent.v1",
+        run_id=run_id,
+        created_at_utc=now.isoformat(),
+        mode="paper",
+        status="emitted" if action in {"buy", "sell"} else "blocked",
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        action=action,
+        notional_usd=max(0.0, float(notional_usd)),
+        risk_approved=action in {"buy", "sell"},
+        reason="trigger_monitor_signal",
+        destination_path=str(intent_destination_path),
+    )
+    write_contract(intent_destination_path, intent)
+    execution = execute_paper_trade_intent(
+        quant_data_root=settings.quant_data_root,
+        run_id=run_id,
+        created_at_utc=now.isoformat(),
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        intent=intent,
+        mark_price=float(prediction.close_price),
+        starting_cash_usd=max(0.0, float(starting_cash_usd)),
+        fee_bps=max(0.0, float(fee_bps)),
+        slippage_bps=max(0.0, float(slippage_bps)),
+    )
+    return intent, execution
+
+
 def monitor_trigger_signals(
     *,
     settings: Settings,
@@ -1690,10 +1990,18 @@ def monitor_trigger_signals(
     priority2_features_enabled: bool = True,
     priority2_external_features_path: Path | None = None,
     priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
+    paper_trading_enabled: bool = False,
+    paper_notional_usd: float = 100.0,
+    paper_starting_cash_usd: float = 10000.0,
+    paper_fee_bps: float = 5.0,
+    paper_slippage_bps: float = 1.0,
 ) -> TriggerMonitorResult:
     cycle_count = 0
     alert_count = 0
+    paper_trades_attempted = 0
+    paper_trades_executed = 0
     latest_alert_path: Path | None = None
+    latest_paper_execution_path: Path | None = None
     state_path = settings.quant_data_root / "logs" / "agents" / "trigger-monitor" / "state.json"
     state = _load_monitor_state(state_path)
 
@@ -1784,7 +2092,58 @@ def monitor_trigger_signals(
                 "model_path": str(prediction.model_path),
                 "source_data_path": str(prediction.source_data_path),
                 "source_data_sha256": prediction.source_data_sha256,
+                "paper_trading_enabled": bool(paper_trading_enabled),
             }
+            if paper_trading_enabled and is_actionable:
+                try:
+                    paper_intent, paper_execution = _execute_trigger_paper_trade(
+                        settings=settings,
+                        exchange=exchange,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        cycle_count=cycle_count,
+                        prediction=prediction,
+                        notional_usd=paper_notional_usd,
+                        starting_cash_usd=paper_starting_cash_usd,
+                        fee_bps=paper_fee_bps,
+                        slippage_bps=paper_slippage_bps,
+                    )
+                    paper_trades_attempted += 1
+                    if str(paper_execution.execution_status) == "executed":
+                        paper_trades_executed += 1
+                    if paper_execution.execution_record_path:
+                        latest_paper_execution_path = Path(str(paper_execution.execution_record_path))
+                    alert_payload["paper_trade_intent_path"] = paper_intent.destination_path
+                    alert_payload["paper_trade_execution_status"] = paper_execution.execution_status
+                    alert_payload["paper_trade_executed_action"] = paper_execution.executed_action
+                    alert_payload["paper_trade_executed_notional_usd"] = paper_execution.executed_notional_usd
+                    alert_payload["paper_trade_execution_reason"] = paper_execution.reason
+                    alert_payload["paper_trade_execution_record_path"] = (
+                        str(paper_execution.execution_record_path)
+                        if paper_execution.execution_record_path
+                        else None
+                    )
+                    print(
+                        f"[paper] cycle={cycle_count} "
+                        f"status={paper_execution.execution_status} "
+                        f"action={str(paper_execution.executed_action).upper()} "
+                        f"notional={paper_execution.executed_notional_usd:.2f}"
+                    )
+                    state["last_paper_trade_status"] = str(paper_execution.execution_status)
+                    state["last_paper_trade_action"] = str(paper_execution.executed_action)
+                    state["last_paper_trade_notional_usd"] = float(paper_execution.executed_notional_usd)
+                    state["last_paper_trade_reason"] = str(paper_execution.reason)
+                    state["last_paper_trade_execution_record_path"] = (
+                        str(paper_execution.execution_record_path)
+                        if paper_execution.execution_record_path
+                        else None
+                    )
+                except Exception as exc:
+                    logger.warning("Monitor cycle=%s paper trade execution failed: %s", cycle_count, exc)
+                    alert_payload["paper_trade_execution_status"] = "error"
+                    alert_payload["paper_trade_execution_error"] = str(exc)
+                    state["last_paper_trade_status"] = "error"
+                    state["last_paper_trade_reason"] = str(exc)
             _append_jsonl(alert_path, alert_payload)
             latest_alert_path = alert_path
             alert_count += 1
@@ -1828,6 +2187,9 @@ def monitor_trigger_signals(
     return TriggerMonitorResult(
         cycles_completed=cycle_count,
         alerts_emitted=alert_count,
+        paper_trades_attempted=paper_trades_attempted,
+        paper_trades_executed=paper_trades_executed,
         latest_alert_path=latest_alert_path,
+        latest_paper_execution_path=latest_paper_execution_path,
         state_path=state_path,
     )

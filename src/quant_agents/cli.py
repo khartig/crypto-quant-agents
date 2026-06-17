@@ -749,7 +749,10 @@ def _base_parser() -> argparse.ArgumentParser:
         "--optimize-thresholds",
         dest="optimize_thresholds",
         action="store_true",
-        help="Enable threshold optimization by net expectancy.",
+        help=(
+            "Enable threshold optimization by execution-aligned realized PnL "
+            "(with equity return tie-breakers)."
+        ),
     )
     trigger_train.add_argument(
         "--no-optimize-thresholds",
@@ -878,12 +881,48 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Also notify for hold predictions (disabled by default).",
     )
     trigger_monitor.add_argument(
+        "--paper-trading-enabled",
+        dest="paper_trading_enabled",
+        action="store_true",
+        help="Enable paper-trading execution for actionable trigger alerts.",
+    )
+    trigger_monitor.add_argument(
+        "--no-paper-trading-enabled",
+        dest="paper_trading_enabled",
+        action="store_false",
+        help="Disable paper-trading execution for monitor runs.",
+    )
+    trigger_monitor.add_argument(
+        "--paper-notional-usd",
+        type=float,
+        default=None,
+        help="Paper-trade notional USD for each actionable trigger execution.",
+    )
+    trigger_monitor.add_argument(
+        "--paper-starting-cash-usd",
+        type=float,
+        default=None,
+        help="Starting cash USD used for paper-trading portfolio state initialization.",
+    )
+    trigger_monitor.add_argument(
+        "--paper-fee-bps",
+        type=float,
+        default=None,
+        help="Per-trade paper execution fee in basis points.",
+    )
+    trigger_monitor.add_argument(
+        "--paper-slippage-bps",
+        type=float,
+        default=None,
+        help="Per-trade paper execution slippage in basis points.",
+    )
+    trigger_monitor.add_argument(
         "--max-cycles",
         type=int,
         default=None,
         help="Optional finite cycle cap for bounded monitor runs.",
     )
-    trigger_monitor.set_defaults(priority2_features_enabled=None)
+    trigger_monitor.set_defaults(priority2_features_enabled=None, paper_trading_enabled=None)
 
     doctor = subparsers.add_parser(
         "doctor",
@@ -1142,6 +1181,10 @@ def main(argv: list[str] | None = None) -> None:
             metric["selected_buy_threshold"] = result.selected_buy_threshold
             metric["selected_sell_threshold"] = result.selected_sell_threshold
             metric["net_expectancy_per_actionable"] = result.net_expectancy_per_actionable
+            metric["execution_backtest_equity_return"] = result.execution_backtest_equity_return
+            metric["execution_backtest_realized_pnl_delta_usd"] = (
+                result.execution_backtest_realized_pnl_delta_usd
+            )
             metric["selected_trade_quality_threshold"] = result.selected_trade_quality_threshold
             metric["selected_action_confidence_threshold"] = result.selected_action_confidence_threshold
         print(
@@ -1150,7 +1193,9 @@ def main(argv: list[str] | None = None) -> None:
             f"(samples={result.sample_count} accuracy={result.accuracy:.3f} "
             f"buy_th={result.selected_buy_threshold:.4f} sell_th={result.selected_sell_threshold:.4f} "
             f"quality_th={result.selected_trade_quality_threshold:.3f} "
-            f"conf_th={result.selected_action_confidence_threshold:.3f})"
+            f"conf_th={result.selected_action_confidence_threshold:.3f} "
+            f"exec_realized_pnl={result.execution_backtest_realized_pnl_delta_usd:.4f} "
+            f"exec_equity_ret={result.execution_backtest_equity_return:.4f})"
         )
         return
 
@@ -1765,6 +1810,43 @@ def main(argv: list[str] | None = None) -> None:
         )
         webhook_url = args.webhook_url or settings.trigger_monitor_webhook_url
         notify_on_hold = bool(args.notify_on_hold or settings.trigger_monitor_notify_on_hold)
+        paper_trading_enabled = (
+            bool(args.paper_trading_enabled)
+            if args.paper_trading_enabled is not None
+            else bool(settings.trigger_monitor_paper_trading_enabled)
+        )
+        paper_notional_usd = max(
+            0.0,
+            float(
+                args.paper_notional_usd
+                if args.paper_notional_usd is not None
+                else settings.paper_trade_notional_usd
+            ),
+        )
+        paper_starting_cash_usd = max(
+            0.0,
+            float(
+                args.paper_starting_cash_usd
+                if args.paper_starting_cash_usd is not None
+                else settings.paper_trade_starting_cash_usd
+            ),
+        )
+        paper_fee_bps = max(
+            0.0,
+            float(
+                args.paper_fee_bps
+                if args.paper_fee_bps is not None
+                else settings.paper_trade_fee_bps
+            ),
+        )
+        paper_slippage_bps = max(
+            0.0,
+            float(
+                args.paper_slippage_bps
+                if args.paper_slippage_bps is not None
+                else settings.paper_trade_slippage_bps
+            ),
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="monitor-triggers",
@@ -1789,17 +1871,32 @@ def main(argv: list[str] | None = None) -> None:
                 priority2_features_enabled=bool(priority2_features_enabled),
                 priority2_external_features_path=priority2_external_features_path,
                 priority2_feature_columns=priority2_feature_columns,
+                paper_trading_enabled=paper_trading_enabled,
+                paper_notional_usd=paper_notional_usd,
+                paper_starting_cash_usd=paper_starting_cash_usd,
+                paper_fee_bps=paper_fee_bps,
+                paper_slippage_bps=paper_slippage_bps,
             )
             metric["cycles_completed"] = result.cycles_completed
             metric["alerts_emitted"] = result.alerts_emitted
+            metric["paper_trading_enabled"] = bool(paper_trading_enabled)
+            metric["paper_trades_attempted"] = result.paper_trades_attempted
+            metric["paper_trades_executed"] = result.paper_trades_executed
             metric["latest_alert_path"] = (
                 str(result.latest_alert_path) if result.latest_alert_path else None
+            )
+            metric["latest_paper_execution_path"] = (
+                str(result.latest_paper_execution_path)
+                if result.latest_paper_execution_path
+                else None
             )
             metric["state_path"] = str(result.state_path)
         print(
             "Trigger monitor complete -> "
             f"cycles={result.cycles_completed} "
             f"alerts={result.alerts_emitted} "
+            f"paper_attempted={result.paper_trades_attempted} "
+            f"paper_executed={result.paper_trades_executed} "
             f"state={result.state_path}"
         )
         return
