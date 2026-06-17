@@ -33,6 +33,11 @@ from quant_agents.backtest import (
 from quant_agents.config import Settings
 from quant_agents.ollama_client import OllamaClient
 from quant_agents.paper_trading import execute_paper_trade_intent
+from quant_agents.priority2_features import (
+    PRIORITY2_FEATURE_COLUMNS,
+    build_priority2_feature_bundle,
+    write_priority2_feature_artifacts,
+)
 from quant_agents.regime_detection import RegimeDetectionConfig, detect_regime_from_frame
 from quant_agents.storage import latest_raw_dataset
 
@@ -73,6 +78,7 @@ class AgentPlaneConfig:
     paper_fee_bps: float
     paper_slippage_bps: float
     minimum_bars: int
+    regime_enabled: bool = True
     regime_detector_mode: str = "score"
     regime_policy_mode: str = "legacy"
     regime_policy_min_actionable_confidence: float = 0.50
@@ -109,6 +115,8 @@ class AgentPlaneConfig:
     ensemble_decay_horizon: int = 96
     ensemble_exploration_weight: float = 0.08
     ensemble_turnover_penalty_bps: float = 8.0
+    priority2_features_enabled: bool = True
+    priority2_external_features_path: Path | None = None
     source_data_path: Path | None = None
     strategy_fast_window: int | None = None
     strategy_slow_window: int | None = None
@@ -136,6 +144,8 @@ class AgentPlaneRunResult:
     backtest_evaluation_path: Path
     backtest_arm_attribution_path: Path | None
     phase1_feature_context_path: Path
+    priority2_feature_contract_path: Path
+    priority2_feature_parquet_path: Path
     walkforward_evaluation_path: Path
     confidence_calibration_path: Path
     self_critique_signal_path: Path
@@ -835,6 +845,10 @@ def _compute_phase1_feature_context(
     regime_trend_spread_threshold: float,
     regime_persistence_bars: int,
     regime_ablation_mode: bool = False,
+    regime_disabled: bool = False,
+    priority2_feature_snapshot: dict[str, float] | None = None,
+    priority2_reason_codes: list[str] | None = None,
+    priority2_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     close = pd.to_numeric(frame.get("close"), errors="coerce").ffill().bfill()
     high = pd.to_numeric(frame.get("high"), errors="coerce").ffill().bfill()
@@ -941,7 +955,7 @@ def _compute_phase1_feature_context(
         reason_codes.append("price_inside_bands")
 
     if regime_ablation_mode:
-        reason_codes.append("regime_ablation_mode_enabled")
+        reason_codes.append("regime_disabled" if regime_disabled else "regime_ablation_mode_enabled")
     else:
         if regime == "volatile":
             vote_counts["hold"] += 0.75
@@ -981,6 +995,43 @@ def _compute_phase1_feature_context(
         "volume_zscore_24": latest_volume_zscore,
         "regime_confidence": output_regime_confidence,
     }
+    normalized_priority2_snapshot: dict[str, float] = {}
+    if isinstance(priority2_feature_snapshot, dict):
+        for key, value in priority2_feature_snapshot.items():
+            if not isinstance(key, str):
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(parsed):
+                normalized_priority2_snapshot[key] = parsed
+    if normalized_priority2_snapshot:
+        feature_snapshot.update(normalized_priority2_snapshot)
+
+    normalized_priority2_reason_codes = sorted(
+        set(
+            [
+                str(code).strip().lower().replace(" ", "_")
+                for code in (priority2_reason_codes or [])
+                if str(code).strip()
+            ]
+        )
+    )
+    normalized_priority2_diagnostics = (
+        dict(priority2_diagnostics) if isinstance(priority2_diagnostics, dict) else {}
+    )
+    quality_score = normalized_priority2_diagnostics.get("quality_score")
+    try:
+        if quality_score is not None:
+            feature_snapshot["priority2_quality_score"] = float(quality_score)
+    except (TypeError, ValueError):
+        pass
+    base_reason_codes = (
+        sorted(set(reason_codes))
+        if regime_ablation_mode
+        else sorted(set([*reason_codes, *regime_reason_codes]))
+    )
     return {
         "regime": output_regime,
         "regime_confidence": output_regime_confidence,
@@ -988,11 +1039,11 @@ def _compute_phase1_feature_context(
         "regime_diagnostics": output_regime_diagnostics,
         "indicator_votes": indicator_votes,
         "feature_snapshot": feature_snapshot,
-        "reason_codes": (
-            sorted(set(reason_codes))
-            if regime_ablation_mode
-            else sorted(set([*reason_codes, *regime_reason_codes]))
-        ),
+        "priority2_feature_snapshot": normalized_priority2_snapshot,
+        "priority2_reason_codes": normalized_priority2_reason_codes,
+        "priority2_diagnostics": normalized_priority2_diagnostics,
+        "priority2_feature_columns": list(PRIORITY2_FEATURE_COLUMNS),
+        "reason_codes": sorted(set([*base_reason_codes, *normalized_priority2_reason_codes])),
     }
 
 
@@ -2413,11 +2464,16 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     )
     step_records: list[StepExecutionRecord] = []
     regime_policy_mode = _normalize_regime_policy_mode(config.regime_policy_mode)
+    regime_enabled = bool(config.regime_enabled)
+    regime_ablation_active = bool(config.regime_ablation_mode or not regime_enabled)
+    regime_off_reason_code = (
+        "regime_disabled" if not regime_enabled else "regime_ablation_mode_enabled"
+    )
     regime_touchpoints = {
-        "prompting": bool((not config.regime_ablation_mode) and config.regime_touchpoint_prompting_enabled),
-        "calibration": bool((not config.regime_ablation_mode) and config.regime_touchpoint_calibration_enabled),
-        "self_critique": bool((not config.regime_ablation_mode) and config.regime_touchpoint_self_critique_enabled),
-        "risk_gate": bool((not config.regime_ablation_mode) and config.regime_touchpoint_risk_gate_enabled),
+        "prompting": bool((not regime_ablation_active) and config.regime_touchpoint_prompting_enabled),
+        "calibration": bool((not regime_ablation_active) and config.regime_touchpoint_calibration_enabled),
+        "self_critique": bool((not regime_ablation_active) and config.regime_touchpoint_self_critique_enabled),
+        "risk_gate": bool((not regime_ablation_active) and config.regime_touchpoint_risk_gate_enabled),
     }
 
     data_quality_path = run_dir / "data_quality_signal.json"
@@ -2434,6 +2490,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     ops_report_contract_path = run_dir / "ops_report_contract.json"
     run_manifest_path = run_dir / "run_manifest.json"
     ensemble_performance_update_path = run_dir / "ensemble_performance_update.json"
+    priority2_feature_parquet_path = run_dir / "priority2_features.parquet"
+    priority2_feature_contract_path = run_dir / "priority2_feature_contract.json"
     ensemble_weight_state_path = (
         settings.quant_data_root / "paper-trading" / "state" / "ensemble_weight_state.json"
     )
@@ -2493,6 +2551,22 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
     step_records.append(data_quality_step)
 
     def phase1_feature_runner() -> dict[str, Any]:
+        nonlocal priority2_feature_parquet_path, priority2_feature_contract_path
+        priority2_bundle = build_priority2_feature_bundle(
+            market_frame,
+            features_enabled=bool(config.priority2_features_enabled),
+            external_features_path=config.priority2_external_features_path,
+        )
+        priority2_artifacts = write_priority2_feature_artifacts(
+            quant_data_root=settings.quant_data_root,
+            exchange=config.exchange,
+            symbol=config.symbol,
+            timeframe=config.timeframe,
+            run_id=run_id,
+            bundle=priority2_bundle,
+        )
+        priority2_feature_parquet_path = priority2_artifacts.parquet_path
+        priority2_feature_contract_path = priority2_artifacts.contract_path
         return {
             "contract": "phase1_feature_context.v1",
             "run_id": run_id,
@@ -2502,13 +2576,29 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "timeframe": config.timeframe,
             "input_data_path": str(source_data_path),
             "input_data_sha256": source_data_sha256,
+            "regime_enabled": bool(regime_enabled),
+            "regime_ablation_mode": bool(regime_ablation_active),
+            "priority2_features_enabled": bool(config.priority2_features_enabled),
+            "priority2_external_features_path": (
+                str(config.priority2_external_features_path)
+                if config.priority2_external_features_path is not None
+                else None
+            ),
+            "priority2_feature_artifacts": {
+                "priority2_feature_parquet": str(priority2_feature_parquet_path),
+                "priority2_feature_contract": str(priority2_feature_contract_path),
+            },
             **_compute_phase1_feature_context(
                 market_frame,
                 regime_detector_mode=config.regime_detector_mode,
                 regime_volatility_threshold=config.regime_volatility_threshold,
                 regime_trend_spread_threshold=config.regime_trend_spread_threshold,
                 regime_persistence_bars=config.regime_persistence_bars,
-                regime_ablation_mode=bool(config.regime_ablation_mode),
+                regime_ablation_mode=bool(regime_ablation_active),
+                regime_disabled=not regime_enabled,
+                priority2_feature_snapshot=dict(priority2_bundle.feature_snapshot),
+                priority2_reason_codes=list(priority2_bundle.reason_codes),
+                priority2_diagnostics=dict(priority2_bundle.diagnostics),
             ),
         }
 
@@ -2539,7 +2629,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             preferred_fast_window=strategy_fast_window,
             preferred_slow_window=strategy_slow_window,
             regime_prompting_enabled=bool(regime_touchpoints["prompting"]),
-            regime_ablation_mode=bool(config.regime_ablation_mode),
+            regime_ablation_mode=bool(regime_ablation_active),
         )
         raw_response = ollama.generate(
             model=config.strategy_model,
@@ -2595,13 +2685,13 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             payload.get("reason_codes"),
             fallback=list(phase1_feature_context.get("reason_codes", [])),
         )
-        if config.regime_ablation_mode:
-            warnings.append("regime_ablation_mode_enabled")
+        if regime_ablation_active:
+            warnings.append(regime_off_reason_code)
             regime = "unknown"
             regime_confidence = 0.5
             regime_transition = "none"
             regime_diagnostics = {"ablation_mode": True}
-            reason_codes = sorted(set([*reason_codes, "regime_ablation_mode_enabled"]))
+            reason_codes = sorted(set([*reason_codes, regime_off_reason_code]))
 
         return StrategyProposalSignal(
             contract="strategy_proposal_signal.v1",
@@ -2637,13 +2727,13 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         fallback_regime_diagnostics = dict(phase1_feature_context.get("regime_diagnostics", {}))
         fallback_reason_codes = list(phase1_feature_context.get("reason_codes", []))
         fallback_warnings = list(errors)
-        if config.regime_ablation_mode:
-            fallback_warnings.append("regime_ablation_mode_enabled")
+        if regime_ablation_active:
+            fallback_warnings.append(regime_off_reason_code)
             fallback_regime = "unknown"
             fallback_regime_confidence = 0.5
             fallback_regime_transition = "none"
             fallback_regime_diagnostics = {"ablation_mode": True}
-            fallback_reason_codes = sorted(set([*fallback_reason_codes, "regime_ablation_mode_enabled"]))
+            fallback_reason_codes = sorted(set([*fallback_reason_codes, regime_off_reason_code]))
         return StrategyProposalSignal(
             contract="strategy_proposal_signal.v1",
             run_id=run_id,
@@ -2974,7 +3064,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             quality_penalty_strength=config.calibration_quality_penalty_strength,
             directional_contradiction_penalty=config.calibration_directional_contradiction_penalty,
             cost_pressure_penalty_strength=config.calibration_cost_pressure_penalty_strength,
-            regime_ablation_mode=bool(config.regime_ablation_mode),
+            regime_ablation_mode=bool(regime_ablation_active),
             regime_calibration_enabled=bool(regime_touchpoints["calibration"]),
         )
 
@@ -3014,7 +3104,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                 "regime_confidence": strategy_signal.regime_confidence,
                 "regime_transition": strategy_signal.regime_transition,
                 "regime_diagnostics": strategy_signal.regime_diagnostics,
-                "regime_ablation_mode": bool(config.regime_ablation_mode),
+                "regime_ablation_mode": bool(regime_ablation_active),
                 "regime_calibration_enabled": bool(regime_touchpoints["calibration"]),
                 "indicator_votes": strategy_signal.indicator_votes,
                 "feature_snapshot": strategy_signal.feature_snapshot,
@@ -3065,7 +3155,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             min_score=config.self_critique_min_score,
             max_findings=max(1, config.self_critique_max_findings),
             timeframe=config.timeframe,
-            regime_ablation_mode=bool(config.regime_ablation_mode),
+            regime_ablation_mode=bool(regime_ablation_active),
             regime_self_critique_enabled=bool(regime_touchpoints["self_critique"]),
         )
 
@@ -3239,10 +3329,19 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "phase1_regime_confidence": regime_confidence,
             "phase1_regime_transition": regime_transition,
             "phase1_regime_diagnostics": strategy_signal.regime_diagnostics,
-            "phase1_regime_ablation_mode": bool(config.regime_ablation_mode),
+            "phase1_regime_enabled": bool(regime_enabled),
+            "phase1_regime_ablation_mode": bool(regime_ablation_active),
             "phase1_regime_touchpoint_risk_gate_enabled": bool(regime_touchpoints["risk_gate"]),
             "phase1_indicator_votes": strategy_signal.indicator_votes,
             "phase1_feature_snapshot": strategy_signal.feature_snapshot,
+            "phase1_priority2_feature_snapshot": phase1_feature_context.get(
+                "priority2_feature_snapshot",
+                {},
+            ),
+            "phase1_priority2_reason_codes": phase1_feature_context.get(
+                "priority2_reason_codes",
+                [],
+            ),
             "self_critique_pass": self_critique_pass,
             "self_critique_score": self_critique_score,
             "self_critique_highest_severity": self_critique_highest,
@@ -3263,7 +3362,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "max_contradictions": float(config.calibration_max_contradictions),
             "min_walkforward_quality_score": config.thresholds.min_walkforward_quality_score,
             "min_regime_confidence": config.thresholds.min_regime_confidence,
-            "regime_ablation_mode": bool(config.regime_ablation_mode),
+            "regime_enabled": bool(regime_enabled),
+            "regime_ablation_mode": bool(regime_ablation_active),
             "regime_policy_mode": regime_policy_mode,
             "regime_touchpoint_prompting_enabled": bool(regime_touchpoints["prompting"]),
             "regime_touchpoint_calibration_enabled": bool(regime_touchpoints["calibration"]),
@@ -3429,13 +3529,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         )
 
         if actionable:
-            if (not regime_touchpoints["risk_gate"]) or config.regime_ablation_mode:
+            if (not regime_touchpoints["risk_gate"]) or regime_ablation_active:
                 decision_trace.append(
                     {
                         "gate": "regime",
                         "metric": "ablation_mode",
                         "observed": {
-                            "regime_ablation_mode": bool(config.regime_ablation_mode),
+                            "regime_enabled": bool(regime_enabled),
+                            "regime_ablation_mode": bool(regime_ablation_active),
                             "touchpoint_enabled": bool(regime_touchpoints["risk_gate"]),
                         },
                         "threshold": "regime checks disabled",
@@ -3981,6 +4082,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "backtest_arm_attribution": backtest_evaluation.arm_attribution_path or "",
             "ensemble_weight_state": str(ensemble_state_path),
             "ensemble_performance_update": str(ensemble_performance_update_path),
+            "priority2_feature_contract": str(priority2_feature_contract_path),
+            "priority2_feature_parquet": str(priority2_feature_parquet_path),
         },
         arm_votes=dict(risk_decision.arm_votes),
         arm_weights=dict(risk_decision.arm_weights),
@@ -4025,6 +4128,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "self_critique_min_score": config.self_critique_min_score,
             "self_critique_max_findings": config.self_critique_max_findings,
             "ops_report_verbosity": _normalize_report_verbosity(config.ops_report_verbosity),
+            "regime_enabled": bool(regime_enabled),
             "regime_detector_mode": str(config.regime_detector_mode).strip().lower(),
             "regime_policy_mode": regime_policy_mode,
             "regime_policy_min_actionable_confidence": float(
@@ -4043,7 +4147,14 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                 float(config.regime_trend_spread_threshold),
             ),
             "regime_persistence_bars": max(1, int(config.regime_persistence_bars)),
-            "regime_ablation_mode": bool(config.regime_ablation_mode),
+            "regime_ablation_mode_requested": bool(config.regime_ablation_mode),
+            "regime_ablation_mode": bool(regime_ablation_active),
+            "priority2_features_enabled": bool(config.priority2_features_enabled),
+            "priority2_external_features_path": (
+                str(config.priority2_external_features_path)
+                if config.priority2_external_features_path is not None
+                else None
+            ),
             "ensemble_mode": ensemble_mode,
             "ensemble_enabled_arms": list(enabled_arms),
             "ensemble_decay_horizon": max(4, int(config.ensemble_decay_horizon)),
@@ -4079,6 +4190,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "backtest_arm_attribution": str(backtest_arm_attribution_path)
             if backtest_arm_attribution_path
             else None,
+            "priority2_feature_contract": str(priority2_feature_contract_path),
+            "priority2_feature_parquet": str(priority2_feature_parquet_path),
             "ensemble_weight_state": str(ensemble_state_path),
             "ensemble_performance_update": str(ensemble_performance_update_path),
             "paper_trade_destination": str(intent_destination_path) if intent_destination_path else None,
@@ -4095,7 +4208,15 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "phase1_regime": strategy_signal.regime,
             "phase1_regime_confidence": strategy_signal.regime_confidence,
             "phase1_regime_transition": strategy_signal.regime_transition,
-            "phase1_regime_ablation_mode": bool(config.regime_ablation_mode),
+            "phase1_regime_enabled": bool(regime_enabled),
+            "phase1_regime_ablation_mode_requested": bool(config.regime_ablation_mode),
+            "phase1_regime_ablation_mode": bool(regime_ablation_active),
+            "priority2_features_enabled": bool(config.priority2_features_enabled),
+            "priority2_feature_quality_score": (
+                phase1_feature_context.get("priority2_diagnostics", {}).get("quality_score")
+                if isinstance(phase1_feature_context.get("priority2_diagnostics"), dict)
+                else None
+            ),
             "regime_policy_mode": regime_policy_mode,
             "regime_touchpoints": dict(regime_touchpoints),
             "walkforward_quality_score": confidence_calibration.get("walkforward_quality_score"),
@@ -4132,6 +4253,8 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         backtest_evaluation_path=backtest_evaluation_path,
         backtest_arm_attribution_path=backtest_arm_attribution_path,
         phase1_feature_context_path=phase1_feature_context_path,
+        priority2_feature_contract_path=priority2_feature_contract_path,
+        priority2_feature_parquet_path=priority2_feature_parquet_path,
         walkforward_evaluation_path=walkforward_evaluation_path,
         confidence_calibration_path=confidence_calibration_path,
         self_critique_signal_path=self_critique_signal_path,

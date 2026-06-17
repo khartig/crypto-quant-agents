@@ -1,0 +1,17 @@
+# Profitability Improvement Ideas (Simple-First)
+- Run baseline mode in production now
+  - Disable external derivatives/whale features for live predictions until they prove positive out-of-sample.
+- Add a hard quality gate before using external data
+  - Only allow external features when `fallback_mode=none` and coverage is above a minimum threshold (for example `>= 0.50`).
+- Use derivatives data as a confirmation filter, not a core driver
+  - Keep base-model signals as primary and require derivatives/whale features to confirm before executing action.
+- Trade less frequently
+  - Raise action-confidence threshold and/or widen buy/sell thresholds to reduce low-edge trades.
+- Constrain threshold optimization
+  - Keep optimization enabled but limit search space to conservative ranges to avoid high-turnover behavior.
+- Add a cost-aware action gate
+  - Block actions unless expected edge exceeds fees/slippage by a safety margin.
+- Keep only 1-3 robust external features
+  - Start with funding + basis + open interest, and add others only after proven incremental lift.
+- Use rolling walk-forward model selection
+  - Choose configurations with stable positive net expectancy across windows, not just one backtest.

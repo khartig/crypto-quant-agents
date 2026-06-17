@@ -19,6 +19,9 @@ JobStatus = Literal["queued", "running", "succeeded", "blocked", "failed"]
 TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"succeeded", "blocked", "failed"})
 REQUIRED_ARTIFACT_KEYS: tuple[str, ...] = (
     "data_quality_signal",
+    "phase1_feature_context",
+    "priority2_feature_contract",
+    "priority2_feature_parquet",
     "walkforward_evaluation",
     "confidence_calibration",
     "self_critique_signal",
@@ -83,6 +86,7 @@ class OpenClawOrchestrationRequest:
     ops_model: str
     step_retries: int
     minimum_bars: int
+    regime_enabled: bool
     regime_detector_mode: str
     regime_policy_mode: str
     regime_policy_min_actionable_confidence: float
@@ -131,6 +135,8 @@ class OpenClawOrchestrationRequest:
     paper_starting_cash_usd: float
     paper_fee_bps: float
     paper_slippage_bps: float
+    priority2_features_enabled: bool
+    priority2_external_features_path: str | None
     source_data_path: str | None = None
 
     @staticmethod
@@ -143,6 +149,10 @@ class OpenClawOrchestrationRequest:
             ops_model=str(payload.get("ops_model") or settings.ollama_ops_model),
             step_retries=max(0, int(payload.get("step_retries", settings.agent_step_retries))),
             minimum_bars=max(10, int(payload.get("minimum_bars", settings.agent_minimum_bars))),
+            regime_enabled=_coerce_bool(
+                payload.get("regime_enabled"),
+                default=bool(settings.regime_enabled),
+            ),
             regime_detector_mode=str(
                 payload.get("regime_detector_mode", settings.regime_detector_mode)
             ).strip().lower(),
@@ -387,6 +397,19 @@ class OpenClawOrchestrationRequest:
             paper_slippage_bps=float(
                 payload.get("paper_slippage_bps", settings.paper_trade_slippage_bps)
             ),
+            priority2_features_enabled=_coerce_bool(
+                payload.get("priority2_features_enabled"),
+                default=bool(settings.priority2_features_enabled),
+            ),
+            priority2_external_features_path=(
+                str(payload["priority2_external_features_path"])
+                if payload.get("priority2_external_features_path")
+                else (
+                    str(settings.priority2_external_features_path)
+                    if settings.priority2_external_features_path
+                    else None
+                )
+            ),
             source_data_path=(str(payload["source_data_path"]) if payload.get("source_data_path") else None),
         )
 
@@ -418,6 +441,7 @@ class OpenClawOrchestrationRequest:
             paper_fee_bps=self.paper_fee_bps,
             paper_slippage_bps=max(0.0, float(self.paper_slippage_bps)),
             minimum_bars=self.minimum_bars,
+            regime_enabled=bool(self.regime_enabled),
             regime_detector_mode=(
                 self.regime_detector_mode if self.regime_detector_mode in {"heuristic", "score"} else "score"
             ),
@@ -471,6 +495,10 @@ class OpenClawOrchestrationRequest:
             ensemble_decay_horizon=max(4, int(self.ensemble_decay_horizon)),
             ensemble_exploration_weight=max(0.0, float(self.ensemble_exploration_weight)),
             ensemble_turnover_penalty_bps=max(0.0, float(self.ensemble_turnover_penalty_bps)),
+            priority2_features_enabled=bool(self.priority2_features_enabled),
+            priority2_external_features_path=Path(self.priority2_external_features_path).expanduser().resolve()
+            if self.priority2_external_features_path
+            else None,
             source_data_path=Path(self.source_data_path).expanduser().resolve()
             if self.source_data_path
             else None,
@@ -496,6 +524,8 @@ def run_openclaw_orchestration(
         "artifacts": {
             "data_quality_signal": str(result.data_quality_path),
             "phase1_feature_context": str(result.phase1_feature_context_path),
+            "priority2_feature_contract": str(result.priority2_feature_contract_path),
+            "priority2_feature_parquet": str(result.priority2_feature_parquet_path),
             "strategy_proposal_signal": str(result.strategy_signal_path),
             "backtest_evaluation": str(result.backtest_evaluation_path),
             "backtest_arm_attribution": (
@@ -860,10 +890,20 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             manifest_ensemble_update_present = isinstance(
                 artifacts_obj.get("ensemble_performance_update"), str
             ) and bool(str(artifacts_obj.get("ensemble_performance_update")))
+            manifest_priority2_contract_present = isinstance(
+                artifacts_obj.get("priority2_feature_contract"),
+                str,
+            ) and bool(str(artifacts_obj.get("priority2_feature_contract")))
+            manifest_priority2_parquet_present = isinstance(
+                artifacts_obj.get("priority2_feature_parquet"),
+                str,
+            ) and bool(str(artifacts_obj.get("priority2_feature_parquet")))
             checks["manifest:self_critique_artifact_present"] = manifest_self_critique_present
             checks["manifest:backtest_arm_attribution_present"] = manifest_backtest_arm_attr_present
             checks["manifest:ensemble_weight_state_present"] = manifest_ensemble_weight_state_present
             checks["manifest:ensemble_performance_update_present"] = manifest_ensemble_update_present
+            checks["manifest:priority2_feature_contract_present"] = manifest_priority2_contract_present
+            checks["manifest:priority2_feature_parquet_present"] = manifest_priority2_parquet_present
             if not manifest_self_critique_present:
                 errors.append("manifest_self_critique_artifact_missing")
             if not manifest_backtest_arm_attr_present:
@@ -872,6 +912,10 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_ensemble_weight_state_missing")
             if not manifest_ensemble_update_present:
                 errors.append("manifest_ensemble_performance_update_missing")
+            if not manifest_priority2_contract_present:
+                errors.append("manifest_priority2_feature_contract_missing")
+            if not manifest_priority2_parquet_present:
+                errors.append("manifest_priority2_feature_parquet_missing")
         else:
             checks["manifest:artifacts_present"] = False
             errors.append("manifest_artifacts_missing")
@@ -885,11 +929,13 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             config_has_ensemble_arms = "ensemble_enabled_arms" in manifest_config
             config_has_ensemble_decay = "ensemble_decay_horizon" in manifest_config
             config_has_ensemble_exploration = "ensemble_exploration_weight" in manifest_config
+            config_has_regime_enabled = "regime_enabled" in manifest_config
             config_has_regime_policy_mode = "regime_policy_mode" in manifest_config
             config_has_regime_touchpoint_prompting = "regime_touchpoint_prompting_enabled" in manifest_config
             config_has_regime_touchpoint_calibration = "regime_touchpoint_calibration_enabled" in manifest_config
             config_has_regime_touchpoint_self_critique = "regime_touchpoint_self_critique_enabled" in manifest_config
             config_has_regime_touchpoint_risk = "regime_touchpoint_risk_gate_enabled" in manifest_config
+            config_has_priority2_enabled = "priority2_features_enabled" in manifest_config
             config_has_calibration_directional_edge = "calibration_directional_edge_threshold" in manifest_config
             config_has_calibration_quality_strength = "calibration_quality_penalty_strength" in manifest_config
             config_has_calibration_directional_penalty = "calibration_directional_contradiction_penalty" in manifest_config
@@ -901,11 +947,13 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             checks["manifest:config_ensemble_arms_present"] = config_has_ensemble_arms
             checks["manifest:config_ensemble_decay_present"] = config_has_ensemble_decay
             checks["manifest:config_ensemble_exploration_present"] = config_has_ensemble_exploration
+            checks["manifest:config_regime_enabled_present"] = config_has_regime_enabled
             checks["manifest:config_regime_policy_mode_present"] = config_has_regime_policy_mode
             checks["manifest:config_regime_touchpoint_prompting_present"] = config_has_regime_touchpoint_prompting
             checks["manifest:config_regime_touchpoint_calibration_present"] = config_has_regime_touchpoint_calibration
             checks["manifest:config_regime_touchpoint_self_critique_present"] = config_has_regime_touchpoint_self_critique
             checks["manifest:config_regime_touchpoint_risk_present"] = config_has_regime_touchpoint_risk
+            checks["manifest:config_priority2_features_enabled_present"] = config_has_priority2_enabled
             checks["manifest:config_calibration_directional_edge_present"] = config_has_calibration_directional_edge
             checks["manifest:config_calibration_quality_strength_present"] = config_has_calibration_quality_strength
             checks["manifest:config_calibration_directional_penalty_present"] = config_has_calibration_directional_penalty
@@ -924,6 +972,8 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_config_ensemble_decay_missing")
             if not config_has_ensemble_exploration:
                 errors.append("manifest_config_ensemble_exploration_missing")
+            if not config_has_regime_enabled:
+                errors.append("manifest_config_regime_enabled_missing")
             if not config_has_regime_policy_mode:
                 errors.append("manifest_config_regime_policy_mode_missing")
             if not config_has_regime_touchpoint_prompting:
@@ -934,6 +984,8 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_config_regime_touchpoint_self_critique_missing")
             if not config_has_regime_touchpoint_risk:
                 errors.append("manifest_config_regime_touchpoint_risk_missing")
+            if not config_has_priority2_enabled:
+                errors.append("manifest_config_priority2_features_enabled_missing")
             if not config_has_calibration_directional_edge:
                 errors.append("manifest_config_calibration_directional_edge_missing")
             if not config_has_calibration_quality_strength:
@@ -958,6 +1010,14 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             ) > 0
             manifest_ensemble_reasons_present = isinstance(outcome.get("ensemble_reason_codes"), list)
             manifest_touchpoints_present = isinstance(outcome.get("regime_touchpoints"), dict)
+            manifest_phase1_regime_enabled_present = isinstance(
+                outcome.get("phase1_regime_enabled"),
+                bool,
+            )
+            manifest_priority2_enabled_present = isinstance(
+                outcome.get("priority2_features_enabled"),
+                bool,
+            )
             manifest_cost_pressure_present = isinstance(
                 outcome.get("cost_pressure_score"),
                 (int, float),
@@ -983,6 +1043,8 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
             checks["manifest:selected_arms_present"] = manifest_selected_arms_present
             checks["manifest:ensemble_reason_codes_present"] = manifest_ensemble_reasons_present
             checks["manifest:regime_touchpoints_present"] = manifest_touchpoints_present
+            checks["manifest:phase1_regime_enabled_present"] = manifest_phase1_regime_enabled_present
+            checks["manifest:priority2_features_enabled_present"] = manifest_priority2_enabled_present
             checks["manifest:cost_pressure_present"] = manifest_cost_pressure_present
             checks["manifest:directional_contradiction_present"] = (
                 manifest_directional_contradiction_present
@@ -1006,6 +1068,10 @@ def verify_orchestration_gate(response: dict[str, Any]) -> dict[str, Any]:
                 errors.append("manifest_ensemble_reason_codes_invalid")
             if not manifest_touchpoints_present:
                 errors.append("manifest_regime_touchpoints_missing")
+            if not manifest_phase1_regime_enabled_present:
+                errors.append("manifest_phase1_regime_enabled_missing")
+            if not manifest_priority2_enabled_present:
+                errors.append("manifest_priority2_features_enabled_missing")
             if not manifest_cost_pressure_present:
                 errors.append("manifest_cost_pressure_missing")
             if not manifest_directional_contradiction_present:

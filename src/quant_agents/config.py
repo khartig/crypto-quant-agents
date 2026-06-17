@@ -42,7 +42,15 @@ class Settings:
     regime_volatility_threshold: float
     regime_trend_spread_threshold: float
     regime_persistence_bars: int
+    regime_enabled: bool
     regime_ablation_mode: bool
+    priority2_features_enabled: bool
+    priority2_external_features_path: str | None
+    priority2_retrieval_provider: str
+    priority2_retrieval_timeout_seconds: float
+    priority2_retrieval_max_points: int
+    priority2_retrieval_base_url: str
+    priority2_local_feature_overrides_path: str | None
     risk_min_total_return: float
     risk_min_sharpe: float
     risk_max_drawdown: float
@@ -93,6 +101,9 @@ class Settings:
     trigger_model_min_train_samples: int
     trigger_model_cost_bps: float
     trigger_model_optimize_thresholds: bool
+    trigger_model_labeling_mode: str
+    trigger_model_trade_quality_min_score: float
+    trigger_model_action_confidence_threshold: float
     trigger_monitor_poll_seconds: float
     trigger_monitor_signal_confidence: float
     trigger_monitor_webhook_url: str | None
@@ -143,6 +154,15 @@ def _as_regime_policy_mode(value: str | None, default: str = "legacy") -> str:
         return default
     normalized = value.strip().lower()
     if normalized in {"legacy", "conditional_v2"}:
+        return normalized
+    return default
+
+
+def _as_trigger_labeling_mode(value: str | None, default: str = "triple_barrier_v2") -> str:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"directional_v1", "triple_barrier_v2"}:
         return normalized
     return default
 
@@ -237,9 +257,37 @@ def load_settings() -> Settings:
             1,
             _as_int(os.getenv("REGIME_PERSISTENCE_BARS"), default=3),
         ),
+        regime_enabled=_as_bool(
+            os.getenv("REGIME_ENABLED"),
+            default=True,
+        ),
         regime_ablation_mode=_as_bool(
             os.getenv("REGIME_ABLATION_MODE"),
             default=False,
+        ),
+        priority2_features_enabled=_as_bool(
+            os.getenv("PRIORITY2_FEATURES_ENABLED"),
+            default=True,
+        ),
+        priority2_external_features_path=os.getenv("PRIORITY2_EXTERNAL_FEATURES_PATH") or None,
+        priority2_retrieval_provider=os.getenv(
+            "PRIORITY2_RETRIEVAL_PROVIDER",
+            "okx_public",
+        ).strip().lower(),
+        priority2_retrieval_timeout_seconds=max(
+            1.0,
+            _as_float(os.getenv("PRIORITY2_RETRIEVAL_TIMEOUT_SECONDS"), default=20.0),
+        ),
+        priority2_retrieval_max_points=max(
+            50,
+            _as_int(os.getenv("PRIORITY2_RETRIEVAL_MAX_POINTS"), default=500),
+        ),
+        priority2_retrieval_base_url=os.getenv(
+            "PRIORITY2_RETRIEVAL_BASE_URL",
+            "https://www.okx.com",
+        ).strip(),
+        priority2_local_feature_overrides_path=(
+            os.getenv("PRIORITY2_LOCAL_FEATURE_OVERRIDES_PATH") or None
         ),
         risk_min_total_return=_as_float(os.getenv("RISK_MIN_TOTAL_RETURN"), default=0.0),
         risk_min_sharpe=_as_float(os.getenv("RISK_MIN_SHARPE"), default=0.0),
@@ -439,6 +487,30 @@ def load_settings() -> Settings:
         trigger_model_optimize_thresholds=_as_bool(
             os.getenv("TRIGGER_MODEL_OPTIMIZE_THRESHOLDS"),
             default=True,
+        ),
+        trigger_model_labeling_mode=_as_trigger_labeling_mode(
+            os.getenv("TRIGGER_MODEL_LABELING_MODE"),
+            default="triple_barrier_v2",
+        ),
+        trigger_model_trade_quality_min_score=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("TRIGGER_MODEL_TRADE_QUALITY_MIN_SCORE"),
+                    default=0.55,
+                ),
+            ),
+        ),
+        trigger_model_action_confidence_threshold=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("TRIGGER_MODEL_ACTION_CONFIDENCE_THRESHOLD"),
+                    default=0.55,
+                ),
+            ),
         ),
         trigger_monitor_poll_seconds=max(
             5.0,

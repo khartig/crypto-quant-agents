@@ -563,6 +563,7 @@ def _evaluate_windows_for_profiles(
                 paper_fee_bps=settings.paper_trade_fee_bps,
                 paper_slippage_bps=settings.paper_trade_slippage_bps,
                 minimum_bars=minimum_bars,
+                regime_enabled=not bool(profile.regime_ablation_mode),
                 regime_detector_mode=settings.regime_detector_mode,
                 regime_policy_mode=str(profile.regime_policy_mode),
                 regime_policy_min_actionable_confidence=settings.regime_policy_min_actionable_confidence,
@@ -583,6 +584,12 @@ def _evaluate_windows_for_profiles(
                 regime_trend_spread_threshold=settings.regime_trend_spread_threshold,
                 regime_persistence_bars=settings.regime_persistence_bars,
                 regime_ablation_mode=bool(profile.regime_ablation_mode),
+                priority2_features_enabled=bool(settings.priority2_features_enabled),
+                priority2_external_features_path=(
+                    Path(settings.priority2_external_features_path).expanduser().resolve()
+                    if settings.priority2_external_features_path
+                    else None
+                ),
                 walk_forward_train_bars=settings.walk_forward_train_bars,
                 walk_forward_validate_bars=settings.walk_forward_validate_bars,
                 walk_forward_step_bars=settings.walk_forward_step_bars,
@@ -621,6 +628,9 @@ def _evaluate_windows_for_profiles(
             strategy_payload = json.loads(
                 run_result.strategy_signal_path.read_text(encoding="utf-8")
             )
+            phase1_context = json.loads(
+                run_result.phase1_feature_context_path.read_text(encoding="utf-8")
+            )
             manifest = json.loads(run_result.run_manifest_path.read_text(encoding="utf-8"))
             manifest_outcome = manifest.get("outcome", {}) if isinstance(manifest, dict) else {}
             phase1_regime = (
@@ -641,6 +651,27 @@ def _evaluate_windows_for_profiles(
                 calibration.get("quality_contradiction_detected", False)
             )
             arm_cost_return_drag = _extract_arm_cost_map(backtest)
+            priority2_diagnostics = (
+                phase1_context.get("priority2_diagnostics", {})
+                if isinstance(phase1_context, dict)
+                else {}
+            )
+            priority2_reason_codes = (
+                phase1_context.get("priority2_reason_codes")
+                if isinstance(phase1_context, dict)
+                else None
+            )
+            if not isinstance(priority2_reason_codes, list):
+                phase1_reason_codes = (
+                    phase1_context.get("reason_codes", [])
+                    if isinstance(phase1_context, dict)
+                    else []
+                )
+                priority2_reason_codes = [
+                    str(code)
+                    for code in phase1_reason_codes
+                    if str(code).strip().lower().startswith("priority2_")
+                ]
 
             row = {
                 "scenario": scenario.name,
@@ -685,14 +716,43 @@ def _evaluate_windows_for_profiles(
                 "max_drawdown": _safe_float(backtest.get("max_drawdown")),
                 "total_cost_return_drag": _safe_float(backtest.get("total_cost_return_drag")),
                 "arm_cost_return_drag": arm_cost_return_drag,
+                "priority2_features_enabled": bool(
+                    manifest_outcome.get("priority2_features_enabled", False)
+                )
+                if isinstance(manifest_outcome, dict)
+                else False,
+                "priority2_feature_quality_score": _safe_float(
+                    manifest_outcome.get("priority2_feature_quality_score")
+                    if isinstance(manifest_outcome, dict)
+                    else None
+                ),
+                "priority2_external_features_loaded": bool(
+                    priority2_diagnostics.get("external_features_loaded", False)
+                )
+                if isinstance(priority2_diagnostics, dict)
+                else False,
+                "priority2_external_coverage_mean": _mean_optional(
+                    [
+                        _safe_float(value)
+                        for value in (
+                            dict(priority2_diagnostics.get("external_feature_coverage", {})).values()
+                            if isinstance(priority2_diagnostics, dict)
+                            else []
+                        )
+                    ]
+                ),
+                "priority2_reason_codes": [str(code) for code in priority2_reason_codes],
                 "agent_run_id": run_result.run_id,
                 "agent_run_dir": str(run_result.run_dir),
                 "artifacts": {
+                    "phase1_feature_context": str(run_result.phase1_feature_context_path),
                     "strategy_proposal_signal": str(run_result.strategy_signal_path),
                     "backtest_evaluation": str(run_result.backtest_evaluation_path),
                     "confidence_calibration": str(run_result.confidence_calibration_path),
                     "risk_decision": str(run_result.risk_decision_path),
                     "run_manifest": str(run_result.run_manifest_path),
+                    "priority2_feature_contract": str(run_result.priority2_feature_contract_path),
+                    "priority2_feature_parquet": str(run_result.priority2_feature_parquet_path),
                 },
             }
             results.append(row)
@@ -715,6 +775,11 @@ def _evaluate_windows_for_profiles(
                         "sharpe": row["sharpe"],
                         "max_drawdown": row["max_drawdown"],
                         "total_cost_return_drag": row["total_cost_return_drag"],
+                        "priority2_features_enabled": row["priority2_features_enabled"],
+                        "priority2_feature_quality_score": row["priority2_feature_quality_score"],
+                        "priority2_external_features_loaded": row[
+                            "priority2_external_features_loaded"
+                        ],
                     },
                     sort_keys=True,
                 )
@@ -731,9 +796,11 @@ def _summarize_profile_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
     for profile_name, profile_rows in by_profile.items():
         reason_counts: Counter[str] = Counter()
         calibration_reason_counts: Counter[str] = Counter()
+        priority2_reason_counts: Counter[str] = Counter()
         for row in profile_rows:
             reason_counts.update(list(row.get("reason_codes", [])))
             calibration_reason_counts.update(list(row.get("calibration_reason_codes", [])))
+            priority2_reason_counts.update(list(row.get("priority2_reason_codes", [])))
         profile_summary[profile_name] = {
             "windows_evaluated": len(profile_rows),
             "approval_rate": _safe_rate(
@@ -773,6 +840,24 @@ def _summarize_profile_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
             "mean_total_cost_return_drag": _mean_optional(
                 [_safe_float(row.get("total_cost_return_drag")) for row in profile_rows]
             ),
+            "priority2_features_enabled_rate": _safe_rate(
+                sum(1.0 for row in profile_rows if bool(row.get("priority2_features_enabled"))),
+                len(profile_rows),
+            ),
+            "priority2_external_features_loaded_rate": _safe_rate(
+                sum(
+                    1.0
+                    for row in profile_rows
+                    if bool(row.get("priority2_external_features_loaded"))
+                ),
+                len(profile_rows),
+            ),
+            "mean_priority2_feature_quality_score": _mean_optional(
+                [_safe_float(row.get("priority2_feature_quality_score")) for row in profile_rows]
+            ),
+            "mean_priority2_external_coverage": _mean_optional(
+                [_safe_float(row.get("priority2_external_coverage_mean")) for row in profile_rows]
+            ),
             "reason_code_distribution": dict(
                 sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))
             ),
@@ -781,6 +866,9 @@ def _summarize_profile_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
                     calibration_reason_counts.items(),
                     key=lambda item: (-item[1], item[0]),
                 )
+            ),
+            "priority2_reason_code_distribution": dict(
+                sorted(priority2_reason_counts.items(), key=lambda item: (-item[1], item[0]))
             ),
         }
     return profile_summary
@@ -811,6 +899,14 @@ def _build_window_comparison(
             "sharpe": left_row.get("sharpe"),
             "max_drawdown": left_row.get("max_drawdown"),
             "total_cost_return_drag": left_row.get("total_cost_return_drag"),
+            "priority2_features_enabled": left_row.get("priority2_features_enabled"),
+            "priority2_feature_quality_score": left_row.get("priority2_feature_quality_score"),
+            "priority2_external_features_loaded": left_row.get(
+                "priority2_external_features_loaded"
+            ),
+            "priority2_external_coverage_mean": left_row.get(
+                "priority2_external_coverage_mean"
+            ),
         }
         right_payload = {
             "approval_rate": right_row.get("approval_rate"),
@@ -823,6 +919,14 @@ def _build_window_comparison(
             "sharpe": right_row.get("sharpe"),
             "max_drawdown": right_row.get("max_drawdown"),
             "total_cost_return_drag": right_row.get("total_cost_return_drag"),
+            "priority2_features_enabled": right_row.get("priority2_features_enabled"),
+            "priority2_feature_quality_score": right_row.get("priority2_feature_quality_score"),
+            "priority2_external_features_loaded": right_row.get(
+                "priority2_external_features_loaded"
+            ),
+            "priority2_external_coverage_mean": right_row.get(
+                "priority2_external_coverage_mean"
+            ),
         }
         delta_payload = {
             "approval_rate": _delta(
@@ -860,6 +964,14 @@ def _build_window_comparison(
             "total_cost_return_drag": _delta(
                 _safe_float(left_row.get("total_cost_return_drag")),
                 _safe_float(right_row.get("total_cost_return_drag")),
+            ),
+            "priority2_feature_quality_score": _delta(
+                _safe_float(left_row.get("priority2_feature_quality_score")),
+                _safe_float(right_row.get("priority2_feature_quality_score")),
+            ),
+            "priority2_external_coverage_mean": _delta(
+                _safe_float(left_row.get("priority2_external_coverage_mean")),
+                _safe_float(right_row.get("priority2_external_coverage_mean")),
             ),
         }
         row: dict[str, Any] = {

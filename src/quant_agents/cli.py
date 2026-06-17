@@ -16,6 +16,7 @@ from quant_agents.ingestion import fetch_ohlcv_to_parquet
 from quant_agents.logging_utils import configure_logging
 from quant_agents.metrics import tracked_operation
 from quant_agents.paper_account import run_paper_account_probe
+from quant_agents.priority2_retrieval import retrieve_priority2_external_features
 from quant_agents.reporting import generate_daily_report
 from quant_agents.storage import ensure_phase1_tree, latest_backtest_run_dir
 from quant_agents.trigger_model import (
@@ -53,6 +54,46 @@ def _base_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--symbol", default=None)
     ingest.add_argument("--timeframe", default=None)
     ingest.add_argument("--limit", type=int, default=1000)
+    priority2_retrieve = subparsers.add_parser(
+        "retrieve-priority2-features",
+        help="Build canonical external Priority 2 feature artifacts from derivatives/whale data sources.",
+    )
+    priority2_retrieve.add_argument("--exchange", default=None)
+    priority2_retrieve.add_argument("--symbol", default=None)
+    priority2_retrieve.add_argument("--timeframe", default=None)
+    priority2_retrieve.add_argument(
+        "--input-file",
+        default=None,
+        help="Optional explicit market parquet input file for retrieval window alignment.",
+    )
+    priority2_retrieve.add_argument(
+        "--provider",
+        choices=["binance_futures_public", "okx_public"],
+        default=None,
+        help="External retrieval provider (default from settings).",
+    )
+    priority2_retrieve.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=None,
+        help="HTTP timeout for provider requests (default from settings).",
+    )
+    priority2_retrieve.add_argument(
+        "--max-points",
+        type=int,
+        default=None,
+        help="Per-request page size for provider endpoints (default from settings).",
+    )
+    priority2_retrieve.add_argument(
+        "--base-url",
+        default=None,
+        help="Provider base URL override (default from settings).",
+    )
+    priority2_retrieve.add_argument(
+        "--local-feature-overrides-path",
+        default=None,
+        help="Optional local CSV/JSON/Parquet feature file used to override/augment provider output.",
+    )
 
     backtest = subparsers.add_parser("backtest", help="Run baseline SMA crossover backtest.")
     backtest.add_argument("--exchange", default=None)
@@ -169,6 +210,18 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Minimum bars required for data-quality pass.",
     )
     agent_plane.add_argument(
+        "--regime-enabled",
+        dest="regime_enabled",
+        action="store_true",
+        help="Enable regime logic and regime touchpoint contributions.",
+    )
+    agent_plane.add_argument(
+        "--no-regime-enabled",
+        dest="regime_enabled",
+        action="store_false",
+        help="Disable regime logic globally (forces regime-off behavior across touchpoints).",
+    )
+    agent_plane.add_argument(
         "--regime-detector-mode",
         choices=["heuristic", "score"],
         default=None,
@@ -205,6 +258,23 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Enable normal regime contributions (default behavior unless env enables ablation).",
     )
     agent_plane.set_defaults(regime_ablation_mode=None)
+    agent_plane.add_argument(
+        "--priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_true",
+        help="Enable Priority 2 feature expansion in phase-1 context.",
+    )
+    agent_plane.add_argument(
+        "--no-priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_false",
+        help="Disable Priority 2 feature expansion in phase-1 context.",
+    )
+    agent_plane.add_argument(
+        "--priority2-external-features-path",
+        default=None,
+        help="Optional CSV/JSON/Parquet path with externally computed Priority 2 feature columns.",
+    )
     agent_plane.add_argument(
         "--regime-policy-mode",
         choices=["legacy", "conditional_v2"],
@@ -272,6 +342,8 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Disable regime confidence gate checks in deterministic risk stage.",
     )
     agent_plane.set_defaults(
+        regime_enabled=None,
+        priority2_features_enabled=None,
         regime_touchpoint_prompting_enabled=None,
         regime_touchpoint_calibration_enabled=None,
         regime_touchpoint_self_critique_enabled=None,
@@ -570,6 +642,41 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Optional explicit parquet input file for training.",
     )
     trigger_train.add_argument(
+        "--labeling-mode",
+        choices=["directional_v1", "triple_barrier_v2"],
+        default=None,
+        help="Trigger-model labeling mode (default from settings).",
+    )
+    trigger_train.add_argument(
+        "--trade-quality-min-score",
+        type=float,
+        default=None,
+        help="Minimum trade-quality score retained as actionable label evidence.",
+    )
+    trigger_train.add_argument(
+        "--action-confidence-threshold",
+        type=float,
+        default=None,
+        help="Minimum class probability required before actionable buy/sell is emitted.",
+    )
+    trigger_train.add_argument(
+        "--priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_true",
+        help="Enable Priority 2 feature expansion for trigger-model training.",
+    )
+    trigger_train.add_argument(
+        "--no-priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_false",
+        help="Disable Priority 2 feature expansion for trigger-model training.",
+    )
+    trigger_train.add_argument(
+        "--priority2-external-features-path",
+        default=None,
+        help="Optional external Priority 2 feature file used during training.",
+    )
+    trigger_train.add_argument(
         "--horizon-bars",
         type=int,
         default=None,
@@ -612,6 +719,7 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Disable threshold optimization and use provided thresholds directly.",
     )
     trigger_train.set_defaults(optimize_thresholds=None)
+    trigger_train.set_defaults(priority2_features_enabled=None)
 
     trigger_predict = subparsers.add_parser(
         "predict-trigger",
@@ -620,6 +728,29 @@ def _base_parser() -> argparse.ArgumentParser:
     trigger_predict.add_argument("--exchange", default=None)
     trigger_predict.add_argument("--symbol", default=None)
     trigger_predict.add_argument("--timeframe", default=None)
+    trigger_predict.add_argument(
+        "--action-confidence-threshold",
+        type=float,
+        default=None,
+        help="Prediction-time actionable confidence threshold override.",
+    )
+    trigger_predict.add_argument(
+        "--priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_true",
+        help="Enable Priority 2 feature expansion for prediction.",
+    )
+    trigger_predict.add_argument(
+        "--no-priority2-features-enabled",
+        dest="priority2_features_enabled",
+        action="store_false",
+        help="Disable Priority 2 feature expansion for prediction.",
+    )
+    trigger_predict.add_argument(
+        "--priority2-external-features-path",
+        default=None,
+        help="Optional external Priority 2 feature file used during prediction.",
+    )
     trigger_predict.add_argument(
         "--model-path",
         default=None,
@@ -630,6 +761,7 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional explicit parquet input file for prediction.",
     )
+    trigger_predict.set_defaults(priority2_features_enabled=None)
 
     trigger_monitor = subparsers.add_parser(
         "monitor-triggers",
@@ -731,6 +863,73 @@ def main(argv: list[str] | None = None) -> None:
             metric["data_end"] = str(result.end_timestamp)
         print(f"Ingested {result.row_count} rows -> {result.output_path}")
         return
+    if args.command == "retrieve-priority2-features":
+        source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
+        local_feature_overrides_path = (
+            Path(args.local_feature_overrides_path).expanduser().resolve()
+            if args.local_feature_overrides_path
+            else (
+                Path(settings.priority2_local_feature_overrides_path).expanduser().resolve()
+                if settings.priority2_local_feature_overrides_path
+                else None
+            )
+        )
+        provider = (
+            str(args.provider).strip().lower()
+            if args.provider is not None
+            else settings.priority2_retrieval_provider
+        )
+        timeout_seconds = (
+            args.timeout_seconds
+            if args.timeout_seconds is not None
+            else settings.priority2_retrieval_timeout_seconds
+        )
+        max_points = (
+            args.max_points
+            if args.max_points is not None
+            else settings.priority2_retrieval_max_points
+        )
+        base_url = args.base_url or settings.priority2_retrieval_base_url
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="retrieve-priority2-features",
+            dimensions={
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "provider": provider,
+            },
+        ) as metric:
+            result = retrieve_priority2_external_features(
+                settings=settings,
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe,
+                source_data_path=source_file,
+                provider=provider,
+                timeout_seconds=max(1.0, float(timeout_seconds)),
+                max_points_per_request=max(50, int(max_points)),
+                base_url=str(base_url),
+                local_feature_overrides_path=local_feature_overrides_path,
+            )
+            metric["run_id"] = result.run_id
+            metric["provider"] = result.provider
+            metric["source_data_path"] = str(result.source_data_path)
+            metric["row_count"] = result.row_count
+            metric["coverage_ratio"] = result.coverage_ratio
+            metric["parquet_path"] = str(result.parquet_path)
+            metric["contract_path"] = str(result.contract_path)
+            metric["reason_codes"] = list(result.reason_codes)
+        print(
+            "Priority 2 external features retrieved -> "
+            f"{result.parquet_path} "
+            f"(coverage={result.coverage_ratio:.3f} rows={result.row_count})"
+        )
+        print(
+            "Use this path with --priority2-external-features-path: "
+            f"{result.parquet_path}"
+        )
+        return
 
     if args.command == "backtest":
         source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
@@ -765,6 +964,11 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "train-trigger-model":
         source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
+        labeling_mode = (
+            args.labeling_mode
+            if args.labeling_mode is not None
+            else settings.trigger_model_labeling_mode
+        )
         horizon_bars = (
             args.horizon_bars
             if args.horizon_bars is not None
@@ -795,6 +999,30 @@ def main(argv: list[str] | None = None) -> None:
             if args.optimize_thresholds is not None
             else settings.trigger_model_optimize_thresholds
         )
+        trade_quality_min_score = (
+            args.trade_quality_min_score
+            if args.trade_quality_min_score is not None
+            else settings.trigger_model_trade_quality_min_score
+        )
+        action_confidence_threshold = (
+            args.action_confidence_threshold
+            if args.action_confidence_threshold is not None
+            else settings.trigger_model_action_confidence_threshold
+        )
+        priority2_features_enabled = (
+            bool(args.priority2_features_enabled)
+            if args.priority2_features_enabled is not None
+            else bool(settings.priority2_features_enabled)
+        )
+        priority2_external_features_path = (
+            Path(args.priority2_external_features_path).expanduser().resolve()
+            if args.priority2_external_features_path
+            else (
+                Path(settings.priority2_external_features_path).expanduser().resolve()
+                if settings.priority2_external_features_path
+                else None
+            )
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="train-trigger-model",
@@ -816,6 +1044,14 @@ def main(argv: list[str] | None = None) -> None:
                 min_train_samples=max(20, int(min_train_samples)),
                 cost_bps=max(0.0, float(cost_bps)),
                 optimize_thresholds=bool(optimize_thresholds),
+                labeling_mode=str(labeling_mode),
+                trade_quality_min_score=min(1.0, max(0.0, float(trade_quality_min_score))),
+                action_confidence_threshold=min(
+                    1.0,
+                    max(0.0, float(action_confidence_threshold)),
+                ),
+                priority2_features_enabled=bool(priority2_features_enabled),
+                priority2_external_features_path=priority2_external_features_path,
             )
             metric["model_path"] = str(result.model_path)
             metric["run_dir"] = str(result.run_dir)
@@ -826,17 +1062,40 @@ def main(argv: list[str] | None = None) -> None:
             metric["selected_buy_threshold"] = result.selected_buy_threshold
             metric["selected_sell_threshold"] = result.selected_sell_threshold
             metric["net_expectancy_per_actionable"] = result.net_expectancy_per_actionable
+            metric["selected_trade_quality_threshold"] = result.selected_trade_quality_threshold
+            metric["selected_action_confidence_threshold"] = result.selected_action_confidence_threshold
         print(
             "Trigger model training complete -> "
             f"{result.model_path} "
             f"(samples={result.sample_count} accuracy={result.accuracy:.3f} "
-            f"buy_th={result.selected_buy_threshold:.4f} sell_th={result.selected_sell_threshold:.4f})"
+            f"buy_th={result.selected_buy_threshold:.4f} sell_th={result.selected_sell_threshold:.4f} "
+            f"quality_th={result.selected_trade_quality_threshold:.3f} "
+            f"conf_th={result.selected_action_confidence_threshold:.3f})"
         )
         return
 
     if args.command == "predict-trigger":
         source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
         model_path = Path(args.model_path).expanduser().resolve() if args.model_path else None
+        action_confidence_threshold = (
+            args.action_confidence_threshold
+            if args.action_confidence_threshold is not None
+            else settings.trigger_model_action_confidence_threshold
+        )
+        priority2_features_enabled = (
+            bool(args.priority2_features_enabled)
+            if args.priority2_features_enabled is not None
+            else bool(settings.priority2_features_enabled)
+        )
+        priority2_external_features_path = (
+            Path(args.priority2_external_features_path).expanduser().resolve()
+            if args.priority2_external_features_path
+            else (
+                Path(settings.priority2_external_features_path).expanduser().resolve()
+                if settings.priority2_external_features_path
+                else None
+            )
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="predict-trigger",
@@ -854,6 +1113,12 @@ def main(argv: list[str] | None = None) -> None:
                 model_path=model_path,
                 input_file=source_file,
                 write_artifact=True,
+                action_confidence_threshold=min(
+                    1.0,
+                    max(0.0, float(action_confidence_threshold)),
+                ),
+                priority2_features_enabled=bool(priority2_features_enabled),
+                priority2_external_features_path=priority2_external_features_path,
             )
             metric["model_path"] = str(result.model_path)
             metric["source_data_path"] = str(result.source_data_path)
@@ -1070,6 +1335,11 @@ def main(argv: list[str] | None = None) -> None:
                 if args.regime_detector_mode is not None
                 else settings.regime_detector_mode
             ),
+            regime_enabled=(
+                bool(args.regime_enabled)
+                if args.regime_enabled is not None
+                else bool(settings.regime_enabled)
+            ),
             regime_policy_mode=(
                 args.regime_policy_mode
                 if args.regime_policy_mode is not None
@@ -1135,6 +1405,20 @@ def main(argv: list[str] | None = None) -> None:
                 bool(args.regime_ablation_mode)
                 if args.regime_ablation_mode is not None
                 else bool(settings.regime_ablation_mode)
+            ),
+            priority2_features_enabled=(
+                bool(args.priority2_features_enabled)
+                if args.priority2_features_enabled is not None
+                else bool(settings.priority2_features_enabled)
+            ),
+            priority2_external_features_path=(
+                Path(args.priority2_external_features_path).expanduser().resolve()
+                if args.priority2_external_features_path
+                else (
+                    Path(settings.priority2_external_features_path).expanduser().resolve()
+                    if settings.priority2_external_features_path
+                    else None
+                )
             ),
             strategy_fast_window=max(2, int(args.fast_window)) if args.fast_window is not None else None,
             strategy_slow_window=max(3, int(args.slow_window)) if args.slow_window is not None else None,

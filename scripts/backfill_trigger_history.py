@@ -17,6 +17,7 @@ from quant_agents.trigger_model import (
     _coerce_frame,
     _feature_reasons,
     _predict_probabilities,
+    _resolve_prediction_action_confidence_threshold,
     latest_trigger_model_path,
 )
 
@@ -86,13 +87,27 @@ def main() -> None:
     source_data_sha256 = hashlib.sha256(source_data_path.read_bytes()).hexdigest()
 
     frame = _coerce_frame(source_data_path)
-    feature_frame = _build_feature_frame(frame).dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
+    priority2_external_features_path = (
+        Path(settings.priority2_external_features_path).expanduser().resolve()
+        if settings.priority2_external_features_path
+        else None
+    )
+    feature_frame, _ = _build_feature_frame(
+        frame,
+        priority2_features_enabled=bool(settings.priority2_features_enabled),
+        priority2_external_features_path=priority2_external_features_path,
+    )
+    feature_frame = feature_frame.dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
     if feature_frame.empty:
         raise RuntimeError("No usable feature rows for backfill")
 
     points = max(1, int(args.points))
     backfill_frame = feature_frame.tail(points).reset_index(drop=True)
     threshold = max(0.0, min(1.0, float(args.alert_confidence_threshold)))
+    action_confidence_threshold = _resolve_prediction_action_confidence_threshold(
+        model_payload=model_payload,
+        override_threshold=None,
+    )
 
     prediction_count = 0
     alert_count = 0
@@ -100,9 +115,36 @@ def main() -> None:
     for index, row in backfill_frame.iterrows():
         timestamp = pd.Timestamp(row["timestamp"]).tz_convert("UTC")
         vector = np.asarray([float(row[feature]) for feature in FEATURE_COLUMNS], dtype=float)
-        recommendation, probabilities = _predict_probabilities(model_payload, vector)
-        confidence = float(probabilities[recommendation])
-        top_reasons, reason_details = _feature_reasons(model_payload, vector, recommendation, probabilities)
+        raw_recommendation, probabilities = _predict_probabilities(model_payload, vector)
+        confidence = float(probabilities[raw_recommendation])
+        recommendation = raw_recommendation
+        confidence_gate_applied = False
+        if recommendation in {"buy", "sell"} and confidence < action_confidence_threshold:
+            recommendation = "hold"
+            confidence_gate_applied = True
+        top_reasons, reason_details = _feature_reasons(
+            model_payload,
+            vector,
+            raw_recommendation,
+            probabilities,
+        )
+        if confidence_gate_applied:
+            gate_reason = (
+                f"confidence_gate_demoted_to_hold raw={raw_recommendation} "
+                f"confidence={confidence:.3f} threshold={action_confidence_threshold:.3f}"
+            )
+            top_reasons = [gate_reason, *top_reasons]
+            reason_details = [
+                {
+                    "feature": "action_confidence_threshold",
+                    "value": float(confidence),
+                    "impact": float(confidence - action_confidence_threshold),
+                    "supports": "hold",
+                    "vs_alternative": raw_recommendation,
+                    "reason": "confidence_gate_demoted_to_hold",
+                },
+                *reason_details,
+            ]
 
         close_price = float(row["close"])
         sma_fast = close_price / (1.0 + float(row["sma_fast_spread"]))
@@ -122,14 +164,17 @@ def main() -> None:
         prediction_dir.mkdir(parents=True, exist_ok=True)
         prediction_path = prediction_dir / f"prediction_{timestamp:%Y%m%dT%H%M%SZ}_{index:04d}.json"
         prediction_payload = {
-            "contract": "trigger_prediction.v1",
+            "contract": "trigger_prediction.v2",
             "created_at_utc": timestamp.isoformat(),
             "exchange": args.exchange,
             "symbol": args.symbol,
             "timeframe": args.timeframe,
             "prediction_timestamp_utc": timestamp.isoformat(),
+            "raw_recommendation": raw_recommendation,
             "recommendation": recommendation,
             "confidence": confidence,
+            "action_confidence_threshold": float(action_confidence_threshold),
+            "confidence_gate_applied": bool(confidence_gate_applied),
             "probabilities": probabilities,
             "close_price": close_price,
             "sma_fast": sma_fast,
@@ -169,6 +214,7 @@ def main() -> None:
                 "timeframe": args.timeframe,
                 "recommendation": recommendation,
                 "confidence": confidence,
+                "action_confidence_threshold": float(action_confidence_threshold),
                 "probabilities": probabilities,
                 "prediction_timestamp_utc": timestamp.isoformat(),
                 "close_price": close_price,

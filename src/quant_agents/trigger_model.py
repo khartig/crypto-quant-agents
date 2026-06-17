@@ -17,12 +17,19 @@ import pandas as pd
 
 from quant_agents.config import Settings
 from quant_agents.ingestion import fetch_ohlcv_to_parquet
+from quant_agents.priority2_features import (
+    PRIORITY2_FEATURE_COLUMNS,
+    Priority2FeatureBundle,
+    build_priority2_feature_bundle,
+    write_priority2_feature_artifacts,
+)
+from quant_agents.priority2_retrieval import latest_priority2_external_features_path
 from quant_agents.storage import latest_raw_dataset, symbol_slug
 
 logger = logging.getLogger(__name__)
 
 TRIGGER_LABELS: tuple[str, str, str] = ("buy", "hold", "sell")
-FEATURE_COLUMNS: tuple[str, ...] = (
+BASE_FEATURE_COLUMNS: tuple[str, ...] = (
     "ret_1",
     "ret_4",
     "ret_24",
@@ -35,6 +42,7 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "volume_zscore_24",
     "hl_range_14",
 )
+FEATURE_COLUMNS: tuple[str, ...] = BASE_FEATURE_COLUMNS + PRIORITY2_FEATURE_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,8 @@ class TriggerModelTrainingResult:
     confusion_matrix: dict[str, dict[str, int]]
     selected_buy_threshold: float
     selected_sell_threshold: float
+    selected_trade_quality_threshold: float
+    selected_action_confidence_threshold: float
     net_expectancy_per_actionable: float
 
 
@@ -73,6 +83,7 @@ class TriggerPredictionResult:
     feature_values: dict[str, float]
     top_reasons: list[str]
     reason_details: list[dict[str, Any]]
+    action_confidence_threshold: float
     prediction_path: Path | None
 
 
@@ -147,7 +158,12 @@ def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
-def _build_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def _build_feature_frame(
+    frame: pd.DataFrame,
+    *,
+    priority2_features_enabled: bool = True,
+    priority2_external_features_path: Path | None = None,
+) -> tuple[pd.DataFrame, Priority2FeatureBundle]:
     close = frame["close"].astype(float)
     high = frame["high"].astype(float)
     low = frame["low"].astype(float)
@@ -169,6 +185,8 @@ def _build_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
         {
             "timestamp": frame["timestamp"],
             "close": close,
+            "high": high,
+            "low": low,
             "ret_1": close.pct_change(periods=1),
             "ret_4": close.pct_change(periods=4),
             "ret_24": close.pct_change(periods=24),
@@ -182,7 +200,220 @@ def _build_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
             "hl_range_14": hl_range,
         }
     )
-    return feature_frame
+    priority2_bundle = build_priority2_feature_bundle(
+        frame,
+        features_enabled=bool(priority2_features_enabled),
+        external_features_path=priority2_external_features_path,
+    )
+    priority2_frame = priority2_bundle.feature_frame.copy()
+    priority2_frame["timestamp"] = pd.to_datetime(
+        priority2_frame["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    merged = pd.merge_asof(
+        feature_frame.sort_values("timestamp").reset_index(drop=True),
+        priority2_frame.sort_values("timestamp").reset_index(drop=True),
+        on="timestamp",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    for column in PRIORITY2_FEATURE_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = 0.0
+        merged[column] = (
+            pd.to_numeric(merged[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+    return merged, priority2_bundle
+
+
+def _resolve_priority2_external_features_path(
+    *,
+    settings: Settings,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    priority2_features_enabled: bool,
+    requested_path: Path | None,
+) -> tuple[Path | None, str]:
+    if not priority2_features_enabled:
+        return None, "priority2_disabled"
+    if requested_path is not None:
+        return requested_path, "explicit"
+    latest_path = latest_priority2_external_features_path(
+        quant_data_root=settings.quant_data_root,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    if latest_path is not None:
+        return latest_path, "latest_retrieval_artifact"
+    return None, "none_found"
+
+def _resolve_labeling_mode(labeling_mode: str) -> str:
+    normalized = str(labeling_mode or "directional_v1").strip().lower()
+    if normalized in {"directional_v1", "triple_barrier_v2"}:
+        return normalized
+    return "directional_v1"
+
+
+def _compute_forward_path_statistics(
+    feature_frame: pd.DataFrame,
+    *,
+    horizon_bars: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    horizon = max(1, int(horizon_bars))
+    close = feature_frame["close"].to_numpy(dtype=float)
+    high = feature_frame["high"].to_numpy(dtype=float)
+    low = feature_frame["low"].to_numpy(dtype=float)
+    count = len(feature_frame)
+
+    forward_return = np.full(count, np.nan, dtype=float)
+    max_up_return = np.full(count, np.nan, dtype=float)
+    min_down_return = np.full(count, np.nan, dtype=float)
+
+    for index in range(count):
+        end = min(count - 1, index + horizon)
+        if end <= index:
+            continue
+        entry = close[index]
+        if not np.isfinite(entry) or abs(entry) < 1e-12:
+            continue
+        terminal = close[end]
+        if np.isfinite(terminal):
+            forward_return[index] = float(terminal / entry - 1.0)
+
+        high_window = high[index + 1 : end + 1]
+        if high_window.size > 0:
+            high_returns = (high_window / entry) - 1.0
+            finite_high = high_returns[np.isfinite(high_returns)]
+            if finite_high.size > 0:
+                max_up_return[index] = float(np.max(finite_high))
+
+        low_window = low[index + 1 : end + 1]
+        if low_window.size > 0:
+            low_returns = (low_window / entry) - 1.0
+            finite_low = low_returns[np.isfinite(low_returns)]
+            if finite_low.size > 0:
+                min_down_return[index] = float(np.min(finite_low))
+
+    return forward_return, max_up_return, min_down_return
+
+
+def _label_triple_barrier(
+    feature_frame: pd.DataFrame,
+    *,
+    horizon_bars: int,
+    buy_threshold: float,
+    sell_threshold: float,
+) -> tuple[list[str], list[str]]:
+    horizon = max(1, int(horizon_bars))
+    buy_cutoff = float(max(0.0005, buy_threshold))
+    sell_cutoff = float(max(0.0005, abs(sell_threshold)))
+    close = feature_frame["close"].to_numpy(dtype=float)
+    high = feature_frame["high"].to_numpy(dtype=float)
+    low = feature_frame["low"].to_numpy(dtype=float)
+    count = len(feature_frame)
+    labels: list[str] = []
+    barrier_events: list[str] = []
+
+    for index in range(count):
+        end = min(count - 1, index + horizon)
+        entry = close[index]
+        if end <= index or (not np.isfinite(entry)) or abs(entry) < 1e-12:
+            labels.append("hold")
+            barrier_events.append("time_expiry")
+            continue
+
+        assigned_label = "hold"
+        event = "time_expiry"
+        for offset in range(1, (end - index) + 1):
+            high_return = (high[index + offset] / entry) - 1.0
+            low_return = (low[index + offset] / entry) - 1.0
+            upper_hit = np.isfinite(high_return) and high_return >= buy_cutoff
+            lower_hit = np.isfinite(low_return) and low_return <= -sell_cutoff
+            if upper_hit and lower_hit:
+                upper_strength = abs(high_return) / max(buy_cutoff, 1e-9)
+                lower_strength = abs(low_return) / max(sell_cutoff, 1e-9)
+                if upper_strength >= lower_strength:
+                    assigned_label = "buy"
+                    event = "double_hit_upper_dominant"
+                else:
+                    assigned_label = "sell"
+                    event = "double_hit_lower_dominant"
+                break
+            if upper_hit:
+                assigned_label = "buy"
+                event = "upper_barrier_hit"
+                break
+            if lower_hit:
+                assigned_label = "sell"
+                event = "lower_barrier_hit"
+                break
+        labels.append(assigned_label)
+        barrier_events.append(event)
+    return labels, barrier_events
+
+
+def _compute_trade_quality_scores(
+    labeled: pd.DataFrame,
+    *,
+    buy_threshold: float,
+    sell_threshold: float,
+    one_way_cost_bps: float,
+) -> np.ndarray:
+    buy_cutoff = float(max(0.0005, buy_threshold))
+    sell_cutoff = float(max(0.0005, abs(sell_threshold)))
+    cost_rate = max(0.0, float(one_way_cost_bps)) / 10_000.0
+    target_scale = max(buy_cutoff, sell_cutoff, cost_rate, 1e-6)
+
+    scores = np.zeros(len(labeled), dtype=float)
+    raw_labels = labeled["raw_label"].astype(str).to_numpy()
+    forward_returns = labeled["forward_return"].to_numpy(dtype=float)
+    max_up = labeled["max_up_return"].to_numpy(dtype=float)
+    min_down = labeled["min_down_return"].to_numpy(dtype=float)
+    volatility = (
+        pd.to_numeric(labeled.get("volatility_24", pd.Series(np.zeros(len(labeled)))), errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=float)
+    )
+
+    for index, label in enumerate(raw_labels):
+        if label not in {"buy", "sell"}:
+            scores[index] = 0.0
+            continue
+        forward_return = float(forward_returns[index]) if np.isfinite(forward_returns[index]) else 0.0
+        up_move = float(max_up[index]) if np.isfinite(max_up[index]) else 0.0
+        down_move = float(min_down[index]) if np.isfinite(min_down[index]) else 0.0
+
+        if label == "buy":
+            realized_directional_return = forward_return
+            favorable_move = max(up_move, forward_return, 0.0)
+            adverse_move = max(abs(down_move), 0.0)
+        else:
+            realized_directional_return = -forward_return
+            favorable_move = max(abs(down_move), -forward_return, 0.0)
+            adverse_move = max(up_move, 0.0)
+
+        edge_component = float(
+            np.clip((realized_directional_return - cost_rate) / max(target_scale, 1e-9), 0.0, 1.0)
+        )
+        reward_risk_ratio = favorable_move / max(adverse_move + cost_rate, 1e-9)
+        reward_risk_component = float(np.clip(reward_risk_ratio / 2.0, 0.0, 1.0))
+        confidence_component = float(
+            np.clip(abs(realized_directional_return) / max(target_scale, 1e-9), 0.0, 1.0)
+        )
+        stability_component = float(np.clip(1.0 - (max(0.0, volatility[index]) * 12.0), 0.0, 1.0))
+        score = (
+            (0.40 * edge_component)
+            + (0.25 * reward_risk_component)
+            + (0.20 * confidence_component)
+            + (0.15 * stability_component)
+        )
+        scores[index] = float(np.clip(score, 0.0, 1.0))
+    return scores
 
 
 def _label_training_frame(
@@ -191,17 +422,64 @@ def _label_training_frame(
     horizon_bars: int,
     buy_threshold: float,
     sell_threshold: float,
+    labeling_mode: str,
+    trade_quality_min_score: float,
+    one_way_cost_bps: float,
 ) -> pd.DataFrame:
     horizon = max(1, int(horizon_bars))
-    buy_cutoff = float(buy_threshold)
-    sell_cutoff = abs(float(sell_threshold))
+    buy_cutoff = float(max(0.0005, buy_threshold))
+    sell_cutoff = float(max(0.0005, abs(sell_threshold)))
+    mode = _resolve_labeling_mode(labeling_mode)
+    quality_threshold = float(np.clip(trade_quality_min_score, 0.0, 1.0))
+
+    forward_return, max_up_return, min_down_return = _compute_forward_path_statistics(
+        feature_frame,
+        horizon_bars=horizon,
+    )
 
     labeled = feature_frame.copy()
-    labeled["forward_return"] = labeled["close"].shift(-horizon) / labeled["close"] - 1.0
-    labeled["label"] = "hold"
-    labeled.loc[labeled["forward_return"] >= buy_cutoff, "label"] = "buy"
-    labeled.loc[labeled["forward_return"] <= -sell_cutoff, "label"] = "sell"
-    labeled = labeled.dropna(subset=[*FEATURE_COLUMNS, "forward_return"]).reset_index(drop=True)
+    labeled["forward_return"] = forward_return
+    labeled["max_up_return"] = max_up_return
+    labeled["min_down_return"] = min_down_return
+
+    if mode == "triple_barrier_v2":
+        raw_labels, barrier_events = _label_triple_barrier(
+            feature_frame,
+            horizon_bars=horizon,
+            buy_threshold=buy_cutoff,
+            sell_threshold=sell_cutoff,
+        )
+    else:
+        raw_labels = ["hold"] * len(labeled)
+        barrier_events = ["forward_return_threshold"] * len(labeled)
+        forward_series = pd.to_numeric(labeled["forward_return"], errors="coerce")
+        for index, value in enumerate(forward_series.to_numpy(dtype=float)):
+            if not np.isfinite(value):
+                continue
+            if value >= buy_cutoff:
+                raw_labels[index] = "buy"
+            elif value <= -sell_cutoff:
+                raw_labels[index] = "sell"
+
+    labeled["raw_label"] = raw_labels
+    labeled["barrier_event"] = barrier_events
+    trade_quality_score = _compute_trade_quality_scores(
+        labeled,
+        buy_threshold=buy_cutoff,
+        sell_threshold=sell_cutoff,
+        one_way_cost_bps=one_way_cost_bps,
+    )
+    labeled["trade_quality_score"] = trade_quality_score
+    actionable_raw = labeled["raw_label"].isin({"buy", "sell"})
+    labeled["trade_quality_pass"] = actionable_raw & (labeled["trade_quality_score"] >= quality_threshold)
+    labeled["meta_label"] = labeled["trade_quality_pass"].astype(int)
+    labeled["label"] = labeled["raw_label"].where(labeled["trade_quality_pass"], "hold")
+    labeled["labeling_mode"] = mode
+    labeled["trade_quality_threshold"] = quality_threshold
+    labeled["trade_quality_demoted_to_hold"] = actionable_raw & (~labeled["trade_quality_pass"])
+    labeled = labeled.dropna(
+        subset=[*FEATURE_COLUMNS, "forward_return", "max_up_return", "min_down_return"]
+    ).reset_index(drop=True)
     return labeled
 
 
@@ -517,22 +795,47 @@ def _derive_expectancy_metrics(
         "break_even_one_way_cost_bps": break_even_one_way_cost_bps,
     }
 
+def _apply_action_confidence_gate(
+    *,
+    predicted: list[str],
+    probabilities: list[dict[str, float]],
+    action_confidence_threshold: float,
+) -> tuple[list[str], int]:
+    threshold = float(np.clip(action_confidence_threshold, 0.0, 1.0))
+    gated: list[str] = []
+    demoted_count = 0
+    for label, probs in zip(predicted, probabilities):
+        confidence = float(probs.get(label, 0.0))
+        if label in {"buy", "sell"} and confidence < threshold:
+            gated.append("hold")
+            demoted_count += 1
+        else:
+            gated.append(label)
+    return gated, demoted_count
+
+
 
 def _evaluate_model(
     *,
     model_payload: dict[str, Any],
     test_frame: pd.DataFrame,
     one_way_cost_bps: float,
+    action_confidence_threshold: float,
 ) -> dict[str, Any]:
     expected = test_frame["label"].astype(str).tolist()
     forward_returns = test_frame["forward_return"].to_numpy(dtype=float)
     feature_matrix = test_frame[list(FEATURE_COLUMNS)].to_numpy(dtype=float)
-    predicted: list[str] = []
+    raw_predicted: list[str] = []
     probability_rows: list[dict[str, float]] = []
     for row in feature_matrix:
         label, probabilities = _predict_probabilities(model_payload, row)
-        predicted.append(label)
+        raw_predicted.append(label)
         probability_rows.append(probabilities)
+    predicted, demoted_action_count = _apply_action_confidence_gate(
+        predicted=raw_predicted,
+        probabilities=probability_rows,
+        action_confidence_threshold=action_confidence_threshold,
+    )
     accuracy, confusion = _classification_metrics(expected, predicted)
     per_class = _derive_per_class_metrics(confusion)
     actionable = _derive_actionable_metrics(expected, predicted)
@@ -553,6 +856,13 @@ def _evaluate_model(
         "actionable_metrics": actionable,
         "calibration_metrics": calibration,
         "expectancy_metrics": expectancy,
+        "action_confidence_threshold": float(np.clip(action_confidence_threshold, 0.0, 1.0)),
+        "demoted_action_count": int(demoted_action_count),
+        "raw_actionable_count": int(sum(1 for label in raw_predicted if label in {"buy", "sell"})),
+        "raw_actionable_rate": _safe_div(
+            float(sum(1 for label in raw_predicted if label in {"buy", "sell"})),
+            float(len(raw_predicted)),
+        ),
     }
 
 
@@ -589,6 +899,98 @@ def _candidate_threshold_pairs(
         for sell_value in ordered:
             pairs.append((float(buy_value), float(sell_value)))
     return pairs
+
+
+def _candidate_action_confidence_thresholds(minimum_threshold: float) -> list[float]:
+    floor = float(np.clip(minimum_threshold, 0.0, 1.0))
+    base = {0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, floor}
+    return [value for value in sorted(float(np.clip(item, 0.0, 1.0)) for item in base) if value >= floor]
+
+
+def _select_action_confidence_frontier(
+    *,
+    model_payload: dict[str, Any],
+    test_frame: pd.DataFrame,
+    one_way_cost_bps: float,
+    minimum_threshold: float,
+    optimize_thresholds: bool,
+) -> tuple[float, dict[str, Any], list[dict[str, Any]]]:
+    candidate_thresholds = (
+        _candidate_action_confidence_thresholds(minimum_threshold)
+        if optimize_thresholds
+        else [float(np.clip(minimum_threshold, 0.0, 1.0))]
+    )
+    selected_threshold = float(np.clip(minimum_threshold, 0.0, 1.0))
+    selected_evaluation: dict[str, Any] | None = None
+    frontier_rows: list[dict[str, Any]] = []
+    best_rank: tuple[float, float, float, float, float] | None = None
+
+    for threshold in candidate_thresholds:
+        evaluation = _evaluate_model(
+            model_payload=model_payload,
+            test_frame=test_frame,
+            one_way_cost_bps=one_way_cost_bps,
+            action_confidence_threshold=threshold,
+        )
+        expectancy = dict(evaluation.get("expectancy_metrics", {}))
+        actionable = dict(evaluation.get("actionable_metrics", {}))
+        row = {
+            "threshold": float(threshold),
+            "accuracy": float(evaluation.get("accuracy", 0.0)),
+            "demoted_action_count": int(evaluation.get("demoted_action_count", 0)),
+            "raw_actionable_rate": float(evaluation.get("raw_actionable_rate", 0.0)),
+            "actionable_rate": float(actionable.get("actionable_rate", 0.0)),
+            "binary_actionable_precision": float(
+                actionable.get("binary_actionable_precision", 0.0)
+            ),
+            "binary_actionable_recall": float(actionable.get("binary_actionable_recall", 0.0)),
+            "net_expectancy_per_bar": float(expectancy.get("net_expectancy_per_bar", 0.0)),
+            "net_expectancy_per_actionable": float(
+                expectancy.get("net_expectancy_per_actionable", 0.0)
+            ),
+        }
+        frontier_rows.append(row)
+        rank = (
+            row["net_expectancy_per_bar"],
+            row["net_expectancy_per_actionable"],
+            row["binary_actionable_precision"],
+            row["actionable_rate"],
+            row["accuracy"],
+        )
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            selected_threshold = float(threshold)
+            selected_evaluation = evaluation
+
+    if selected_evaluation is None:
+        selected_evaluation = _evaluate_model(
+            model_payload=model_payload,
+            test_frame=test_frame,
+            one_way_cost_bps=one_way_cost_bps,
+            action_confidence_threshold=selected_threshold,
+        )
+        expectancy = dict(selected_evaluation.get("expectancy_metrics", {}))
+        actionable = dict(selected_evaluation.get("actionable_metrics", {}))
+        frontier_rows.append(
+            {
+                "threshold": float(selected_threshold),
+                "accuracy": float(selected_evaluation.get("accuracy", 0.0)),
+                "demoted_action_count": int(selected_evaluation.get("demoted_action_count", 0)),
+                "raw_actionable_rate": float(selected_evaluation.get("raw_actionable_rate", 0.0)),
+                "actionable_rate": float(actionable.get("actionable_rate", 0.0)),
+                "binary_actionable_precision": float(
+                    actionable.get("binary_actionable_precision", 0.0)
+                ),
+                "binary_actionable_recall": float(
+                    actionable.get("binary_actionable_recall", 0.0)
+                ),
+                "net_expectancy_per_bar": float(expectancy.get("net_expectancy_per_bar", 0.0)),
+                "net_expectancy_per_actionable": float(
+                    expectancy.get("net_expectancy_per_actionable", 0.0)
+                ),
+            }
+        )
+    return selected_threshold, selected_evaluation, frontier_rows
 
 
 def _feature_reasons(
@@ -661,6 +1063,11 @@ def train_trigger_model(
     min_train_samples: int,
     cost_bps: float = 0.0,
     optimize_thresholds: bool = True,
+    labeling_mode: str = "triple_barrier_v2",
+    trade_quality_min_score: float = 0.55,
+    action_confidence_threshold: float = 0.55,
+    priority2_features_enabled: bool = True,
+    priority2_external_features_path: Path | None = None,
 ) -> TriggerModelTrainingResult:
     source_data_path = (
         input_file.expanduser().resolve()
@@ -670,13 +1077,30 @@ def train_trigger_model(
     if not source_data_path.exists():
         raise FileNotFoundError(f"Training input file not found: {source_data_path}")
     source_data_sha256 = _sha256_file(source_data_path)
+    resolved_priority2_external_features_path, priority2_external_resolution = (
+        _resolve_priority2_external_features_path(
+            settings=settings,
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            priority2_features_enabled=bool(priority2_features_enabled),
+            requested_path=priority2_external_features_path,
+        )
+    )
 
     frame = _coerce_frame(source_data_path)
-    feature_frame = _build_feature_frame(frame)
+    feature_frame, priority2_bundle = _build_feature_frame(
+        frame,
+        priority2_features_enabled=bool(priority2_features_enabled),
+        priority2_external_features_path=resolved_priority2_external_features_path,
+    )
+    resolved_labeling_mode = _resolve_labeling_mode(labeling_mode)
     resolved_horizon = int(max(1, horizon_bars))
     resolved_buy_threshold = float(max(0.0005, buy_threshold))
     resolved_sell_threshold = float(max(0.0005, abs(sell_threshold)))
     resolved_cost_bps = float(max(0.0, cost_bps))
+    resolved_trade_quality_min_score = float(np.clip(trade_quality_min_score, 0.0, 1.0))
+    resolved_action_confidence_threshold = float(np.clip(action_confidence_threshold, 0.0, 1.0))
     required_rows = max(30, int(min_train_samples) + 5)
 
     threshold_candidates: list[dict[str, Any]] = []
@@ -692,6 +1116,9 @@ def train_trigger_model(
                 horizon_bars=resolved_horizon,
                 buy_threshold=candidate_buy,
                 sell_threshold=candidate_sell,
+                labeling_mode=resolved_labeling_mode,
+                trade_quality_min_score=resolved_trade_quality_min_score,
+                one_way_cost_bps=resolved_cost_bps,
             )
             if len(candidate_labeled) < required_rows:
                 continue
@@ -707,13 +1134,20 @@ def train_trigger_model(
                 model_payload=candidate_model,
                 test_frame=candidate_test,
                 one_way_cost_bps=resolved_cost_bps,
+                action_confidence_threshold=resolved_action_confidence_threshold,
             )
             expectancy = dict(candidate_eval.get("expectancy_metrics", {}))
             actionable = dict(candidate_eval.get("actionable_metrics", {}))
+            quality_pass_rate = (
+                float(candidate_labeled["trade_quality_pass"].mean())
+                if "trade_quality_pass" in candidate_labeled and len(candidate_labeled) > 0
+                else 0.0
+            )
             threshold_candidates.append(
                 {
                     "buy_threshold": candidate_buy,
                     "sell_threshold": candidate_sell,
+                    "trade_quality_min_score": resolved_trade_quality_min_score,
                     "sample_count": int(len(candidate_labeled)),
                     "train_count": int(candidate_train_count),
                     "test_count": int(candidate_test_count),
@@ -726,6 +1160,7 @@ def train_trigger_model(
                     "binary_actionable_precision": float(
                         actionable.get("binary_actionable_precision", 0.0)
                     ),
+                    "trade_quality_pass_rate": quality_pass_rate,
                 }
             )
         if threshold_candidates:
@@ -746,6 +1181,9 @@ def train_trigger_model(
         horizon_bars=resolved_horizon,
         buy_threshold=selected_buy_threshold,
         sell_threshold=selected_sell_threshold,
+        labeling_mode=resolved_labeling_mode,
+        trade_quality_min_score=resolved_trade_quality_min_score,
+        one_way_cost_bps=resolved_cost_bps,
     )
     if len(labeled) < required_rows:
         raise RuntimeError(
@@ -758,10 +1196,12 @@ def train_trigger_model(
         min_train_samples=min_train_samples,
     )
     model = _fit_gaussian_model(train_frame)
-    evaluation = _evaluate_model(
+    selected_action_confidence_threshold, evaluation, action_confidence_frontier = _select_action_confidence_frontier(
         model_payload=model,
         test_frame=test_frame,
         one_way_cost_bps=resolved_cost_bps,
+        minimum_threshold=resolved_action_confidence_threshold,
+        optimize_thresholds=bool(optimize_thresholds),
     )
     accuracy = float(evaluation.get("accuracy", 0.0))
     confusion = dict(evaluation.get("confusion_matrix", {}))
@@ -774,33 +1214,76 @@ def train_trigger_model(
         label: int((labeled["label"] == label).sum())
         for label in TRIGGER_LABELS
     }
+    raw_distribution = {
+        label: int((labeled["raw_label"] == label).sum())
+        for label in TRIGGER_LABELS
+    }
+    trade_quality_pass_count = int(labeled["trade_quality_pass"].sum())
+    trade_quality_demoted_count = int(labeled["trade_quality_demoted_to_hold"].sum())
+    meta_label_positive_count = int(labeled["meta_label"].sum())
+
     run_dir = _new_trigger_model_dir(settings.quant_data_root, exchange, symbol, timeframe)
     model_path = run_dir / "model.json"
     train_frame_path = run_dir / "train_dataset.parquet"
     test_frame_path = run_dir / "test_dataset.parquet"
     train_frame.to_parquet(train_frame_path, index=False)
     test_frame.to_parquet(test_frame_path, index=False)
+    priority2_artifacts = write_priority2_feature_artifacts(
+        quant_data_root=settings.quant_data_root,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        run_id=run_dir.name,
+        bundle=priority2_bundle,
+    )
 
     model_payload = {
-        "contract": "trigger_model.gaussian_nb.v1",
+        "contract": "trigger_model.gaussian_nb.v2",
         "created_at_utc": _utc_now_iso(),
         "exchange": exchange,
         "symbol": symbol,
         "timeframe": timeframe,
         "source_data_path": str(source_data_path),
         "source_data_sha256": source_data_sha256,
+        "labeling_mode": resolved_labeling_mode,
         "horizon_bars": resolved_horizon,
         "buy_threshold": float(selected_buy_threshold),
         "sell_threshold": float(selected_sell_threshold),
+        "trade_quality_min_score": float(resolved_trade_quality_min_score),
+        "selected_action_confidence_threshold": float(selected_action_confidence_threshold),
         "feature_columns": list(FEATURE_COLUMNS),
         "labels": list(TRIGGER_LABELS),
         "class_stats": model["class_stats"],
+        "priority2_features_enabled": bool(priority2_features_enabled),
+        "priority2_external_features_path": (
+            str(resolved_priority2_external_features_path)
+            if resolved_priority2_external_features_path is not None
+            else None
+        ),
+        "priority2_external_features_path_resolution": priority2_external_resolution,
+        "priority2_reason_codes": list(priority2_bundle.reason_codes),
+        "priority2_diagnostics": dict(priority2_bundle.diagnostics),
         "training_metrics": {
             "sample_count": int(len(labeled)),
             "train_count": int(train_count),
             "test_count": int(test_count),
             "accuracy": accuracy,
             "label_distribution": distribution,
+            "raw_label_distribution": raw_distribution,
+            "trade_quality_stats": {
+                "trade_quality_min_score": float(resolved_trade_quality_min_score),
+                "trade_quality_pass_count": trade_quality_pass_count,
+                "trade_quality_demoted_to_hold_count": trade_quality_demoted_count,
+                "trade_quality_pass_rate": _safe_div(
+                    float(trade_quality_pass_count),
+                    float(len(labeled)),
+                ),
+                "meta_label_positive_count": meta_label_positive_count,
+                "meta_label_positive_rate": _safe_div(
+                    float(meta_label_positive_count),
+                    float(len(labeled)),
+                ),
+            },
             "confusion_matrix": confusion,
             "per_class_metrics": per_class_metrics,
             "actionable_metrics": actionable_metrics,
@@ -815,13 +1298,23 @@ def train_trigger_model(
             "selected": {
                 "buy_threshold": float(selected_buy_threshold),
                 "sell_threshold": float(selected_sell_threshold),
+                "trade_quality_min_score": float(resolved_trade_quality_min_score),
+                "action_confidence_threshold": float(selected_action_confidence_threshold),
             },
             "top_candidates": threshold_candidates[:10],
+            "action_confidence_frontier": {
+                "objective": "net_expectancy_per_bar",
+                "candidate_count": int(len(action_confidence_frontier)),
+                "selected_threshold": float(selected_action_confidence_threshold),
+                "rows": action_confidence_frontier[:20],
+            },
         },
         "artifacts": {
             "run_dir": str(run_dir),
             "train_dataset_path": str(train_frame_path),
             "test_dataset_path": str(test_frame_path),
+            "priority2_feature_parquet": str(priority2_artifacts.parquet_path),
+            "priority2_feature_contract": str(priority2_artifacts.contract_path),
         },
     }
     _write_json(model_path, model_payload)
@@ -843,8 +1336,34 @@ def train_trigger_model(
         confusion_matrix=confusion,
         selected_buy_threshold=float(selected_buy_threshold),
         selected_sell_threshold=float(selected_sell_threshold),
+        selected_trade_quality_threshold=float(resolved_trade_quality_min_score),
+        selected_action_confidence_threshold=float(selected_action_confidence_threshold),
         net_expectancy_per_actionable=float(expectancy_metrics.get("net_expectancy_per_actionable", 0.0)),
     )
+
+def _resolve_prediction_action_confidence_threshold(
+    *,
+    model_payload: dict[str, Any],
+    override_threshold: float | None,
+) -> float:
+    if override_threshold is not None:
+        return float(np.clip(override_threshold, 0.0, 1.0))
+    model_value = model_payload.get("selected_action_confidence_threshold")
+    if isinstance(model_value, (int, float)):
+        return float(np.clip(float(model_value), 0.0, 1.0))
+    threshold_optimization = model_payload.get("threshold_optimization")
+    if isinstance(threshold_optimization, dict):
+        selected = threshold_optimization.get("selected")
+        if isinstance(selected, dict):
+            selected_value = selected.get("action_confidence_threshold")
+            if isinstance(selected_value, (int, float)):
+                return float(np.clip(float(selected_value), 0.0, 1.0))
+        frontier = threshold_optimization.get("action_confidence_frontier")
+        if isinstance(frontier, dict):
+            frontier_value = frontier.get("selected_threshold")
+            if isinstance(frontier_value, (int, float)):
+                return float(np.clip(float(frontier_value), 0.0, 1.0))
+    return 0.0
 
 
 def predict_trigger_signal(
@@ -856,6 +1375,9 @@ def predict_trigger_signal(
     model_path: Path | None,
     input_file: Path | None,
     write_artifact: bool = True,
+    action_confidence_threshold: float | None = None,
+    priority2_features_enabled: bool = True,
+    priority2_external_features_path: Path | None = None,
 ) -> TriggerPredictionResult:
     resolved_model_path = (
         model_path.expanduser().resolve()
@@ -869,17 +1391,63 @@ def predict_trigger_signal(
         else latest_raw_dataset(settings.quant_data_root, exchange, symbol, timeframe)
     )
     source_data_sha256 = _sha256_file(source_data_path)
+    resolved_priority2_external_features_path, priority2_external_resolution = (
+        _resolve_priority2_external_features_path(
+            settings=settings,
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            priority2_features_enabled=bool(priority2_features_enabled),
+            requested_path=priority2_external_features_path,
+        )
+    )
 
     frame = _coerce_frame(source_data_path)
-    feature_frame = _build_feature_frame(frame).dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
+    feature_frame, priority2_bundle = _build_feature_frame(
+        frame,
+        priority2_features_enabled=bool(priority2_features_enabled),
+        priority2_external_features_path=resolved_priority2_external_features_path,
+    )
+    feature_frame = feature_frame.dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
     if feature_frame.empty:
         raise RuntimeError("No usable feature rows for prediction")
 
     latest_row = feature_frame.iloc[-1]
     vector = np.asarray([float(latest_row[feature]) for feature in FEATURE_COLUMNS], dtype=float)
-    recommendation, probabilities = _predict_probabilities(model_payload, vector)
-    confidence = float(probabilities[recommendation])
-    top_reasons, reason_details = _feature_reasons(model_payload, vector, recommendation, probabilities)
+    raw_recommendation, probabilities = _predict_probabilities(model_payload, vector)
+    confidence = float(probabilities[raw_recommendation])
+    resolved_action_confidence_threshold = _resolve_prediction_action_confidence_threshold(
+        model_payload=model_payload,
+        override_threshold=action_confidence_threshold,
+    )
+    recommendation = raw_recommendation
+    confidence_gate_applied = False
+    if recommendation in {"buy", "sell"} and confidence < resolved_action_confidence_threshold:
+        recommendation = "hold"
+        confidence_gate_applied = True
+    top_reasons, reason_details = _feature_reasons(
+        model_payload,
+        vector,
+        raw_recommendation,
+        probabilities,
+    )
+    if confidence_gate_applied:
+        gate_reason = (
+            f"confidence_gate_demoted_to_hold raw={raw_recommendation} "
+            f"confidence={confidence:.3f} threshold={resolved_action_confidence_threshold:.3f}"
+        )
+        top_reasons = [gate_reason, *top_reasons]
+        reason_details = [
+            {
+                "feature": "action_confidence_threshold",
+                "value": float(confidence),
+                "impact": float(confidence - resolved_action_confidence_threshold),
+                "supports": "hold",
+                "vs_alternative": raw_recommendation,
+                "reason": "confidence_gate_demoted_to_hold",
+            },
+            *reason_details,
+        ]
     feature_values = {feature: float(latest_row[feature]) for feature in FEATURE_COLUMNS}
     close_price = float(latest_row["close"])
     sma_fast = close_price / (1.0 + float(latest_row["sma_fast_spread"]))
@@ -898,14 +1466,17 @@ def predict_trigger_signal(
         _write_json(
             prediction_path,
             {
-                "contract": "trigger_prediction.v1",
+                "contract": "trigger_prediction.v2",
                 "created_at_utc": now.isoformat(),
                 "exchange": exchange,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "prediction_timestamp_utc": timestamp_utc,
+                "raw_recommendation": raw_recommendation,
                 "recommendation": recommendation,
                 "confidence": confidence,
+                "action_confidence_threshold": float(resolved_action_confidence_threshold),
+                "confidence_gate_applied": bool(confidence_gate_applied),
                 "probabilities": probabilities,
                 "close_price": close_price,
                 "sma_fast": sma_fast,
@@ -922,6 +1493,16 @@ def predict_trigger_signal(
                 "model_path": str(resolved_model_path),
                 "model_contract": str(model_payload.get("contract", "")),
                 "model_created_at_utc": model_payload.get("created_at_utc"),
+                "priority2_features_enabled": bool(priority2_features_enabled),
+                "priority2_external_features_path": (
+                    str(resolved_priority2_external_features_path)
+                    if resolved_priority2_external_features_path is not None
+                    else None
+                ),
+                "priority2_external_features_path_resolution": priority2_external_resolution,
+                "priority2_reason_codes": list(priority2_bundle.reason_codes),
+                "priority2_diagnostics": dict(priority2_bundle.diagnostics),
+                "priority2_feature_snapshot": dict(priority2_bundle.feature_snapshot),
             },
         )
 
@@ -943,6 +1524,7 @@ def predict_trigger_signal(
         feature_values=feature_values,
         top_reasons=top_reasons,
         reason_details=reason_details,
+        action_confidence_threshold=float(resolved_action_confidence_threshold),
         prediction_path=prediction_path,
     )
 

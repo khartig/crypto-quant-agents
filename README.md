@@ -127,7 +127,15 @@ Key environment variables (see `.env.example`):
   - `REGIME_VOLATILITY_THRESHOLD`
   - `REGIME_TREND_SPREAD_THRESHOLD`
   - `REGIME_PERSISTENCE_BARS`
+  - `REGIME_ENABLED`
   - `REGIME_ABLATION_MODE`
+  - `PRIORITY2_FEATURES_ENABLED`
+  - `PRIORITY2_EXTERNAL_FEATURES_PATH`
+  - `PRIORITY2_RETRIEVAL_PROVIDER`
+  - `PRIORITY2_RETRIEVAL_TIMEOUT_SECONDS`
+  - `PRIORITY2_RETRIEVAL_MAX_POINTS`
+  - `PRIORITY2_RETRIEVAL_BASE_URL`
+  - `PRIORITY2_LOCAL_FEATURE_OVERRIDES_PATH`
   - `AGENT_ENSEMBLE_MODE`
   - `AGENT_ENSEMBLE_ARMS`
   - `AGENT_ENSEMBLE_DECAY_HORIZON`
@@ -145,6 +153,9 @@ Key environment variables (see `.env.example`):
   - `TRIGGER_MODEL_MIN_TRAIN_SAMPLES`
   - `TRIGGER_MODEL_COST_BPS`
   - `TRIGGER_MODEL_OPTIMIZE_THRESHOLDS`
+  - `TRIGGER_MODEL_LABELING_MODE` (`directional_v1|triple_barrier_v2`)
+  - `TRIGGER_MODEL_TRADE_QUALITY_MIN_SCORE`
+  - `TRIGGER_MODEL_ACTION_CONFIDENCE_THRESHOLD`
 - Trigger monitor:
   - `TRIGGER_MONITOR_POLL_SECONDS`
   - `TRIGGER_MONITOR_SIGNAL_CONFIDENCE`
@@ -183,7 +194,9 @@ Key environment variables (see `.env.example`):
   - `REGIME_VOLATILITY_THRESHOLD=0.03`
   - `REGIME_TREND_SPREAD_THRESHOLD=0.01`
   - `REGIME_PERSISTENCE_BARS=3`
+  - `REGIME_ENABLED=1`
   - `REGIME_ABLATION_MODE=0`
+  - `PRIORITY2_FEATURES_ENABLED=1`
 - Risk thresholds:
   - `RISK_MAX_COST_RETURN_DRAG=0.05`
   - `RISK_MAX_COST_PRESSURE_SCORE=0.95`
@@ -199,6 +212,15 @@ Key environment variables (see `.env.example`):
 - Cost model:
   - `BACKTEST_FEE_BPS=5.0`, `BACKTEST_SLIPPAGE_BPS=2.5`
   - `WALK_FORWARD_FEE_BPS=5.0`, `WALK_FORWARD_SLIPPAGE_BPS=2.5`
+- Trigger model:
+  - `TRIGGER_MODEL_LABELING_MODE=triple_barrier_v2`
+  - `TRIGGER_MODEL_TRADE_QUALITY_MIN_SCORE=0.55`
+  - `TRIGGER_MODEL_ACTION_CONFIDENCE_THRESHOLD=0.55`
+
+### Regime control precedence
+- `REGIME_ENABLED=0` (or CLI `--no-regime-enabled`) is the top-level operator kill-switch and forces effective regime ablation semantics.
+- `REGIME_ABLATION_MODE=1` keeps legacy ablation behavior when regime logic remains enabled globally.
+- Regime touchpoint toggles only apply when regime logic is effectively enabled.
 
 ## Commands
 The main CLI command is `quant-agents`.
@@ -217,6 +239,16 @@ quant-agents backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --fast-
 quant-agents backtest --exchange kraken --symbol BTC/USDT --timeframe 1h --input-file /mnt/quant-data/raw/exchange=kraken/symbol=BTC-USDT/interval=1h/year=2026/month=06/ohlcv_YYYYMMDDTHHMMSSZ.parquet
 quant-agents archive-backtest --strategy sma_crossover
 ```
+### Priority 2 external retrieval (Phase 1)
+Use this to generate canonical external derivatives/whale feature artifacts, then feed the resulting parquet path into `--priority2-external-features-path` for training/prediction/agent-plane runs.
+`--provider` supports `okx_public` (default) and `binance_futures_public`.
+```bash path=null start=null
+quant-agents retrieve-priority2-features --exchange binanceus --symbol BTC/USDT --timeframe 1h --provider okx_public
+quant-agents retrieve-priority2-features --exchange binanceus --symbol BTC/USDT --timeframe 1h --provider okx_public --input-file /mnt/quant-data/raw/exchange=binanceus/symbol=BTC-USDT/interval=1h/year=2026/month=06/ohlcv_YYYYMMDDTHHMMSSZ_6mo.parquet --max-points 500 --timeout-seconds 20
+quant-agents retrieve-priority2-features --exchange binanceus --symbol BTC/USDT --timeframe 1h --provider binance_futures_public --base-url https://fapi.binance.com
+quant-agents retrieve-priority2-features --exchange kraken --symbol BTC/USDT --timeframe 1h --local-feature-overrides-path /mnt/quant-data/external/priority2_whale_overrides.parquet
+```
+When `train-trigger-model` or `predict-trigger` runs with Priority 2 enabled and no explicit `--priority2-external-features-path`, the pipeline now auto-resolves the latest artifact from `curated/features/external/.../latest_external_features_path.txt` for the same exchange/symbol/timeframe scope.
 
 ### Reporting and daily workflow
 ```bash path=null start=null
@@ -232,7 +264,9 @@ quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --min-total-return 0.01 --min-sharpe 0.2 --max-drawdown -0.15 --min-signal-confidence 0.6 --step-retries 2
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --max-cost-return-drag 0.05 --max-cost-pressure-score 0.95 --min-walkforward-quality-score 0.43 --backtest-fee-bps 5 --backtest-slippage-bps 2.5 --walkforward-fee-bps 5 --walkforward-slippage-bps 2.5
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --regime-detector-mode score --regime-volatility-threshold 0.03 --regime-trend-spread-threshold 0.01 --regime-persistence-bars 3 --min-regime-confidence 0.45
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --no-regime-enabled
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --regime-ablation-mode
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-external-features-path /mnt/quant-data/external/priority2_features_btcusdt_1h.parquet
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5 --paper-slippage-bps 1
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --ensemble-mode adaptive --ensemble-arms sma_baseline,technical_composite,llm_context --ensemble-decay-horizon 48 --ensemble-exploration-weight 0.15 --ensemble-turnover-penalty-bps 8
 ```
@@ -252,7 +286,9 @@ quant-agents visualize-run --run-dir /mnt/quant-data/logs/agents/openclaw-orches
 ### Trigger model and continuous monitoring
 ```bash path=null start=null
 quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --cost-bps 7.5 --optimize-thresholds
+quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --labeling-mode triple_barrier_v2 --trade-quality-min-score 0.55 --action-confidence-threshold 0.60 --priority2-features-enabled
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
+quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h --action-confidence-threshold 0.60 --priority2-features-enabled
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
@@ -371,6 +407,14 @@ All paths below are relative to `QUANT_DATA_ROOT`.
   - `models/trigger-models/exchange=<exchange>/symbol=<pair>/interval=<tf>/<run_id>/model.json`
   - `models/trigger-models/exchange=<exchange>/symbol=<pair>/interval=<tf>/<run_id>/train_dataset.parquet`
   - `models/trigger-models/exchange=<exchange>/symbol=<pair>/interval=<tf>/<run_id>/test_dataset.parquet`
+- Priority 2 curated feature artifacts:
+  - `curated/features/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_features.parquet`
+  - `curated/features/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_feature_contract.json`
+- Priority 2 external retrieval artifacts:
+  - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_external_features.parquet`
+  - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_external_feature_contract.json`
+  - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_external_features_path.txt`
+  - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_external_feature_contract_path.txt`
 - Trigger predictions and alerts:
   - `logs/agents/model-predictor/<yyyy-mm-dd>/prediction_<timestamp>.json`
   - `logs/agents/trigger-monitor/<yyyy-mm-dd>/alerts.jsonl`
@@ -384,4 +428,5 @@ All paths below are relative to `QUANT_DATA_ROOT`.
 - If data quality fails due to low history, ingest more candles or lower `AGENT_MINIMUM_BARS` for controlled testing.
 - If risk gate fails, intent stays blocked and paper execution is skipped by design.
 - If a `sell` intent is emitted while no long inventory is open, execution is rejected with `reason=no_long_position_to_sell` by design.
+- If `retrieve-priority2-features` shows provider HTTP 451 errors (common on Binance futures in restricted regions), switch to `--provider okx_public`; if all external endpoints still fail, the module auto-falls back to deterministic market-derived Priority 2 features and records fallback diagnostics in the contract. Use `--local-feature-overrides-path` (or `PRIORITY2_LOCAL_FEATURE_OVERRIDES_PATH`) when you want to replace/augment fallback output with your own external feed.
 - TradingView built-in paper trading is not exposed as a direct public trading API; use TradingView alerts/webhooks plus a broker/testnet API path.
