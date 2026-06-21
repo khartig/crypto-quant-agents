@@ -10,13 +10,26 @@ import numpy as np
 import pandas as pd
 
 from quant_agents.config import load_settings
+from quant_agents.orderbook_features import (
+    DEFAULT_STABLE_ORDERBOOK_FEATURE_COLUMNS,
+    normalize_orderbook_feature_columns,
+)
+from quant_agents.ranked_features import (
+    DEFAULT_STABLE_RANKED_FEATURE_COLUMNS,
+    normalize_ranked_feature_columns,
+)
 from quant_agents.storage import latest_raw_dataset
 from quant_agents.trigger_model import (
-    FEATURE_COLUMNS,
+    _apply_orderbook_features,
+    _apply_ranked_features,
+    _build_prediction_vector,
     _build_feature_frame,
     _coerce_frame,
     _feature_reasons,
     _predict_probabilities,
+    _resolve_model_feature_columns,
+    _resolve_orderbook_features_path,
+    _resolve_ranked_external_features_path,
     _resolve_prediction_action_confidence_threshold,
     latest_trigger_model_path,
 )
@@ -98,7 +111,62 @@ def main() -> None:
         priority2_external_features_path=priority2_external_features_path,
         priority2_feature_columns=tuple(settings.priority2_feature_columns),
     )
-    feature_frame = feature_frame.dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
+    ranked_external_features_path = (
+        Path(settings.ranked_external_features_path).expanduser().resolve()
+        if settings.ranked_external_features_path
+        else None
+    )
+    resolved_ranked_external_features_path, _ = _resolve_ranked_external_features_path(
+        settings=settings,
+        ranked_features_enabled=bool(settings.ranked_features_enabled),
+        requested_path=ranked_external_features_path,
+    )
+    ranked_feature_columns = normalize_ranked_feature_columns(
+        tuple(settings.ranked_feature_columns)
+        if settings.ranked_feature_columns
+        else DEFAULT_STABLE_RANKED_FEATURE_COLUMNS
+    )
+    feature_frame, _ = _apply_ranked_features(
+        market_frame=frame,
+        feature_frame=feature_frame,
+        ranked_features_enabled=bool(settings.ranked_features_enabled),
+        ranked_external_features_path=resolved_ranked_external_features_path,
+        ranked_feature_columns=ranked_feature_columns,
+    )
+    orderbook_features_path = (
+        Path(settings.orderbook_features_path).expanduser().resolve()
+        if settings.orderbook_features_path
+        else None
+    )
+    resolved_orderbook_features_path, _ = _resolve_orderbook_features_path(
+        settings=settings,
+        exchange=args.exchange,
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        orderbook_features_enabled=bool(settings.orderbook_features_enabled),
+        requested_path=orderbook_features_path,
+    )
+    orderbook_feature_columns = normalize_orderbook_feature_columns(
+        tuple(settings.orderbook_feature_columns)
+        if settings.orderbook_feature_columns
+        else DEFAULT_STABLE_ORDERBOOK_FEATURE_COLUMNS
+    )
+    feature_frame, _ = _apply_orderbook_features(
+        market_frame=frame,
+        feature_frame=feature_frame,
+        orderbook_features_enabled=bool(settings.orderbook_features_enabled),
+        orderbook_features_path=resolved_orderbook_features_path,
+        orderbook_feature_columns=orderbook_feature_columns,
+    )
+    model_feature_columns = _resolve_model_feature_columns(model_payload)
+    for feature in model_feature_columns:
+        if feature not in feature_frame.columns:
+            feature_frame[feature] = 0.0
+        feature_frame[feature] = (
+            pd.to_numeric(feature_frame[feature], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+    feature_frame = feature_frame.dropna(subset=list(model_feature_columns)).reset_index(drop=True)
     if feature_frame.empty:
         raise RuntimeError("No usable feature rows for backfill")
 
@@ -115,7 +183,10 @@ def main() -> None:
 
     for index, row in backfill_frame.iterrows():
         timestamp = pd.Timestamp(row["timestamp"]).tz_convert("UTC")
-        vector = np.asarray([float(row[feature]) for feature in FEATURE_COLUMNS], dtype=float)
+        vector = _build_prediction_vector(
+            row=row,
+            model_feature_columns=model_feature_columns,
+        )
         raw_recommendation, probabilities = _predict_probabilities(model_payload, vector)
         confidence = float(probabilities[raw_recommendation])
         recommendation = raw_recommendation
@@ -128,6 +199,7 @@ def main() -> None:
             vector,
             raw_recommendation,
             probabilities,
+            model_feature_columns=model_feature_columns,
         )
         if confidence_gate_applied:
             gate_reason = (
@@ -184,7 +256,10 @@ def main() -> None:
             "macd_hist": macd_hist,
             "rsi_14": rsi_14,
             "volatility_24": volatility_24,
-            "feature_values": {feature: float(row[feature]) for feature in FEATURE_COLUMNS},
+            "feature_values": {
+                feature: float(vector[position])
+                for position, feature in enumerate(model_feature_columns)
+            },
             "top_reasons": top_reasons,
             "reason_details": reason_details,
             "source_data_path": str(source_data_path),

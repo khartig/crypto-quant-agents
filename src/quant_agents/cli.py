@@ -15,11 +15,23 @@ from quant_agents.doctor import format_doctor_report, run_doctor
 from quant_agents.ingestion import fetch_ohlcv_to_parquet
 from quant_agents.logging_utils import configure_logging
 from quant_agents.metrics import tracked_operation
+from quant_agents.orderbook_features import (
+    DEFAULT_STABLE_ORDERBOOK_FEATURE_COLUMNS,
+    ORDERBOOK_FEATURE_COLUMNS,
+    normalize_orderbook_feature_columns,
+)
+from quant_agents.orderbook_ingestion import capture_orderbook_snapshots_to_parquet
+from quant_agents.orderbook_retrieval import retrieve_orderbook_features
 from quant_agents.paper_account import run_paper_account_probe
 from quant_agents.priority2_features import (
     DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS,
     PRIORITY2_FEATURE_COLUMNS,
     normalize_priority2_feature_columns,
+)
+from quant_agents.ranked_features import (
+    DEFAULT_STABLE_RANKED_FEATURE_COLUMNS,
+    RANKED_FEATURE_COLUMNS,
+    normalize_ranked_feature_columns,
 )
 from quant_agents.priority2_retrieval import retrieve_priority2_external_features
 from quant_agents.reporting import generate_daily_report
@@ -72,6 +84,58 @@ def _parse_priority2_feature_columns(
     return normalized or fallback
 
 
+def _parse_ranked_feature_columns(
+    value: str | tuple[str, ...] | list[str] | None,
+    *,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    fallback = normalize_ranked_feature_columns(default)
+    if value is None:
+        return fallback
+    if isinstance(value, tuple):
+        items = value
+    elif isinstance(value, list):
+        items = tuple(str(item).strip() for item in value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return fallback
+        lowered = raw.lower()
+        if lowered in {"all", "*"}:
+            return tuple(RANKED_FEATURE_COLUMNS)
+        if lowered in {"stable", "default"}:
+            return tuple(DEFAULT_STABLE_RANKED_FEATURE_COLUMNS)
+        items = tuple(part.strip() for part in raw.split(","))
+    normalized = normalize_ranked_feature_columns(items)
+    return normalized or fallback
+
+
+def _parse_orderbook_feature_columns(
+    value: str | tuple[str, ...] | list[str] | None,
+    *,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    fallback = normalize_orderbook_feature_columns(default)
+    if value is None:
+        return fallback
+    if isinstance(value, tuple):
+        items = value
+    elif isinstance(value, list):
+        items = tuple(str(item).strip() for item in value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return fallback
+        lowered = raw.lower()
+        if lowered in {"all", "*"}:
+            return tuple(ORDERBOOK_FEATURE_COLUMNS)
+        if lowered in {"stable", "default"}:
+            return tuple(DEFAULT_STABLE_ORDERBOOK_FEATURE_COLUMNS)
+        items = tuple(part.strip() for part in raw.split(","))
+    normalized = normalize_orderbook_feature_columns(items)
+    return normalized or fallback
+
+
 def _base_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quant-agents",
@@ -84,6 +148,56 @@ def _base_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--symbol", default=None)
     ingest.add_argument("--timeframe", default=None)
     ingest.add_argument("--limit", type=int, default=1000)
+    orderbook_capture = subparsers.add_parser(
+        "capture-orderbook",
+        help="Capture live order book snapshots and persist them to raw storage.",
+    )
+    orderbook_capture.add_argument("--exchange", default=None)
+    orderbook_capture.add_argument("--symbol", default=None)
+    orderbook_capture.add_argument(
+        "--sample-count",
+        type=int,
+        default=120,
+        help="Number of order book snapshots to collect in this capture run.",
+    )
+    orderbook_capture.add_argument(
+        "--sample-interval-seconds",
+        type=float,
+        default=None,
+        help="Polling interval between snapshots in seconds (default from settings).",
+    )
+    orderbook_capture.add_argument(
+        "--depth-limit",
+        type=int,
+        default=None,
+        help="Order book depth levels requested per snapshot (default from settings).",
+    )
+    orderbook_retrieve = subparsers.add_parser(
+        "retrieve-orderbook-features",
+        help="Build aligned order book feature artifacts from captured snapshots.",
+    )
+    orderbook_retrieve.add_argument("--exchange", default=None)
+    orderbook_retrieve.add_argument("--symbol", default=None)
+    orderbook_retrieve.add_argument("--timeframe", default=None)
+    orderbook_retrieve.add_argument(
+        "--input-file",
+        default=None,
+        help="Optional explicit market parquet input file for retrieval window alignment.",
+    )
+    orderbook_retrieve.add_argument(
+        "--snapshot-source-path",
+        default=None,
+        help="Optional explicit order book snapshot parquet path.",
+    )
+    orderbook_retrieve.add_argument(
+        "--orderbook-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated order book feature columns to enable "
+            "(for example orderbook_spread_feature,orderbook_depth_imbalance_feature). "
+            "Use 'stable' for the default stable set or 'all' for full order book set."
+        ),
+    )
     priority2_retrieve = subparsers.add_parser(
         "retrieve-priority2-features",
         help="Build canonical external Priority 2 feature artifacts from derivatives/whale data sources.",
@@ -716,6 +830,61 @@ def _base_parser() -> argparse.ArgumentParser:
         ),
     )
     trigger_train.add_argument(
+        "--ranked-features-enabled",
+        dest="ranked_features_enabled",
+        action="store_true",
+        help="Enable ranked high-impact feature expansion for trigger-model training.",
+    )
+    trigger_train.add_argument(
+        "--no-ranked-features-enabled",
+        dest="ranked_features_enabled",
+        action="store_false",
+        help="Disable ranked high-impact feature expansion for trigger-model training.",
+    )
+    trigger_train.add_argument(
+        "--ranked-external-features-path",
+        default=None,
+        help="Optional external ranked feature file used during training.",
+    )
+    trigger_train.add_argument(
+        "--ranked-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated ranked feature columns to enable "
+            "(for example flow_signed_volume_imbalance_24,derivatives_basis_z_24). "
+            "Use 'stable' for default ranked subset or 'all' for full ranked set."
+        ),
+    )
+    trigger_train.add_argument(
+        "--orderbook-features-enabled",
+        dest="orderbook_features_enabled",
+        action="store_true",
+        help="Enable order book feature expansion for trigger-model training.",
+    )
+    trigger_train.add_argument(
+        "--no-orderbook-features-enabled",
+        dest="orderbook_features_enabled",
+        action="store_false",
+        help="Disable order book feature expansion for trigger-model training.",
+    )
+    trigger_train.add_argument(
+        "--orderbook-features-path",
+        default=None,
+        help=(
+            "Optional aligned order book feature parquet path (for example from "
+            "retrieve-orderbook-features)."
+        ),
+    )
+    trigger_train.add_argument(
+        "--orderbook-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated order book feature columns to enable "
+            "(for example orderbook_spread_feature,orderbook_depth_imbalance_feature). "
+            "Use 'stable' for the default stable set or 'all' for full order book set."
+        ),
+    )
+    trigger_train.add_argument(
         "--horizon-bars",
         type=int,
         default=None,
@@ -761,7 +930,11 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Disable threshold optimization and use provided thresholds directly.",
     )
     trigger_train.set_defaults(optimize_thresholds=None)
-    trigger_train.set_defaults(priority2_features_enabled=None)
+    trigger_train.set_defaults(
+        priority2_features_enabled=None,
+        ranked_features_enabled=None,
+        orderbook_features_enabled=None,
+    )
 
     trigger_predict = subparsers.add_parser(
         "predict-trigger",
@@ -803,6 +976,58 @@ def _base_parser() -> argparse.ArgumentParser:
         ),
     )
     trigger_predict.add_argument(
+        "--ranked-features-enabled",
+        dest="ranked_features_enabled",
+        action="store_true",
+        help="Enable ranked high-impact feature expansion for prediction.",
+    )
+    trigger_predict.add_argument(
+        "--no-ranked-features-enabled",
+        dest="ranked_features_enabled",
+        action="store_false",
+        help="Disable ranked high-impact feature expansion for prediction.",
+    )
+    trigger_predict.add_argument(
+        "--ranked-external-features-path",
+        default=None,
+        help="Optional external ranked feature file used during prediction.",
+    )
+    trigger_predict.add_argument(
+        "--ranked-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated ranked feature columns to enable "
+            "(for example flow_signed_volume_imbalance_24,derivatives_basis_z_24). "
+            "Use 'stable' for default ranked subset or 'all' for full ranked set."
+        ),
+    )
+    trigger_predict.add_argument(
+        "--orderbook-features-enabled",
+        dest="orderbook_features_enabled",
+        action="store_true",
+        help="Enable order book feature expansion for prediction.",
+    )
+    trigger_predict.add_argument(
+        "--no-orderbook-features-enabled",
+        dest="orderbook_features_enabled",
+        action="store_false",
+        help="Disable order book feature expansion for prediction.",
+    )
+    trigger_predict.add_argument(
+        "--orderbook-features-path",
+        default=None,
+        help="Optional aligned order book feature parquet path used during prediction.",
+    )
+    trigger_predict.add_argument(
+        "--orderbook-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated order book feature columns to enable "
+            "(for example orderbook_spread_feature,orderbook_depth_imbalance_feature). "
+            "Use 'stable' for the default stable set or 'all' for full order book set."
+        ),
+    )
+    trigger_predict.add_argument(
         "--model-path",
         default=None,
         help="Optional explicit model.json path. Defaults to latest model for scope.",
@@ -812,7 +1037,11 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional explicit parquet input file for prediction.",
     )
-    trigger_predict.set_defaults(priority2_features_enabled=None)
+    trigger_predict.set_defaults(
+        priority2_features_enabled=None,
+        ranked_features_enabled=None,
+        orderbook_features_enabled=None,
+    )
 
     trigger_monitor = subparsers.add_parser(
         "monitor-triggers",
@@ -845,6 +1074,58 @@ def _base_parser() -> argparse.ArgumentParser:
             "Comma-separated Priority 2 feature columns to enable "
             "(for example open_interest_feature,participant_positioning_feature). "
             "Use 'stable' for the default stable pair or 'all' for full Priority 2 set."
+        ),
+    )
+    trigger_monitor.add_argument(
+        "--ranked-features-enabled",
+        dest="ranked_features_enabled",
+        action="store_true",
+        help="Enable ranked high-impact feature expansion for monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--no-ranked-features-enabled",
+        dest="ranked_features_enabled",
+        action="store_false",
+        help="Disable ranked high-impact feature expansion for monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--ranked-external-features-path",
+        default=None,
+        help="Optional external ranked feature file used during monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--ranked-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated ranked feature columns to enable "
+            "(for example flow_signed_volume_imbalance_24,derivatives_basis_z_24). "
+            "Use 'stable' for default ranked subset or 'all' for full ranked set."
+        ),
+    )
+    trigger_monitor.add_argument(
+        "--orderbook-features-enabled",
+        dest="orderbook_features_enabled",
+        action="store_true",
+        help="Enable order book feature expansion for monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--no-orderbook-features-enabled",
+        dest="orderbook_features_enabled",
+        action="store_false",
+        help="Disable order book feature expansion for monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--orderbook-features-path",
+        default=None,
+        help="Optional aligned order book feature parquet path used during monitoring predictions.",
+    )
+    trigger_monitor.add_argument(
+        "--orderbook-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated order book feature columns to enable "
+            "(for example orderbook_spread_feature,orderbook_depth_imbalance_feature). "
+            "Use 'stable' for the default stable set or 'all' for full order book set."
         ),
     )
     trigger_monitor.add_argument(
@@ -922,7 +1203,12 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional finite cycle cap for bounded monitor runs.",
     )
-    trigger_monitor.set_defaults(priority2_features_enabled=None, paper_trading_enabled=None)
+    trigger_monitor.set_defaults(
+        priority2_features_enabled=None,
+        ranked_features_enabled=None,
+        orderbook_features_enabled=None,
+        paper_trading_enabled=None,
+    )
 
     doctor = subparsers.add_parser(
         "doctor",
@@ -976,6 +1262,90 @@ def main(argv: list[str] | None = None) -> None:
             metric["data_start"] = str(result.start_timestamp)
             metric["data_end"] = str(result.end_timestamp)
         print(f"Ingested {result.row_count} rows -> {result.output_path}")
+        return
+    if args.command == "capture-orderbook":
+        sample_interval_seconds = (
+            args.sample_interval_seconds
+            if args.sample_interval_seconds is not None
+            else settings.orderbook_capture_sample_interval_seconds
+        )
+        depth_limit = (
+            args.depth_limit
+            if args.depth_limit is not None
+            else settings.orderbook_capture_depth_limit
+        )
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="capture-orderbook",
+            dimensions={"exchange": exchange, "symbol": symbol},
+        ) as metric:
+            result = capture_orderbook_snapshots_to_parquet(
+                settings=settings,
+                exchange_id=exchange,
+                symbol=symbol,
+                sample_count=max(1, int(args.sample_count)),
+                sample_interval_seconds=max(0.0, float(sample_interval_seconds)),
+                depth_limit=max(1, int(depth_limit)),
+            )
+            metric["row_count"] = result.row_count
+            metric["output_path"] = str(result.output_path)
+            metric["start_timestamp"] = str(result.start_timestamp)
+            metric["end_timestamp"] = str(result.end_timestamp)
+            metric["depth_limit"] = result.depth_limit
+            metric["sample_interval_seconds"] = result.sample_interval_seconds
+        print(
+            "Order book capture complete -> "
+            f"{result.output_path} "
+            f"(rows={result.row_count} depth={result.depth_limit} "
+            f"interval={result.sample_interval_seconds:.3f}s)"
+        )
+        return
+    if args.command == "retrieve-orderbook-features":
+        source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
+        snapshot_source_path = (
+            Path(args.snapshot_source_path).expanduser().resolve()
+            if args.snapshot_source_path
+            else None
+        )
+        orderbook_feature_columns = _parse_orderbook_feature_columns(
+            args.orderbook_feature_columns,
+            default=tuple(settings.orderbook_feature_columns),
+        )
+        with tracked_operation(
+            settings.quant_data_root,
+            operation="retrieve-orderbook-features",
+            dimensions={
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+            },
+        ) as metric:
+            result = retrieve_orderbook_features(
+                settings=settings,
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe,
+                source_data_path=source_file,
+                snapshot_source_path=snapshot_source_path,
+                orderbook_feature_columns=orderbook_feature_columns,
+            )
+            metric["run_id"] = result.run_id
+            metric["source_data_path"] = str(result.source_data_path)
+            metric["snapshot_source_path"] = str(result.snapshot_source_path)
+            metric["row_count"] = result.row_count
+            metric["coverage_ratio"] = result.coverage_ratio
+            metric["parquet_path"] = str(result.parquet_path)
+            metric["contract_path"] = str(result.contract_path)
+            metric["reason_codes"] = list(result.reason_codes)
+        print(
+            "Order book features retrieved -> "
+            f"{result.parquet_path} "
+            f"(coverage={result.coverage_ratio:.3f} rows={result.row_count})"
+        )
+        print(
+            "Use this path with --orderbook-features-path: "
+            f"{result.parquet_path}"
+        )
         return
     if args.command == "retrieve-priority2-features":
         source_file = Path(args.input_file).expanduser().resolve() if args.input_file else None
@@ -1141,6 +1511,42 @@ def main(argv: list[str] | None = None) -> None:
             args.priority2_feature_columns,
             default=tuple(settings.priority2_feature_columns),
         )
+        ranked_features_enabled = (
+            bool(args.ranked_features_enabled)
+            if args.ranked_features_enabled is not None
+            else bool(settings.ranked_features_enabled)
+        )
+        ranked_external_features_path = (
+            Path(args.ranked_external_features_path).expanduser().resolve()
+            if args.ranked_external_features_path
+            else (
+                Path(settings.ranked_external_features_path).expanduser().resolve()
+                if settings.ranked_external_features_path
+                else None
+            )
+        )
+        ranked_feature_columns = _parse_ranked_feature_columns(
+            args.ranked_feature_columns,
+            default=tuple(settings.ranked_feature_columns),
+        )
+        orderbook_features_enabled = (
+            bool(args.orderbook_features_enabled)
+            if args.orderbook_features_enabled is not None
+            else bool(settings.orderbook_features_enabled)
+        )
+        orderbook_features_path = (
+            Path(args.orderbook_features_path).expanduser().resolve()
+            if args.orderbook_features_path
+            else (
+                Path(settings.orderbook_features_path).expanduser().resolve()
+                if settings.orderbook_features_path
+                else None
+            )
+        )
+        orderbook_feature_columns = _parse_orderbook_feature_columns(
+            args.orderbook_feature_columns,
+            default=tuple(settings.orderbook_feature_columns),
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="train-trigger-model",
@@ -1171,6 +1577,12 @@ def main(argv: list[str] | None = None) -> None:
                 priority2_features_enabled=bool(priority2_features_enabled),
                 priority2_external_features_path=priority2_external_features_path,
                 priority2_feature_columns=priority2_feature_columns,
+                ranked_features_enabled=bool(ranked_features_enabled),
+                ranked_external_features_path=ranked_external_features_path,
+                ranked_feature_columns=ranked_feature_columns,
+                orderbook_features_enabled=bool(orderbook_features_enabled),
+                orderbook_features_path=orderbook_features_path,
+                orderbook_feature_columns=orderbook_feature_columns,
             )
             metric["model_path"] = str(result.model_path)
             metric["run_dir"] = str(result.run_dir)
@@ -1225,6 +1637,42 @@ def main(argv: list[str] | None = None) -> None:
             args.priority2_feature_columns,
             default=tuple(settings.priority2_feature_columns),
         )
+        ranked_features_enabled = (
+            bool(args.ranked_features_enabled)
+            if args.ranked_features_enabled is not None
+            else bool(settings.ranked_features_enabled)
+        )
+        ranked_external_features_path = (
+            Path(args.ranked_external_features_path).expanduser().resolve()
+            if args.ranked_external_features_path
+            else (
+                Path(settings.ranked_external_features_path).expanduser().resolve()
+                if settings.ranked_external_features_path
+                else None
+            )
+        )
+        ranked_feature_columns = _parse_ranked_feature_columns(
+            args.ranked_feature_columns,
+            default=tuple(settings.ranked_feature_columns),
+        )
+        orderbook_features_enabled = (
+            bool(args.orderbook_features_enabled)
+            if args.orderbook_features_enabled is not None
+            else bool(settings.orderbook_features_enabled)
+        )
+        orderbook_features_path = (
+            Path(args.orderbook_features_path).expanduser().resolve()
+            if args.orderbook_features_path
+            else (
+                Path(settings.orderbook_features_path).expanduser().resolve()
+                if settings.orderbook_features_path
+                else None
+            )
+        )
+        orderbook_feature_columns = _parse_orderbook_feature_columns(
+            args.orderbook_feature_columns,
+            default=tuple(settings.orderbook_feature_columns),
+        )
         with tracked_operation(
             settings.quant_data_root,
             operation="predict-trigger",
@@ -1249,6 +1697,12 @@ def main(argv: list[str] | None = None) -> None:
                 priority2_features_enabled=bool(priority2_features_enabled),
                 priority2_external_features_path=priority2_external_features_path,
                 priority2_feature_columns=priority2_feature_columns,
+                ranked_features_enabled=bool(ranked_features_enabled),
+                ranked_external_features_path=ranked_external_features_path,
+                ranked_feature_columns=ranked_feature_columns,
+                orderbook_features_enabled=bool(orderbook_features_enabled),
+                orderbook_features_path=orderbook_features_path,
+                orderbook_feature_columns=orderbook_feature_columns,
             )
             metric["model_path"] = str(result.model_path)
             metric["source_data_path"] = str(result.source_data_path)
@@ -1803,6 +2257,42 @@ def main(argv: list[str] | None = None) -> None:
             args.priority2_feature_columns,
             default=tuple(settings.priority2_feature_columns),
         )
+        ranked_features_enabled = (
+            bool(args.ranked_features_enabled)
+            if args.ranked_features_enabled is not None
+            else bool(settings.ranked_features_enabled)
+        )
+        ranked_external_features_path = (
+            Path(args.ranked_external_features_path).expanduser().resolve()
+            if args.ranked_external_features_path
+            else (
+                Path(settings.ranked_external_features_path).expanduser().resolve()
+                if settings.ranked_external_features_path
+                else None
+            )
+        )
+        ranked_feature_columns = _parse_ranked_feature_columns(
+            args.ranked_feature_columns,
+            default=tuple(settings.ranked_feature_columns),
+        )
+        orderbook_features_enabled = (
+            bool(args.orderbook_features_enabled)
+            if args.orderbook_features_enabled is not None
+            else bool(settings.orderbook_features_enabled)
+        )
+        orderbook_features_path = (
+            Path(args.orderbook_features_path).expanduser().resolve()
+            if args.orderbook_features_path
+            else (
+                Path(settings.orderbook_features_path).expanduser().resolve()
+                if settings.orderbook_features_path
+                else None
+            )
+        )
+        orderbook_feature_columns = _parse_orderbook_feature_columns(
+            args.orderbook_feature_columns,
+            default=tuple(settings.orderbook_feature_columns),
+        )
         confidence_threshold = (
             args.confidence_threshold
             if args.confidence_threshold is not None
@@ -1871,6 +2361,12 @@ def main(argv: list[str] | None = None) -> None:
                 priority2_features_enabled=bool(priority2_features_enabled),
                 priority2_external_features_path=priority2_external_features_path,
                 priority2_feature_columns=priority2_feature_columns,
+                ranked_features_enabled=bool(ranked_features_enabled),
+                ranked_external_features_path=ranked_external_features_path,
+                ranked_feature_columns=ranked_feature_columns,
+                orderbook_features_enabled=bool(orderbook_features_enabled),
+                orderbook_features_path=orderbook_features_path,
+                orderbook_feature_columns=orderbook_feature_columns,
                 paper_trading_enabled=paper_trading_enabled,
                 paper_notional_usd=paper_notional_usd,
                 paper_starting_cash_usd=paper_starting_cash_usd,

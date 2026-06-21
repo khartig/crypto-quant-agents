@@ -137,6 +137,19 @@ Key environment variables (see `.env.example`):
   - `PRIORITY2_RETRIEVAL_MAX_POINTS`
   - `PRIORITY2_RETRIEVAL_BASE_URL`
   - `PRIORITY2_LOCAL_FEATURE_OVERRIDES_PATH`
+  - `RANKED_FEATURES_ENABLED`
+  - `RANKED_EXTERNAL_FEATURES_PATH`
+  - `RANKED_FEATURE_COLUMNS`
+  - `RANKED_QUALITY_GATE_ENABLED`
+  - `RANKED_QUALITY_MIN_EXTERNAL_RAW_COVERAGE`
+  - `RANKED_QUALITY_MIN_NON_ZERO_COVERAGE`
+  - `RANKED_QUALITY_MAX_FALLBACK_RATE`
+  - `RANKED_QUALITY_MAX_STALENESS_SECONDS`
+  - `ORDERBOOK_FEATURES_ENABLED`
+  - `ORDERBOOK_FEATURES_PATH`
+  - `ORDERBOOK_FEATURE_COLUMNS`
+  - `ORDERBOOK_CAPTURE_SAMPLE_INTERVAL_SECONDS`
+  - `ORDERBOOK_CAPTURE_DEPTH_LIMIT`
   - `AGENT_ENSEMBLE_MODE`
   - `AGENT_ENSEMBLE_ARMS`
   - `AGENT_ENSEMBLE_DECAY_HORIZON`
@@ -200,6 +213,10 @@ Key environment variables (see `.env.example`):
   - `REGIME_ABLATION_MODE=0`
   - `PRIORITY2_FEATURES_ENABLED=1`
   - `PRIORITY2_FEATURE_COLUMNS=open_interest_feature,participant_positioning_feature` (stable default combo)
+  - `RANKED_FEATURES_ENABLED=1`
+  - `RANKED_FEATURE_COLUMNS=flow_signed_volume_imbalance_24,derivatives_open_interest_delta_24,derivatives_basis_z_24,onchain_exchange_netflow_z_24,options_put_call_oi_ratio_z_24,regime_trend_strength_24,regime_momentum_vol_adj_24` (stable default combo)
+  - `ORDERBOOK_FEATURES_ENABLED=0` (baseline default)
+  - `ORDERBOOK_FEATURE_COLUMNS=orderbook_spread_feature,orderbook_depth_imbalance_feature,orderbook_microprice_deviation_feature` (stable default combo)
 - Risk thresholds:
   - `RISK_MAX_COST_RETURN_DRAG=0.05`
   - `RISK_MAX_COST_PRESSURE_SCORE=0.95`
@@ -252,6 +269,16 @@ quant-agents retrieve-priority2-features --exchange binanceus --symbol BTC/USDT 
 quant-agents retrieve-priority2-features --exchange kraken --symbol BTC/USDT --timeframe 1h --local-feature-overrides-path /mnt/quant-data/external/priority2_whale_overrides.parquet
 ```
 When `train-trigger-model` or `predict-trigger` runs with Priority 2 enabled and no explicit `--priority2-external-features-path`, the pipeline now auto-resolves the latest artifact from `curated/features/external/.../latest_external_features_path.txt` for the same exchange/symbol/timeframe scope.
+When `train-trigger-model`, `predict-trigger`, or `monitor-triggers` runs with ranked features enabled and no explicit `--ranked-external-features-path`, the pipeline uses `RANKED_EXTERNAL_FEATURES_PATH` when configured and otherwise falls back to deterministic proxy-ranked features.
+When `train-trigger-model`, `predict-trigger`, or `monitor-triggers` runs with order-book features enabled and no explicit `--orderbook-features-path`, the pipeline auto-resolves the latest aligned order-book artifact from `curated/features/orderbook/.../latest_orderbook_features_path.txt` for the same exchange/symbol/timeframe scope.
+
+### Order book snapshot capture + retrieval
+Use this to capture depth snapshots and build aligned order-book features for trigger-model runs.
+```bash path=null start=null
+quant-agents capture-orderbook --exchange binanceus --symbol BTC/USDT --sample-count 600 --sample-interval-seconds 1 --depth-limit 50
+quant-agents retrieve-orderbook-features --exchange binanceus --symbol BTC/USDT --timeframe 1h
+quant-agents retrieve-orderbook-features --exchange binanceus --symbol BTC/USDT --timeframe 1h --snapshot-source-path /mnt/quant-data/raw/orderbook/exchange=binanceus/symbol=BTC-USDT/year=2026/month=06/orderbook_snapshots_YYYYMMDDTHHMMSSZ.parquet --orderbook-feature-columns stable
+```
 
 ### Reporting and daily workflow
 ```bash path=null start=null
@@ -292,16 +319,34 @@ quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe
 quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --labeling-mode triple_barrier_v2 --trade-quality-min-score 0.55 --action-confidence-threshold 0.60 --priority2-features-enabled
 quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns open_interest_feature,participant_positioning_feature
 quant-agents train-trigger-model --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns funding_rate_feature,open_interest_feature,basis_feature
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 30m --priority2-features-enabled --ranked-features-enabled --ranked-feature-columns stable
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 30m --priority2-features-enabled --ranked-features-enabled --ranked-feature-columns flow_taker_buy_share_6,flow_taker_buy_share_24,flow_signed_volume_imbalance_24,flow_vwap_dislocation_12,derivatives_open_interest_delta_24,derivatives_funding_rate_z_24,derivatives_basis_z_24,derivatives_long_short_ratio_z_24,onchain_exchange_netflow_z_24,onchain_stablecoin_inflow_ratio_24,onchain_exchange_reserve_delta_24,options_put_call_oi_ratio_z_24,options_iv_term_slope_7_30,options_skew_25d_z_24,regime_trend_strength_24,regime_volatility_ratio_24_96,regime_momentum_vol_adj_24
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --no-orderbook-features-enabled
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --orderbook-features-enabled --orderbook-feature-columns stable
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --orderbook-features-enabled --orderbook-features-path /mnt/quant-data/curated/features/orderbook/exchange=binanceus/symbol=BTC-USDT/interval=1h/run_id=YYYYMMDDTHHMMSSZ/orderbook_features.parquet
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h --action-confidence-threshold 0.60 --priority2-features-enabled
 quant-agents predict-trigger --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns all
+quant-agents predict-trigger --exchange binanceus --symbol BTC/USDT --timeframe 30m --priority2-features-enabled --ranked-features-enabled --ranked-feature-columns stable
+quant-agents predict-trigger --exchange binanceus --symbol BTC/USDT --timeframe 1h --orderbook-features-enabled --orderbook-feature-columns stable
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --poll-seconds 3600 --confidence-threshold 0.60
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns stable --max-cycles 3
+quant-agents monitor-triggers --exchange binanceus --symbol BTC/USDT --timeframe 30m --priority2-features-enabled --ranked-features-enabled --ranked-feature-columns stable --max-cycles 3
+quant-agents monitor-triggers --exchange binanceus --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --orderbook-features-enabled --orderbook-feature-columns stable --max-cycles 3
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns stable --paper-trading-enabled --paper-notional-usd 100 --paper-fee-bps 5 --paper-slippage-bps 1 --max-cycles 3
 quant-agents monitor-triggers --exchange kraken --symbol BTC/USDT --timeframe 1h --webhook-url {{TRIGGER_MONITOR_WEBHOOK_URL}} --max-cycles 3
 python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT --timeframe 1h --points 480 --alert-confidence-threshold 0.60
+python scripts/run_ranked_feature_ablation.py --config scripts/ranked_feature_ablation_plan.json
 quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --cost-bps 9 --no-optimize-thresholds --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet
 ```
+Baseline vs baseline+orderbook comparison recipe:
+```bash path=null start=null
+quant-agents capture-orderbook --exchange binanceus --symbol BTC/USDT --sample-count 600 --sample-interval-seconds 1 --depth-limit 50
+quant-agents retrieve-orderbook-features --exchange binanceus --symbol BTC/USDT --timeframe 1h
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --no-orderbook-features-enabled
+quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --orderbook-features-enabled --orderbook-feature-columns stable
+```
+Then compare the resulting `model.json` artifacts on `training_metrics.execution_backtest_metrics` and threshold-selection summaries.
 
 ### Historical backfill for canonical regime coverage
 Use this to close missing historical ranges (for example 2025 Q2) before benchmark gating:
@@ -388,6 +433,7 @@ systemctl --user --no-pager status quant-trigger-monitor.service
 All paths below are relative to `QUANT_DATA_ROOT`.
 
 - Raw market data: `raw/exchange=<exchange>/symbol=<pair>/interval=<tf>/year=<yyyy>/month=<mm>/`
+- Raw order book snapshots: `raw/orderbook/exchange=<exchange>/symbol=<pair>/year=<yyyy>/month=<mm>/orderbook_snapshots_<timestamp>.parquet`
 - Backtests: `backtests/<strategy_name>/<run_id>/`  
   Includes `metrics.json`, `equity_curve.parquet`, `run_manifest.json`; `metrics.json` carries gross+net return diagnostics (including turnover and cost drag), and adaptive ensemble runs also include `arm_attribution.parquet`.
 - Orchestration runs: `logs/agents/openclaw-orchestrator/<yyyy-mm-dd>/<run_id>/`  
@@ -423,10 +469,24 @@ All paths below are relative to `QUANT_DATA_ROOT`.
   - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_external_feature_contract.json`
   - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_external_features_path.txt`
   - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_external_feature_contract_path.txt`
+- Order book retrieval artifacts:
+  - `curated/features/orderbook/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/orderbook_features.parquet`
+  - `curated/features/orderbook/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/orderbook_feature_contract.json`
+  - `curated/features/orderbook/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_orderbook_features_path.txt`
+  - `curated/features/orderbook/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_orderbook_feature_contract_path.txt`
+- Trigger-model order book training snapshots:
+  - `curated/features/orderbook-model/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/orderbook_model_features.parquet`
+  - `curated/features/orderbook-model/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/orderbook_model_feature_contract.json`
+- Trigger-model ranked training snapshots:
+  - `curated/features/ranked-model/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/ranked_model_features.parquet`
+  - `curated/features/ranked-model/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/ranked_model_feature_contract.json`
 - Trigger predictions and alerts:
   - `logs/agents/model-predictor/<yyyy-mm-dd>/prediction_<timestamp>.json`
   - `logs/agents/trigger-monitor/<yyyy-mm-dd>/alerts.jsonl`
   - `logs/agents/trigger-monitor/state.json`
+- Ranked ablation summaries:
+  - `logs/analysis/ranked_feature_ablation_<timestamp>/ranked_feature_ablation_results.json`
+  - `logs/analysis/ranked_feature_ablation_<timestamp>/ranked_feature_ablation_results.md`
 - Archives:
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz`
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz.sha256`
@@ -437,4 +497,5 @@ All paths below are relative to `QUANT_DATA_ROOT`.
 - If risk gate fails, intent stays blocked and paper execution is skipped by design.
 - If a `sell` intent is emitted while no long inventory is open, execution is rejected with `reason=no_long_position_to_sell` by design.
 - If `retrieve-priority2-features` shows provider HTTP 451 errors (common on Binance futures in restricted regions), switch to `--provider okx_public`; if all external endpoints still fail, the module auto-falls back to deterministic market-derived Priority 2 features and records fallback diagnostics in the contract. Use `--local-feature-overrides-path` (or `PRIORITY2_LOCAL_FEATURE_OVERRIDES_PATH`) when you want to replace/augment fallback output with your own external feed.
+- If order-book features are enabled but no aligned order-book artifact is found (or coverage is sparse), trigger-model preprocessing falls back to deterministic zero-filled order-book columns and records reason codes/coverage diagnostics in the model and prediction artifacts.
 - TradingView built-in paper trading is not exposed as a direct public trading API; use TradingView alerts/webhooks plus a broker/testnet API path.

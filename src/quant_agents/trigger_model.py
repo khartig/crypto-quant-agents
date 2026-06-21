@@ -11,7 +11,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,16 @@ from quant_agents.agent_contracts import PaperTradeIntent, Recommendation, write
 
 from quant_agents.config import Settings
 from quant_agents.ingestion import fetch_ohlcv_to_parquet
+from quant_agents.orderbook_features import (
+    DEFAULT_STABLE_ORDERBOOK_FEATURE_COLUMNS,
+    ORDERBOOK_FEATURE_COLUMNS,
+    OrderBookFeatureBundle,
+    apply_orderbook_feature_column_selection,
+    build_orderbook_feature_bundle,
+    normalize_orderbook_feature_columns,
+    write_orderbook_feature_artifacts,
+)
+from quant_agents.orderbook_retrieval import latest_orderbook_features_path
 from quant_agents.paper_trading import (
     execute_paper_trade_intent,
     simulate_paper_trade_execution_step,
@@ -33,6 +43,15 @@ from quant_agents.priority2_features import (
     write_priority2_feature_artifacts,
 )
 from quant_agents.priority2_retrieval import latest_priority2_external_features_path
+from quant_agents.ranked_features import (
+    DEFAULT_STABLE_RANKED_FEATURE_COLUMNS,
+    RANKED_FEATURE_COLUMNS,
+    RankedFeatureBundle,
+    apply_ranked_feature_column_selection,
+    build_ranked_feature_bundle,
+    normalize_ranked_feature_columns,
+    write_ranked_feature_artifacts,
+)
 from quant_agents.storage import latest_raw_dataset, symbol_slug
 
 logger = logging.getLogger(__name__)
@@ -50,8 +69,16 @@ BASE_FEATURE_COLUMNS: tuple[str, ...] = (
     "rsi_14",
     "volume_zscore_24",
     "hl_range_14",
+    "trend_momentum_interaction",
+    "volatility_volume_interaction",
+    "rsi_momentum_interaction",
 )
-FEATURE_COLUMNS: tuple[str, ...] = BASE_FEATURE_COLUMNS + PRIORITY2_FEATURE_COLUMNS
+FEATURE_COLUMNS: tuple[str, ...] = (
+    BASE_FEATURE_COLUMNS
+    + PRIORITY2_FEATURE_COLUMNS
+    + RANKED_FEATURE_COLUMNS
+    + ORDERBOOK_FEATURE_COLUMNS
+)
 EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "execution_backtest_realized_pnl_delta_usd"
 
 
@@ -193,9 +220,13 @@ def _build_feature_frame(
     macd = ema_fast - ema_slow
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     macd_hist = macd - macd_signal
+    rsi_14 = _compute_rsi(close, period=14)
     volume_mean = volume.rolling(window=24, min_periods=24).mean()
     volume_std = volume.rolling(window=24, min_periods=24).std(ddof=0).replace(0.0, np.nan)
     hl_range = ((high - low) / close.replace(0.0, np.nan)).rolling(window=14, min_periods=14).mean()
+    volatility_24 = returns.rolling(window=24, min_periods=24).std(ddof=0)
+    volume_zscore_24 = (volume - volume_mean) / volume_std
+    sma_fast_spread = (close / sma_fast) - 1.0
 
     feature_frame = pd.DataFrame(
         {
@@ -206,14 +237,17 @@ def _build_feature_frame(
             "ret_1": close.pct_change(periods=1),
             "ret_4": close.pct_change(periods=4),
             "ret_24": close.pct_change(periods=24),
-            "volatility_24": returns.rolling(window=24, min_periods=24).std(ddof=0),
-            "sma_fast_spread": (close / sma_fast) - 1.0,
+            "volatility_24": volatility_24,
+            "sma_fast_spread": sma_fast_spread,
             "sma_slow_spread": (close / sma_slow) - 1.0,
             "macd": macd,
             "macd_hist": macd_hist,
-            "rsi_14": _compute_rsi(close, period=14),
-            "volume_zscore_24": (volume - volume_mean) / volume_std,
+            "rsi_14": rsi_14,
+            "volume_zscore_24": volume_zscore_24,
             "hl_range_14": hl_range,
+            "trend_momentum_interaction": sma_fast_spread * macd_hist,
+            "volatility_volume_interaction": volatility_24 * volume_zscore_24,
+            "rsi_momentum_interaction": ((rsi_14 - 50.0) / 50.0) * close.pct_change(periods=4),
         }
     )
     priority2_bundle = build_priority2_feature_bundle(
@@ -225,20 +259,62 @@ def _build_feature_frame(
         bundle=priority2_bundle,
         selected_feature_columns=priority2_feature_columns,
     )
+    feature_merge_frame = feature_frame.copy()
+    feature_merge_frame["timestamp"] = pd.to_datetime(
+        feature_merge_frame["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    feature_merge_frame = (
+        feature_merge_frame
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    if not feature_merge_frame.empty:
+        feature_merge_frame["timestamp"] = feature_merge_frame["timestamp"].dt.as_unit("ns")
     priority2_frame = priority2_bundle.feature_frame.copy()
     priority2_frame["timestamp"] = pd.to_datetime(
         priority2_frame["timestamp"],
         utc=True,
         errors="coerce",
     )
-    merged = pd.merge_asof(
-        feature_frame.sort_values("timestamp").reset_index(drop=True),
-        priority2_frame.sort_values("timestamp").reset_index(drop=True),
-        on="timestamp",
-        direction="backward",
-        allow_exact_matches=True,
+    priority2_frame = (
+        priority2_frame
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .reset_index(drop=True)
     )
+    if not priority2_frame.empty:
+        priority2_frame["timestamp"] = priority2_frame["timestamp"].dt.as_unit("ns")
+    if priority2_frame.empty:
+        merged = feature_merge_frame.copy()
+    else:
+        merged = pd.merge_asof(
+            feature_merge_frame,
+            priority2_frame,
+            on="timestamp",
+            direction="backward",
+            allow_exact_matches=True,
+        )
     for column in PRIORITY2_FEATURE_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = 0.0
+        merged[column] = (
+            pd.to_numeric(merged[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+    for column in RANKED_FEATURE_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = 0.0
+        merged[column] = (
+            pd.to_numeric(merged[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+    for column in ORDERBOOK_FEATURE_COLUMNS:
         if column not in merged.columns:
             merged[column] = 0.0
         merged[column] = (
@@ -271,6 +347,617 @@ def _resolve_priority2_external_features_path(
     if latest_path is not None:
         return latest_path, "latest_retrieval_artifact"
     return None, "none_found"
+
+
+def _resolve_orderbook_features_path(
+    *,
+    settings: Settings,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    orderbook_features_enabled: bool,
+    requested_path: Path | None,
+) -> tuple[Path | None, str]:
+    if not orderbook_features_enabled:
+        return None, "orderbook_disabled"
+    if requested_path is not None:
+        return requested_path, "explicit"
+    latest_path = latest_orderbook_features_path(
+        quant_data_root=settings.quant_data_root,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    if latest_path is not None:
+        return latest_path, "latest_retrieval_artifact"
+    return None, "none_found"
+
+
+def _resolve_ranked_external_features_path(
+    *,
+    settings: Settings,
+    ranked_features_enabled: bool,
+    requested_path: Path | None,
+) -> tuple[Path | None, str]:
+    if not ranked_features_enabled:
+        return None, "ranked_disabled"
+    if requested_path is not None:
+        return requested_path, "explicit"
+    configured = settings.ranked_external_features_path
+    if configured:
+        return Path(configured).expanduser().resolve(), "settings_default"
+    return None, "none_found"
+
+def _safe_metric_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(parsed):
+        return float(default)
+    return float(parsed)
+
+
+def _selected_metric_mean(
+    diagnostics: dict[str, Any],
+    *,
+    key: str,
+    selected_columns: Sequence[str],
+    default: float,
+) -> float:
+    raw_map = diagnostics.get(key, {})
+    if not isinstance(raw_map, dict) or not selected_columns:
+        return float(default)
+    values: list[float] = []
+    for column in selected_columns:
+        values.append(_safe_metric_float(raw_map.get(str(column)), default))
+    if not values:
+        return float(default)
+    return float(np.mean(values))
+
+
+def _apply_priority2_quality_gate(
+    *,
+    feature_frame: pd.DataFrame,
+    bundle: Priority2FeatureBundle,
+    selected_feature_columns: tuple[str, ...] | list[str] | None,
+    settings: Settings,
+) -> tuple[pd.DataFrame, Priority2FeatureBundle]:
+    selected_columns = normalize_priority2_feature_columns(selected_feature_columns)
+    diagnostics = dict(bundle.diagnostics)
+    observed_external_raw_coverage = _safe_metric_float(
+        diagnostics.get(
+            "selected_external_raw_coverage",
+            _selected_metric_mean(
+                diagnostics,
+                key="external_raw_coverage",
+                selected_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        0.0,
+    )
+    observed_non_zero_coverage = _safe_metric_float(
+        diagnostics.get(
+            "selected_non_zero_coverage",
+            _selected_metric_mean(
+                diagnostics,
+                key="effective_non_zero_coverage",
+                selected_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        0.0,
+    )
+    observed_fallback_rate = _safe_metric_float(
+        diagnostics.get(
+            "selected_proxy_fallback_rate",
+            _selected_metric_mean(
+                diagnostics,
+                key="proxy_fallback_rate",
+                selected_columns=selected_columns,
+                default=1.0,
+            ),
+        ),
+        1.0,
+    )
+    staleness_payload = diagnostics.get("external_staleness_seconds", {})
+    observed_staleness_p95: float | None = None
+    if isinstance(staleness_payload, dict):
+        staleness_p95_raw = staleness_payload.get("p95")
+        if staleness_p95_raw is not None:
+            observed_staleness_p95 = _safe_metric_float(staleness_p95_raw, 0.0)
+
+    gate_failures: list[str] = []
+    gate_applied = bool(settings.priority2_quality_gate_enabled) and bool(bundle.features_enabled)
+    if gate_applied:
+        external_requested = bool(bundle.external_features_path)
+        external_loaded = bool(diagnostics.get("external_features_loaded", False))
+        if external_requested and (not external_loaded):
+            gate_failures.append("external_features_not_loaded")
+        if external_requested and observed_external_raw_coverage < float(
+            settings.priority2_quality_min_external_raw_coverage
+        ):
+            gate_failures.append("external_raw_coverage_below_minimum")
+        if observed_non_zero_coverage < float(settings.priority2_quality_min_non_zero_coverage):
+            gate_failures.append("non_zero_coverage_below_minimum")
+        if external_requested and observed_fallback_rate > float(
+            settings.priority2_quality_max_fallback_rate
+        ):
+            gate_failures.append("fallback_rate_above_maximum")
+        if (
+            external_requested
+            and observed_staleness_p95 is not None
+            and observed_staleness_p95 > float(settings.priority2_quality_max_staleness_seconds)
+        ):
+            gate_failures.append("staleness_p95_above_maximum")
+
+    diagnostics["quality_gate"] = {
+        "enabled": bool(settings.priority2_quality_gate_enabled),
+        "applied": bool(gate_applied),
+        "selected_columns": list(selected_columns),
+        "thresholds": {
+            "min_external_raw_coverage": float(settings.priority2_quality_min_external_raw_coverage),
+            "min_non_zero_coverage": float(settings.priority2_quality_min_non_zero_coverage),
+            "max_fallback_rate": float(settings.priority2_quality_max_fallback_rate),
+            "max_staleness_seconds": float(settings.priority2_quality_max_staleness_seconds),
+        },
+        "observed": {
+            "selected_external_raw_coverage": float(observed_external_raw_coverage),
+            "selected_non_zero_coverage": float(observed_non_zero_coverage),
+            "selected_fallback_rate": float(observed_fallback_rate),
+            "staleness_p95_seconds": observed_staleness_p95,
+        },
+        "passed": bool(len(gate_failures) == 0) if gate_applied else None,
+        "failures": list(gate_failures),
+    }
+    diagnostics["quality_score"] = float(
+        observed_external_raw_coverage * observed_non_zero_coverage
+    )
+
+    updated_feature_frame = feature_frame.copy()
+    updated_bundle_frame = bundle.feature_frame.copy()
+    reason_codes = list(bundle.reason_codes)
+    if gate_applied and gate_failures:
+        for column in selected_columns:
+            if column in updated_feature_frame.columns:
+                updated_feature_frame[column] = 0.0
+            if column in updated_bundle_frame.columns:
+                updated_bundle_frame[column] = 0.0
+        diagnostics["quality_score"] = 0.0
+        diagnostics["quality_gate"]["applied_zero_fallback"] = True
+        reason_codes.append("priority2_quality_gate_failed")
+    elif gate_applied:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("priority2_quality_gate_passed")
+    else:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("priority2_quality_gate_skipped")
+    updated_snapshot = {
+        column: float(
+            pd.to_numeric(updated_bundle_frame[column], errors="coerce").fillna(0.0).iloc[-1]
+        ) if (column in updated_bundle_frame.columns and not updated_bundle_frame.empty) else 0.0
+        for column in PRIORITY2_FEATURE_COLUMNS
+    }
+
+    updated_bundle = Priority2FeatureBundle(
+        contract=bundle.contract,
+        created_at_utc=bundle.created_at_utc,
+        features_enabled=bundle.features_enabled,
+        external_features_path=bundle.external_features_path,
+        feature_frame=updated_bundle_frame,
+        feature_snapshot=updated_snapshot,
+        reason_codes=sorted(set(reason_codes)),
+        diagnostics=diagnostics,
+    )
+    return updated_feature_frame, updated_bundle
+
+def _apply_ranked_quality_gate(
+    *,
+    feature_frame: pd.DataFrame,
+    bundle: RankedFeatureBundle,
+    selected_feature_columns: tuple[str, ...] | list[str] | None,
+    settings: Settings,
+) -> tuple[pd.DataFrame, RankedFeatureBundle]:
+    selected_columns = normalize_ranked_feature_columns(selected_feature_columns)
+    diagnostics = dict(bundle.diagnostics)
+    observed_external_raw_coverage = _safe_metric_float(
+        diagnostics.get(
+            "selected_external_raw_coverage",
+            _selected_metric_mean(
+                diagnostics,
+                key="external_raw_coverage",
+                selected_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        0.0,
+    )
+    observed_non_zero_coverage = _safe_metric_float(
+        diagnostics.get(
+            "selected_non_zero_coverage",
+            _selected_metric_mean(
+                diagnostics,
+                key="effective_non_zero_coverage",
+                selected_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        0.0,
+    )
+    observed_fallback_rate = _safe_metric_float(
+        diagnostics.get(
+            "selected_proxy_fallback_rate",
+            _selected_metric_mean(
+                diagnostics,
+                key="proxy_fallback_rate",
+                selected_columns=selected_columns,
+                default=1.0,
+            ),
+        ),
+        1.0,
+    )
+    staleness_payload = diagnostics.get("external_staleness_seconds", {})
+    observed_staleness_p95: float | None = None
+    if isinstance(staleness_payload, dict):
+        staleness_p95_raw = staleness_payload.get("p95")
+        if staleness_p95_raw is not None:
+            observed_staleness_p95 = _safe_metric_float(staleness_p95_raw, 0.0)
+
+    gate_failures: list[str] = []
+    gate_applied = bool(settings.ranked_quality_gate_enabled) and bool(bundle.features_enabled)
+    if gate_applied:
+        external_requested = bool(bundle.external_features_path)
+        external_loaded = bool(diagnostics.get("external_features_loaded", False))
+        if external_requested and (not external_loaded):
+            gate_failures.append("external_features_not_loaded")
+        if external_requested and observed_external_raw_coverage < float(
+            settings.ranked_quality_min_external_raw_coverage
+        ):
+            gate_failures.append("external_raw_coverage_below_minimum")
+        if observed_non_zero_coverage < float(settings.ranked_quality_min_non_zero_coverage):
+            gate_failures.append("non_zero_coverage_below_minimum")
+        if external_requested and observed_fallback_rate > float(
+            settings.ranked_quality_max_fallback_rate
+        ):
+            gate_failures.append("fallback_rate_above_maximum")
+        if (
+            external_requested
+            and observed_staleness_p95 is not None
+            and observed_staleness_p95 > float(settings.ranked_quality_max_staleness_seconds)
+        ):
+            gate_failures.append("staleness_p95_above_maximum")
+
+    diagnostics["quality_gate"] = {
+        "enabled": bool(settings.ranked_quality_gate_enabled),
+        "applied": bool(gate_applied),
+        "selected_columns": list(selected_columns),
+        "thresholds": {
+            "min_external_raw_coverage": float(settings.ranked_quality_min_external_raw_coverage),
+            "min_non_zero_coverage": float(settings.ranked_quality_min_non_zero_coverage),
+            "max_fallback_rate": float(settings.ranked_quality_max_fallback_rate),
+            "max_staleness_seconds": float(settings.ranked_quality_max_staleness_seconds),
+        },
+        "observed": {
+            "selected_external_raw_coverage": float(observed_external_raw_coverage),
+            "selected_non_zero_coverage": float(observed_non_zero_coverage),
+            "selected_fallback_rate": float(observed_fallback_rate),
+            "staleness_p95_seconds": observed_staleness_p95,
+        },
+        "passed": bool(len(gate_failures) == 0) if gate_applied else None,
+        "failures": list(gate_failures),
+    }
+    diagnostics["quality_score"] = float(
+        observed_external_raw_coverage * observed_non_zero_coverage
+    )
+
+    updated_feature_frame = feature_frame.copy()
+    updated_bundle_frame = bundle.feature_frame.copy()
+    reason_codes = list(bundle.reason_codes)
+    if gate_applied and gate_failures:
+        for column in selected_columns:
+            if column in updated_feature_frame.columns:
+                updated_feature_frame[column] = 0.0
+            if column in updated_bundle_frame.columns:
+                updated_bundle_frame[column] = 0.0
+        diagnostics["quality_score"] = 0.0
+        diagnostics["quality_gate"]["applied_zero_fallback"] = True
+        reason_codes.append("ranked_quality_gate_failed")
+    elif gate_applied:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("ranked_quality_gate_passed")
+    else:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("ranked_quality_gate_skipped")
+    updated_snapshot = {
+        column: float(
+            pd.to_numeric(updated_bundle_frame[column], errors="coerce").fillna(0.0).iloc[-1]
+        ) if (column in updated_bundle_frame.columns and not updated_bundle_frame.empty) else 0.0
+        for column in RANKED_FEATURE_COLUMNS
+    }
+
+    updated_bundle = RankedFeatureBundle(
+        contract=bundle.contract,
+        created_at_utc=bundle.created_at_utc,
+        features_enabled=bundle.features_enabled,
+        external_features_path=bundle.external_features_path,
+        feature_frame=updated_bundle_frame,
+        feature_snapshot=updated_snapshot,
+        reason_codes=sorted(set(reason_codes)),
+        diagnostics=diagnostics,
+    )
+    return updated_feature_frame, updated_bundle
+
+
+def _apply_ranked_features(
+    *,
+    market_frame: pd.DataFrame,
+    feature_frame: pd.DataFrame,
+    ranked_features_enabled: bool,
+    ranked_external_features_path: Path | None,
+    ranked_feature_columns: tuple[str, ...] | list[str] | None,
+) -> tuple[pd.DataFrame, RankedFeatureBundle]:
+    ranked_bundle = build_ranked_feature_bundle(
+        market_frame,
+        features_enabled=bool(ranked_features_enabled),
+        external_features_path=ranked_external_features_path,
+    )
+    ranked_bundle = apply_ranked_feature_column_selection(
+        bundle=ranked_bundle,
+        selected_feature_columns=ranked_feature_columns,
+    )
+    ranked_frame = ranked_bundle.feature_frame.copy()
+    ranked_frame["timestamp"] = pd.to_datetime(
+        ranked_frame["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    feature_merge_frame = feature_frame.copy()
+    feature_merge_frame["timestamp"] = pd.to_datetime(
+        feature_merge_frame["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    feature_merge_frame = (
+        feature_merge_frame
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    if not feature_merge_frame.empty:
+        feature_merge_frame["timestamp"] = feature_merge_frame["timestamp"].dt.as_unit("ns")
+    ranked_frame = (
+        ranked_frame
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .reset_index(drop=True)
+    )
+    if not ranked_frame.empty:
+        ranked_frame["timestamp"] = ranked_frame["timestamp"].dt.as_unit("ns")
+    if ranked_frame.empty:
+        merged = feature_merge_frame.copy()
+    else:
+        merged = pd.merge_asof(
+            feature_merge_frame,
+            ranked_frame,
+            on="timestamp",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+    for column in RANKED_FEATURE_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = 0.0
+        merged[column] = (
+            pd.to_numeric(merged[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+    return merged, ranked_bundle
+
+
+def _apply_orderbook_quality_gate(
+    *,
+    feature_frame: pd.DataFrame,
+    bundle: OrderBookFeatureBundle,
+    selected_feature_columns: tuple[str, ...] | list[str] | None,
+    settings: Settings,
+) -> tuple[pd.DataFrame, OrderBookFeatureBundle]:
+    selected_columns = normalize_orderbook_feature_columns(selected_feature_columns)
+    diagnostics = dict(bundle.diagnostics)
+    observed_external_raw_coverage = _safe_metric_float(
+        diagnostics.get(
+            "selected_external_raw_coverage",
+            _selected_metric_mean(
+                diagnostics,
+                key="orderbook_feature_raw_coverage",
+                selected_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        0.0,
+    )
+    observed_non_zero_coverage = _safe_metric_float(
+        diagnostics.get(
+            "selected_non_zero_coverage",
+            _selected_metric_mean(
+                diagnostics,
+                key="orderbook_feature_non_zero_coverage",
+                selected_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        0.0,
+    )
+    observed_fallback_rate = _safe_metric_float(
+        diagnostics.get(
+            "selected_fallback_rate",
+            _selected_metric_mean(
+                diagnostics,
+                key="orderbook_feature_fallback_rate",
+                selected_columns=selected_columns,
+                default=1.0,
+            ),
+        ),
+        1.0,
+    )
+    staleness_payload = diagnostics.get("orderbook_alignment_latency_seconds", {})
+    observed_staleness_p95: float | None = None
+    if isinstance(staleness_payload, dict):
+        staleness_p95_raw = staleness_payload.get("p95")
+        if staleness_p95_raw is not None:
+            observed_staleness_p95 = _safe_metric_float(staleness_p95_raw, 0.0)
+
+    gate_failures: list[str] = []
+    gate_applied = bool(settings.orderbook_quality_gate_enabled) and bool(bundle.features_enabled)
+    if gate_applied:
+        external_requested = bool(bundle.source_path)
+        external_loaded = bool(diagnostics.get("external_features_loaded", False))
+        if external_requested and (not external_loaded):
+            gate_failures.append("external_features_not_loaded")
+        if external_requested and observed_external_raw_coverage < float(
+            settings.orderbook_quality_min_external_raw_coverage
+        ):
+            gate_failures.append("external_raw_coverage_below_minimum")
+        if observed_non_zero_coverage < float(settings.orderbook_quality_min_non_zero_coverage):
+            gate_failures.append("non_zero_coverage_below_minimum")
+        if external_requested and observed_fallback_rate > float(
+            settings.orderbook_quality_max_fallback_rate
+        ):
+            gate_failures.append("fallback_rate_above_maximum")
+        if (
+            external_requested
+            and observed_staleness_p95 is not None
+            and observed_staleness_p95 > float(settings.orderbook_quality_max_staleness_seconds)
+        ):
+            gate_failures.append("staleness_p95_above_maximum")
+
+    diagnostics["quality_gate"] = {
+        "enabled": bool(settings.orderbook_quality_gate_enabled),
+        "applied": bool(gate_applied),
+        "selected_columns": list(selected_columns),
+        "thresholds": {
+            "min_external_raw_coverage": float(settings.orderbook_quality_min_external_raw_coverage),
+            "min_non_zero_coverage": float(settings.orderbook_quality_min_non_zero_coverage),
+            "max_fallback_rate": float(settings.orderbook_quality_max_fallback_rate),
+            "max_staleness_seconds": float(settings.orderbook_quality_max_staleness_seconds),
+        },
+        "observed": {
+            "selected_external_raw_coverage": float(observed_external_raw_coverage),
+            "selected_non_zero_coverage": float(observed_non_zero_coverage),
+            "selected_fallback_rate": float(observed_fallback_rate),
+            "staleness_p95_seconds": observed_staleness_p95,
+        },
+        "passed": bool(len(gate_failures) == 0) if gate_applied else None,
+        "failures": list(gate_failures),
+    }
+    diagnostics["quality_score"] = float(
+        observed_external_raw_coverage * observed_non_zero_coverage
+    )
+
+    updated_feature_frame = feature_frame.copy()
+    updated_bundle_frame = bundle.feature_frame.copy()
+    reason_codes = list(bundle.reason_codes)
+    if gate_applied and gate_failures:
+        for column in selected_columns:
+            if column in updated_feature_frame.columns:
+                updated_feature_frame[column] = 0.0
+            if column in updated_bundle_frame.columns:
+                updated_bundle_frame[column] = 0.0
+        diagnostics["quality_score"] = 0.0
+        diagnostics["quality_gate"]["applied_zero_fallback"] = True
+        reason_codes.append("orderbook_quality_gate_failed")
+    elif gate_applied:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("orderbook_quality_gate_passed")
+    else:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("orderbook_quality_gate_skipped")
+    updated_snapshot = {
+        column: float(
+            pd.to_numeric(updated_bundle_frame[column], errors="coerce").fillna(0.0).iloc[-1]
+        ) if (column in updated_bundle_frame.columns and not updated_bundle_frame.empty) else 0.0
+        for column in ORDERBOOK_FEATURE_COLUMNS
+    }
+
+    updated_bundle = OrderBookFeatureBundle(
+        contract=bundle.contract,
+        created_at_utc=bundle.created_at_utc,
+        features_enabled=bundle.features_enabled,
+        source_path=bundle.source_path,
+        feature_frame=updated_bundle_frame,
+        feature_snapshot=updated_snapshot,
+        reason_codes=sorted(set(reason_codes)),
+        diagnostics=diagnostics,
+    )
+    return updated_feature_frame, updated_bundle
+
+
+def _apply_orderbook_features(
+    *,
+    market_frame: pd.DataFrame,
+    feature_frame: pd.DataFrame,
+    orderbook_features_enabled: bool,
+    orderbook_features_path: Path | None,
+    orderbook_feature_columns: tuple[str, ...] | list[str] | None,
+) -> tuple[pd.DataFrame, OrderBookFeatureBundle]:
+    orderbook_bundle = build_orderbook_feature_bundle(
+        market_frame,
+        features_enabled=bool(orderbook_features_enabled),
+        orderbook_features_path=orderbook_features_path,
+    )
+    orderbook_bundle = apply_orderbook_feature_column_selection(
+        bundle=orderbook_bundle,
+        selected_feature_columns=orderbook_feature_columns,
+    )
+    orderbook_frame = orderbook_bundle.feature_frame.copy()
+    orderbook_frame["timestamp"] = pd.to_datetime(
+        orderbook_frame["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    feature_merge_frame = feature_frame.copy()
+    feature_merge_frame["timestamp"] = pd.to_datetime(
+        feature_merge_frame["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    feature_merge_frame = (
+        feature_merge_frame
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    if not feature_merge_frame.empty:
+        feature_merge_frame["timestamp"] = feature_merge_frame["timestamp"].dt.as_unit("ns")
+    orderbook_frame = (
+        orderbook_frame
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .reset_index(drop=True)
+    )
+    if not orderbook_frame.empty:
+        orderbook_frame["timestamp"] = orderbook_frame["timestamp"].dt.as_unit("ns")
+    if orderbook_frame.empty:
+        merged = feature_merge_frame.copy()
+    else:
+        merged = pd.merge_asof(
+            feature_merge_frame,
+            orderbook_frame,
+            on="timestamp",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+    for column in ORDERBOOK_FEATURE_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = 0.0
+        merged[column] = (
+            pd.to_numeric(merged[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+    return merged, orderbook_bundle
 
 def _resolve_labeling_mode(labeling_mode: str) -> str:
     normalized = str(labeling_mode or "directional_v1").strip().lower()
@@ -573,10 +1260,136 @@ def _fit_gaussian_model(train_frame: pd.DataFrame) -> dict[str, Any]:
     for label in TRIGGER_LABELS:
         class_stats[label]["prior"] = float(class_stats[label]["prior"] / prior_total)
 
-    return {"feature_columns": list(FEATURE_COLUMNS), "class_stats": class_stats}
+    return {
+        "model_family": "gaussian_nb",
+        "feature_columns": list(FEATURE_COLUMNS),
+        "class_stats": class_stats,
+    }
 
 
-def _predict_probabilities(model_payload: dict[str, Any], feature_vector: np.ndarray) -> tuple[str, dict[str, float]]:
+def _fit_regularized_lda_model(
+    train_frame: pd.DataFrame,
+    *,
+    shrinkage: float = 0.15,
+    ridge: float = 1e-5,
+) -> dict[str, Any]:
+    x_train = train_frame[list(FEATURE_COLUMNS)].to_numpy(dtype=float)
+    y_train = train_frame["label"].astype(str).to_numpy()
+    if x_train.size == 0:
+        raise RuntimeError("Training frame is empty")
+
+    global_mean = np.nanmean(x_train, axis=0)
+    global_std = np.nanstd(x_train, axis=0)
+    global_std = np.where(global_std < 1e-6, 1e-6, global_std)
+    total_samples = len(train_frame)
+    feature_count = x_train.shape[1]
+
+    class_stats: dict[str, Any] = {}
+    priors: dict[str, float] = {}
+    prior_total = 0.0
+    centered_chunks: list[np.ndarray] = []
+    for label in TRIGGER_LABELS:
+        mask = y_train == label
+        class_samples = x_train[mask]
+        count = int(class_samples.shape[0])
+        if count >= 2:
+            mean = np.nanmean(class_samples, axis=0)
+            std = np.nanstd(class_samples, axis=0)
+            std = np.where(std < 1e-6, 1e-6, std)
+            centered_chunks.append(class_samples - mean)
+        elif count == 1:
+            mean = class_samples[0]
+            std = global_std
+        else:
+            mean = global_mean
+            std = global_std
+        prior = max(1e-9, count / total_samples)
+        prior_total += prior
+        priors[label] = prior
+        class_stats[label] = {
+            "count": count,
+            "prior": prior,
+            "mean": [float(v) for v in mean.tolist()],
+            "std": [float(v) for v in std.tolist()],
+        }
+    for label in TRIGGER_LABELS:
+        normalized_prior = float(priors[label] / max(prior_total, 1e-12))
+        priors[label] = normalized_prior
+        class_stats[label]["prior"] = normalized_prior
+
+    if centered_chunks:
+        centered = np.vstack(centered_chunks)
+        pooled_cov = np.cov(centered, rowvar=False, bias=True)
+    else:
+        pooled_cov = np.diag(global_std**2)
+    pooled_cov = np.asarray(pooled_cov, dtype=float)
+    if pooled_cov.ndim == 0:
+        pooled_cov = np.asarray([[float(pooled_cov)]], dtype=float)
+    if pooled_cov.shape != (feature_count, feature_count):
+        pooled_cov = np.diag(global_std**2)
+
+    lambda_shrink = float(np.clip(shrinkage, 0.0, 1.0))
+    diagonal_cov = np.diag(np.diag(pooled_cov))
+    regularized_cov = ((1.0 - lambda_shrink) * pooled_cov) + (lambda_shrink * diagonal_cov)
+    regularized_cov += np.eye(feature_count, dtype=float) * float(max(ridge, 1e-8))
+    covariance_inv = np.linalg.pinv(regularized_cov)
+    sign, log_det = np.linalg.slogdet(regularized_cov)
+    if not np.isfinite(log_det) or sign <= 0:
+        singular_values = np.linalg.svd(regularized_cov, compute_uv=False)
+        log_det = float(np.sum(np.log(np.maximum(singular_values, 1e-12))))
+
+    return {
+        "model_family": "regularized_lda",
+        "feature_columns": list(FEATURE_COLUMNS),
+        "class_stats": class_stats,
+        "lda": {
+            "priors": {label: float(priors[label]) for label in TRIGGER_LABELS},
+            "covariance": regularized_cov.tolist(),
+            "covariance_inv": covariance_inv.tolist(),
+            "log_det_covariance": float(log_det),
+            "shrinkage": lambda_shrink,
+            "ridge": float(max(ridge, 1e-8)),
+        },
+    }
+
+def _resolve_model_feature_columns(model_payload: dict[str, Any]) -> tuple[str, ...]:
+    configured = model_payload.get("feature_columns")
+    if isinstance(configured, (list, tuple)):
+        normalized: list[str] = []
+        for value in configured:
+            if not isinstance(value, str):
+                continue
+            column = value.strip()
+            if not column or column in normalized:
+                continue
+            normalized.append(column)
+        if normalized:
+            return tuple(normalized)
+    return tuple(FEATURE_COLUMNS)
+
+
+def _build_prediction_vector(
+    *,
+    row: pd.Series,
+    model_feature_columns: Sequence[str],
+) -> np.ndarray:
+    values: list[float] = []
+    for feature in model_feature_columns:
+        if feature in row.index:
+            parsed = pd.to_numeric(pd.Series([row[feature]]), errors="coerce").iloc[0]
+            value = float(parsed) if pd.notna(parsed) else 0.0
+        else:
+            value = 0.0
+        if not np.isfinite(value):
+            value = 0.0
+        values.append(float(value))
+    return np.asarray(values, dtype=float)
+
+
+def _predict_probabilities_gaussian_nb(
+    model_payload: dict[str, Any],
+    feature_vector: np.ndarray,
+) -> tuple[str, dict[str, float]]:
     class_stats = model_payload.get("class_stats", {})
     if not isinstance(class_stats, dict):
         raise RuntimeError("Model payload missing class_stats")
@@ -605,6 +1418,56 @@ def _predict_probabilities(model_payload: dict[str, Any], feature_vector: np.nda
     probabilities = {label: float(exp_probs[label] / denominator) for label in TRIGGER_LABELS}
     recommendation = max(probabilities, key=probabilities.get)
     return recommendation, probabilities
+
+
+def _predict_probabilities_regularized_lda(
+    model_payload: dict[str, Any],
+    feature_vector: np.ndarray,
+) -> tuple[str, dict[str, float]]:
+    class_stats = model_payload.get("class_stats", {})
+    if not isinstance(class_stats, dict):
+        raise RuntimeError("Model payload missing class_stats")
+    lda_payload = model_payload.get("lda", {})
+    if not isinstance(lda_payload, dict):
+        raise RuntimeError("Model payload missing lda parameters")
+    covariance_inv = np.asarray(lda_payload.get("covariance_inv", []), dtype=float)
+    if covariance_inv.ndim != 2:
+        raise RuntimeError("Model covariance_inv is invalid")
+    if covariance_inv.shape[0] != feature_vector.shape[0] or covariance_inv.shape[1] != feature_vector.shape[0]:
+        raise RuntimeError("Model feature size mismatch")
+
+    priors_payload = lda_payload.get("priors", {})
+    log_scores: dict[str, float] = {}
+    for label in TRIGGER_LABELS:
+        stats = class_stats.get(label)
+        if not isinstance(stats, dict):
+            raise RuntimeError(f"Model payload missing class stats for label: {label}")
+        mean = np.asarray(stats.get("mean", []), dtype=float)
+        if mean.shape[0] != feature_vector.shape[0]:
+            raise RuntimeError("Model feature size mismatch")
+        prior = (
+            float(priors_payload.get(label, stats.get("prior", 0.0)))
+            if isinstance(priors_payload, dict)
+            else float(stats.get("prior", 0.0))
+        )
+        prior = max(prior, 1e-12)
+        linear_term = float(feature_vector @ covariance_inv @ mean)
+        quadratic_term = float(-0.5 * (mean @ covariance_inv @ mean))
+        log_scores[label] = float(linear_term + quadratic_term + math.log(prior))
+
+    max_log = max(log_scores.values())
+    exp_probs = {label: math.exp(value - max_log) for label, value in log_scores.items()}
+    denominator = sum(exp_probs.values())
+    probabilities = {label: float(exp_probs[label] / denominator) for label in TRIGGER_LABELS}
+    recommendation = max(probabilities, key=probabilities.get)
+    return recommendation, probabilities
+
+
+def _predict_probabilities(model_payload: dict[str, Any], feature_vector: np.ndarray) -> tuple[str, dict[str, float]]:
+    model_family = str(model_payload.get("model_family", "gaussian_nb")).strip().lower()
+    if model_family == "regularized_lda":
+        return _predict_probabilities_regularized_lda(model_payload, feature_vector)
+    return _predict_probabilities_gaussian_nb(model_payload, feature_vector)
 
 
 def _predict_labels(model_payload: dict[str, Any], feature_matrix: np.ndarray) -> list[str]:
@@ -1074,6 +1937,122 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, float, fl
         -execution_rejection_rate,
     )
 
+def _evaluation_selection_rank(evaluation: dict[str, Any]) -> tuple[float, float, float, float, float, float, float, float]:
+    actionable = (
+        dict(evaluation.get("actionable_metrics", {}))
+        if isinstance(evaluation.get("actionable_metrics", {}), dict)
+        else {}
+    )
+    execution = (
+        dict(evaluation.get("execution_backtest_metrics", {}))
+        if isinstance(evaluation.get("execution_backtest_metrics", {}), dict)
+        else {}
+    )
+    merged = {**actionable, **execution}
+    return (*_execution_selection_rank(merged), float(evaluation.get("accuracy", 0.0)))
+
+
+def _fit_model_family_candidates(train_frame: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    candidates["gaussian_nb"] = _fit_gaussian_model(train_frame)
+    try:
+        candidates["regularized_lda"] = _fit_regularized_lda_model(train_frame)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("regularized_lda fit failed; falling back to gaussian_nb only: %s", exc)
+    return candidates
+
+
+def _select_best_model_family(
+    *,
+    train_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    symbol: str,
+    one_way_cost_bps: float,
+    action_confidence_threshold: float,
+    paper_notional_usd: float,
+    paper_starting_cash_usd: float,
+    paper_fee_bps: float,
+    paper_slippage_bps: float,
+) -> tuple[dict[str, Any], str, dict[str, Any], list[dict[str, Any]]]:
+    candidate_models = _fit_model_family_candidates(train_frame)
+    family_metrics: list[dict[str, Any]] = []
+    best_family = "gaussian_nb"
+    best_model = candidate_models[best_family]
+    best_evaluation: dict[str, Any] | None = None
+    best_rank: tuple[float, float, float, float, float, float, float, float] | None = None
+
+    for family, model_payload in candidate_models.items():
+        evaluation = _evaluate_model(
+            model_payload=model_payload,
+            test_frame=test_frame,
+            symbol=symbol,
+            one_way_cost_bps=one_way_cost_bps,
+            action_confidence_threshold=action_confidence_threshold,
+            paper_notional_usd=paper_notional_usd,
+            paper_starting_cash_usd=paper_starting_cash_usd,
+            paper_fee_bps=paper_fee_bps,
+            paper_slippage_bps=paper_slippage_bps,
+        )
+        rank = _evaluation_selection_rank(evaluation)
+        actionable = (
+            dict(evaluation.get("actionable_metrics", {}))
+            if isinstance(evaluation.get("actionable_metrics", {}), dict)
+            else {}
+        )
+        execution = (
+            dict(evaluation.get("execution_backtest_metrics", {}))
+            if isinstance(evaluation.get("execution_backtest_metrics", {}), dict)
+            else {}
+        )
+        expectancy = (
+            dict(evaluation.get("expectancy_metrics", {}))
+            if isinstance(evaluation.get("expectancy_metrics", {}), dict)
+            else {}
+        )
+        family_metrics.append(
+            {
+                "model_family": family,
+                "accuracy": float(evaluation.get("accuracy", 0.0)),
+                "net_expectancy_per_actionable": float(
+                    expectancy.get("net_expectancy_per_actionable", 0.0)
+                ),
+                "execution_realized_pnl_delta_usd": float(
+                    execution.get("realized_pnl_delta_usd", 0.0)
+                ),
+                "execution_equity_return": float(execution.get("equity_return", 0.0)),
+                "execution_fill_rate": float(execution.get("fill_rate", 0.0)),
+                "execution_rejection_rate": float(execution.get("rejection_rate", 0.0)),
+                "actionable_rate": float(actionable.get("actionable_rate", 0.0)),
+                "binary_actionable_precision": float(
+                    actionable.get("binary_actionable_precision", 0.0)
+                ),
+                "selection_rank": [float(value) for value in rank],
+            }
+        )
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_family = family
+            best_model = model_payload
+            best_evaluation = evaluation
+
+    if best_evaluation is None:
+        best_evaluation = _evaluate_model(
+            model_payload=best_model,
+            test_frame=test_frame,
+            symbol=symbol,
+            one_way_cost_bps=one_way_cost_bps,
+            action_confidence_threshold=action_confidence_threshold,
+            paper_notional_usd=paper_notional_usd,
+            paper_starting_cash_usd=paper_starting_cash_usd,
+            paper_fee_bps=paper_fee_bps,
+            paper_slippage_bps=paper_slippage_bps,
+        )
+    family_metrics.sort(
+        key=lambda item: tuple(float(value) for value in item.get("selection_rank", [])),
+        reverse=True,
+    )
+    return best_model, best_family, best_evaluation, family_metrics
+
 
 def _select_action_confidence_frontier(
     *,
@@ -1196,6 +2175,7 @@ def _feature_reasons(
     feature_vector: np.ndarray,
     recommendation: str,
     probabilities: dict[str, float],
+    model_feature_columns: Sequence[str] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     ordered_labels = sorted(
         probabilities.items(),
@@ -1212,9 +2192,25 @@ def _feature_reasons(
     std_best = np.where(np.asarray(stats_best["std"], dtype=float) < 1e-6, 1e-6, np.asarray(stats_best["std"], dtype=float))
     mean_alt = np.asarray(stats_alt["mean"], dtype=float)
     std_alt = np.where(np.asarray(stats_alt["std"], dtype=float) < 1e-6, 1e-6, np.asarray(stats_alt["std"], dtype=float))
+    resolved_columns = (
+        tuple(model_feature_columns)
+        if model_feature_columns is not None and len(tuple(model_feature_columns)) > 0
+        else _resolve_model_feature_columns(model_payload)
+    )
+    feature_count = min(
+        len(resolved_columns),
+        int(feature_vector.shape[0]),
+        int(mean_best.shape[0]),
+        int(std_best.shape[0]),
+        int(mean_alt.shape[0]),
+        int(std_alt.shape[0]),
+    )
+    if feature_count <= 0:
+        return [], []
 
     reasons: list[dict[str, Any]] = []
-    for index, feature_name in enumerate(FEATURE_COLUMNS):
+    for index in range(feature_count):
+        feature_name = resolved_columns[index]
         best_term = -0.5 * (
             ((feature_vector[index] - mean_best[index]) / std_best[index]) ** 2
             + math.log(std_best[index] ** 2)
@@ -1267,6 +2263,12 @@ def train_trigger_model(
     priority2_features_enabled: bool = True,
     priority2_external_features_path: Path | None = None,
     priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
+    ranked_features_enabled: bool = True,
+    ranked_external_features_path: Path | None = None,
+    ranked_feature_columns: tuple[str, ...] | list[str] | None = None,
+    orderbook_features_enabled: bool = False,
+    orderbook_features_path: Path | None = None,
+    orderbook_feature_columns: tuple[str, ...] | list[str] | None = None,
 ) -> TriggerModelTrainingResult:
     source_data_path = (
         input_file.expanduser().resolve()
@@ -1291,10 +2293,32 @@ def train_trigger_model(
         if priority2_feature_columns is not None
         else DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS
     )
-    resolved_priority2_feature_columns = normalize_priority2_feature_columns(
-        priority2_feature_columns
-        if priority2_feature_columns is not None
-        else DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS
+    resolved_ranked_external_features_path, ranked_external_resolution = (
+        _resolve_ranked_external_features_path(
+            settings=settings,
+            ranked_features_enabled=bool(ranked_features_enabled),
+            requested_path=ranked_external_features_path,
+        )
+    )
+    resolved_ranked_feature_columns = normalize_ranked_feature_columns(
+        ranked_feature_columns
+        if ranked_feature_columns is not None
+        else DEFAULT_STABLE_RANKED_FEATURE_COLUMNS
+    )
+    resolved_orderbook_features_path, orderbook_features_resolution = (
+        _resolve_orderbook_features_path(
+            settings=settings,
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            orderbook_features_enabled=bool(orderbook_features_enabled),
+            requested_path=orderbook_features_path,
+        )
+    )
+    resolved_orderbook_feature_columns = normalize_orderbook_feature_columns(
+        orderbook_feature_columns
+        if orderbook_feature_columns is not None
+        else DEFAULT_STABLE_ORDERBOOK_FEATURE_COLUMNS
     )
 
     frame = _coerce_frame(source_data_path)
@@ -1303,6 +2327,38 @@ def train_trigger_model(
         priority2_features_enabled=bool(priority2_features_enabled),
         priority2_external_features_path=resolved_priority2_external_features_path,
         priority2_feature_columns=resolved_priority2_feature_columns,
+    )
+    feature_frame, priority2_bundle = _apply_priority2_quality_gate(
+        feature_frame=feature_frame,
+        bundle=priority2_bundle,
+        selected_feature_columns=resolved_priority2_feature_columns,
+        settings=settings,
+    )
+    feature_frame, ranked_bundle = _apply_ranked_features(
+        market_frame=frame,
+        feature_frame=feature_frame,
+        ranked_features_enabled=bool(ranked_features_enabled),
+        ranked_external_features_path=resolved_ranked_external_features_path,
+        ranked_feature_columns=resolved_ranked_feature_columns,
+    )
+    feature_frame, ranked_bundle = _apply_ranked_quality_gate(
+        feature_frame=feature_frame,
+        bundle=ranked_bundle,
+        selected_feature_columns=resolved_ranked_feature_columns,
+        settings=settings,
+    )
+    feature_frame, orderbook_bundle = _apply_orderbook_features(
+        market_frame=frame,
+        feature_frame=feature_frame,
+        orderbook_features_enabled=bool(orderbook_features_enabled),
+        orderbook_features_path=resolved_orderbook_features_path,
+        orderbook_feature_columns=resolved_orderbook_feature_columns,
+    )
+    feature_frame, orderbook_bundle = _apply_orderbook_quality_gate(
+        feature_frame=feature_frame,
+        bundle=orderbook_bundle,
+        selected_feature_columns=resolved_orderbook_feature_columns,
+        settings=settings,
     )
     resolved_labeling_mode = _resolve_labeling_mode(labeling_mode)
     resolved_horizon = int(max(1, horizon_bars))
@@ -1343,9 +2399,13 @@ def train_trigger_model(
                 )
             except RuntimeError:
                 continue
-            candidate_model = _fit_gaussian_model(candidate_train)
-            candidate_eval = _evaluate_model(
-                model_payload=candidate_model,
+            (
+                _,
+                candidate_model_family,
+                candidate_eval,
+                candidate_family_metrics,
+            ) = _select_best_model_family(
+                train_frame=candidate_train,
                 test_frame=candidate_test,
                 symbol=symbol,
                 one_way_cost_bps=resolved_cost_bps,
@@ -1388,6 +2448,8 @@ def train_trigger_model(
                         actionable.get("binary_actionable_precision", 0.0)
                     ),
                     "trade_quality_pass_rate": quality_pass_rate,
+                    "selected_model_family": candidate_model_family,
+                    "model_family_candidates": candidate_family_metrics,
                 }
             )
         if threshold_candidates:
@@ -1417,18 +2479,69 @@ def train_trigger_model(
         labeled,
         min_train_samples=min_train_samples,
     )
-    model = _fit_gaussian_model(train_frame)
-    selected_action_confidence_threshold, evaluation, action_confidence_frontier = _select_action_confidence_frontier(
-        model_payload=model,
-        test_frame=test_frame,
-        symbol=symbol,
-        one_way_cost_bps=resolved_cost_bps,
-        paper_notional_usd=resolved_paper_notional_usd,
-        paper_starting_cash_usd=resolved_paper_starting_cash_usd,
-        paper_fee_bps=resolved_paper_fee_bps,
-        paper_slippage_bps=resolved_paper_slippage_bps,
-        minimum_threshold=resolved_action_confidence_threshold,
-        optimize_thresholds=bool(optimize_thresholds),
+    model_candidates = _fit_model_family_candidates(train_frame)
+    selected_model_family = "gaussian_nb"
+    model = model_candidates[selected_model_family]
+    selected_action_confidence_threshold = float(np.clip(resolved_action_confidence_threshold, 0.0, 1.0))
+    evaluation: dict[str, Any] | None = None
+    action_confidence_frontier: list[dict[str, Any]] = []
+    model_family_selection_rows: list[dict[str, Any]] = []
+    best_family_rank: tuple[float, float, float, float, float, float, float, float] | None = None
+    for family, candidate_model in model_candidates.items():
+        (
+            candidate_threshold,
+            candidate_evaluation,
+            candidate_frontier,
+        ) = _select_action_confidence_frontier(
+            model_payload=candidate_model,
+            test_frame=test_frame,
+            symbol=symbol,
+            one_way_cost_bps=resolved_cost_bps,
+            paper_notional_usd=resolved_paper_notional_usd,
+            paper_starting_cash_usd=resolved_paper_starting_cash_usd,
+            paper_fee_bps=resolved_paper_fee_bps,
+            paper_slippage_bps=resolved_paper_slippage_bps,
+            minimum_threshold=resolved_action_confidence_threshold,
+            optimize_thresholds=bool(optimize_thresholds),
+        )
+        candidate_rank = _evaluation_selection_rank(candidate_evaluation)
+        model_family_selection_rows.append(
+            {
+                "model_family": family,
+                "selected_action_confidence_threshold": float(candidate_threshold),
+                "selection_rank": [float(value) for value in candidate_rank],
+                "accuracy": float(candidate_evaluation.get("accuracy", 0.0)),
+                "actionable_metrics": dict(candidate_evaluation.get("actionable_metrics", {})),
+                "expectancy_metrics": dict(candidate_evaluation.get("expectancy_metrics", {})),
+                "execution_backtest_metrics": dict(
+                    candidate_evaluation.get("execution_backtest_metrics", {})
+                ),
+                "frontier_row_count": int(len(candidate_frontier)),
+            }
+        )
+        if best_family_rank is None or candidate_rank > best_family_rank:
+            best_family_rank = candidate_rank
+            selected_model_family = family
+            model = candidate_model
+            selected_action_confidence_threshold = float(candidate_threshold)
+            evaluation = candidate_evaluation
+            action_confidence_frontier = candidate_frontier
+    if evaluation is None:
+        selected_action_confidence_threshold, evaluation, action_confidence_frontier = _select_action_confidence_frontier(
+            model_payload=model,
+            test_frame=test_frame,
+            symbol=symbol,
+            one_way_cost_bps=resolved_cost_bps,
+            paper_notional_usd=resolved_paper_notional_usd,
+            paper_starting_cash_usd=resolved_paper_starting_cash_usd,
+            paper_fee_bps=resolved_paper_fee_bps,
+            paper_slippage_bps=resolved_paper_slippage_bps,
+            minimum_threshold=resolved_action_confidence_threshold,
+            optimize_thresholds=bool(optimize_thresholds),
+        )
+    model_family_selection_rows.sort(
+        key=lambda row: tuple(float(value) for value in row.get("selection_rank", [])),
+        reverse=True,
     )
     accuracy = float(evaluation.get("accuracy", 0.0))
     confusion = dict(evaluation.get("confusion_matrix", {}))
@@ -1464,9 +2577,25 @@ def train_trigger_model(
         run_id=run_dir.name,
         bundle=priority2_bundle,
     )
+    ranked_artifacts = write_ranked_feature_artifacts(
+        quant_data_root=settings.quant_data_root,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        run_id=run_dir.name,
+        bundle=ranked_bundle,
+    )
+    orderbook_artifacts = write_orderbook_feature_artifacts(
+        quant_data_root=settings.quant_data_root,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        run_id=run_dir.name,
+        bundle=orderbook_bundle,
+    )
 
     model_payload = {
-        "contract": "trigger_model.gaussian_nb.v2",
+        "contract": "trigger_model.discriminant.v3",
         "created_at_utc": _utc_now_iso(),
         "exchange": exchange,
         "symbol": symbol,
@@ -1481,7 +2610,17 @@ def train_trigger_model(
         "selected_action_confidence_threshold": float(selected_action_confidence_threshold),
         "feature_columns": list(FEATURE_COLUMNS),
         "labels": list(TRIGGER_LABELS),
+        "model_family": selected_model_family,
         "class_stats": model["class_stats"],
+        "model_params": {
+            "lda": dict(model.get("lda", {}))
+            if isinstance(model.get("lda", {}), dict)
+            else {},
+        },
+        "model_family_selection": {
+            "selected_model_family": selected_model_family,
+            "candidates": model_family_selection_rows,
+        },
         "priority2_features_enabled": bool(priority2_features_enabled),
         "priority2_external_features_path": (
             str(resolved_priority2_external_features_path)
@@ -1492,6 +2631,26 @@ def train_trigger_model(
         "priority2_external_features_path_resolution": priority2_external_resolution,
         "priority2_reason_codes": list(priority2_bundle.reason_codes),
         "priority2_diagnostics": dict(priority2_bundle.diagnostics),
+        "ranked_features_enabled": bool(ranked_features_enabled),
+        "ranked_external_features_path": (
+            str(resolved_ranked_external_features_path)
+            if resolved_ranked_external_features_path is not None
+            else None
+        ),
+        "ranked_feature_columns": list(resolved_ranked_feature_columns),
+        "ranked_external_features_path_resolution": ranked_external_resolution,
+        "ranked_reason_codes": list(ranked_bundle.reason_codes),
+        "ranked_diagnostics": dict(ranked_bundle.diagnostics),
+        "orderbook_features_enabled": bool(orderbook_features_enabled),
+        "orderbook_features_path": (
+            str(resolved_orderbook_features_path)
+            if resolved_orderbook_features_path is not None
+            else None
+        ),
+        "orderbook_feature_columns": list(resolved_orderbook_feature_columns),
+        "orderbook_features_path_resolution": orderbook_features_resolution,
+        "orderbook_reason_codes": list(orderbook_bundle.reason_codes),
+        "orderbook_diagnostics": dict(orderbook_bundle.diagnostics),
         "training_metrics": {
             "sample_count": int(len(labeled)),
             "train_count": int(train_count),
@@ -1536,6 +2695,7 @@ def train_trigger_model(
                 "sell_threshold": float(selected_sell_threshold),
                 "trade_quality_min_score": float(resolved_trade_quality_min_score),
                 "action_confidence_threshold": float(selected_action_confidence_threshold),
+                "model_family": selected_model_family,
             },
             "top_candidates": threshold_candidates[:10],
             "action_confidence_frontier": {
@@ -1551,6 +2711,10 @@ def train_trigger_model(
             "test_dataset_path": str(test_frame_path),
             "priority2_feature_parquet": str(priority2_artifacts.parquet_path),
             "priority2_feature_contract": str(priority2_artifacts.contract_path),
+            "ranked_feature_parquet": str(ranked_artifacts.parquet_path),
+            "ranked_feature_contract": str(ranked_artifacts.contract_path),
+            "orderbook_feature_parquet": str(orderbook_artifacts.parquet_path),
+            "orderbook_feature_contract": str(orderbook_artifacts.contract_path),
         },
     }
     _write_json(model_path, model_payload)
@@ -1619,6 +2783,12 @@ def predict_trigger_signal(
     priority2_features_enabled: bool = True,
     priority2_external_features_path: Path | None = None,
     priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
+    ranked_features_enabled: bool = True,
+    ranked_external_features_path: Path | None = None,
+    ranked_feature_columns: tuple[str, ...] | list[str] | None = None,
+    orderbook_features_enabled: bool = False,
+    orderbook_features_path: Path | None = None,
+    orderbook_feature_columns: tuple[str, ...] | list[str] | None = None,
 ) -> TriggerPredictionResult:
     resolved_model_path = (
         model_path.expanduser().resolve()
@@ -1647,6 +2817,33 @@ def predict_trigger_signal(
         if priority2_feature_columns is not None
         else DEFAULT_STABLE_PRIORITY2_FEATURE_COLUMNS
     )
+    resolved_ranked_external_features_path, ranked_external_resolution = (
+        _resolve_ranked_external_features_path(
+            settings=settings,
+            ranked_features_enabled=bool(ranked_features_enabled),
+            requested_path=ranked_external_features_path,
+        )
+    )
+    resolved_ranked_feature_columns = normalize_ranked_feature_columns(
+        ranked_feature_columns
+        if ranked_feature_columns is not None
+        else DEFAULT_STABLE_RANKED_FEATURE_COLUMNS
+    )
+    resolved_orderbook_features_path, orderbook_features_resolution = (
+        _resolve_orderbook_features_path(
+            settings=settings,
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            orderbook_features_enabled=bool(orderbook_features_enabled),
+            requested_path=orderbook_features_path,
+        )
+    )
+    resolved_orderbook_feature_columns = normalize_orderbook_feature_columns(
+        orderbook_feature_columns
+        if orderbook_feature_columns is not None
+        else DEFAULT_STABLE_ORDERBOOK_FEATURE_COLUMNS
+    )
 
     frame = _coerce_frame(source_data_path)
     feature_frame, priority2_bundle = _build_feature_frame(
@@ -1655,12 +2852,55 @@ def predict_trigger_signal(
         priority2_external_features_path=resolved_priority2_external_features_path,
         priority2_feature_columns=resolved_priority2_feature_columns,
     )
-    feature_frame = feature_frame.dropna(subset=list(FEATURE_COLUMNS)).reset_index(drop=True)
+    feature_frame, priority2_bundle = _apply_priority2_quality_gate(
+        feature_frame=feature_frame,
+        bundle=priority2_bundle,
+        selected_feature_columns=resolved_priority2_feature_columns,
+        settings=settings,
+    )
+    feature_frame, ranked_bundle = _apply_ranked_features(
+        market_frame=frame,
+        feature_frame=feature_frame,
+        ranked_features_enabled=bool(ranked_features_enabled),
+        ranked_external_features_path=resolved_ranked_external_features_path,
+        ranked_feature_columns=resolved_ranked_feature_columns,
+    )
+    feature_frame, ranked_bundle = _apply_ranked_quality_gate(
+        feature_frame=feature_frame,
+        bundle=ranked_bundle,
+        selected_feature_columns=resolved_ranked_feature_columns,
+        settings=settings,
+    )
+    feature_frame, orderbook_bundle = _apply_orderbook_features(
+        market_frame=frame,
+        feature_frame=feature_frame,
+        orderbook_features_enabled=bool(orderbook_features_enabled),
+        orderbook_features_path=resolved_orderbook_features_path,
+        orderbook_feature_columns=resolved_orderbook_feature_columns,
+    )
+    feature_frame, orderbook_bundle = _apply_orderbook_quality_gate(
+        feature_frame=feature_frame,
+        bundle=orderbook_bundle,
+        selected_feature_columns=resolved_orderbook_feature_columns,
+        settings=settings,
+    )
+    model_feature_columns = _resolve_model_feature_columns(model_payload)
+    for feature in model_feature_columns:
+        if feature not in feature_frame.columns:
+            feature_frame[feature] = 0.0
+        feature_frame[feature] = (
+            pd.to_numeric(feature_frame[feature], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+    feature_frame = feature_frame.dropna(subset=list(model_feature_columns)).reset_index(drop=True)
     if feature_frame.empty:
         raise RuntimeError("No usable feature rows for prediction")
 
     latest_row = feature_frame.iloc[-1]
-    vector = np.asarray([float(latest_row[feature]) for feature in FEATURE_COLUMNS], dtype=float)
+    vector = _build_prediction_vector(
+        row=latest_row,
+        model_feature_columns=model_feature_columns,
+    )
     raw_recommendation, probabilities = _predict_probabilities(model_payload, vector)
     confidence = float(probabilities[raw_recommendation])
     resolved_action_confidence_threshold = _resolve_prediction_action_confidence_threshold(
@@ -1733,6 +2973,7 @@ def predict_trigger_signal(
         vector,
         raw_recommendation,
         probabilities,
+        model_feature_columns=model_feature_columns,
     )
     if confidence_gate_applied:
         gate_reason = (
@@ -1791,7 +3032,7 @@ def predict_trigger_signal(
             },
             *reason_details,
         ]
-    feature_values = {feature: float(latest_row[feature]) for feature in FEATURE_COLUMNS}
+    feature_values = {feature: float(vector[index]) for index, feature in enumerate(model_feature_columns)}
     close_price = float(latest_row["close"])
     sma_fast = close_price / (1.0 + float(latest_row["sma_fast_spread"]))
     sma_slow = close_price / (1.0 + float(latest_row["sma_slow_spread"]))
@@ -1858,6 +3099,28 @@ def predict_trigger_signal(
                 "priority2_reason_codes": list(priority2_bundle.reason_codes),
                 "priority2_diagnostics": dict(priority2_bundle.diagnostics),
                 "priority2_feature_snapshot": dict(priority2_bundle.feature_snapshot),
+                "ranked_features_enabled": bool(ranked_features_enabled),
+                "ranked_external_features_path": (
+                    str(resolved_ranked_external_features_path)
+                    if resolved_ranked_external_features_path is not None
+                    else None
+                ),
+                "ranked_feature_columns": list(resolved_ranked_feature_columns),
+                "ranked_external_features_path_resolution": ranked_external_resolution,
+                "ranked_reason_codes": list(ranked_bundle.reason_codes),
+                "ranked_diagnostics": dict(ranked_bundle.diagnostics),
+                "ranked_feature_snapshot": dict(ranked_bundle.feature_snapshot),
+                "orderbook_features_enabled": bool(orderbook_features_enabled),
+                "orderbook_features_path": (
+                    str(resolved_orderbook_features_path)
+                    if resolved_orderbook_features_path is not None
+                    else None
+                ),
+                "orderbook_feature_columns": list(resolved_orderbook_feature_columns),
+                "orderbook_features_path_resolution": orderbook_features_resolution,
+                "orderbook_reason_codes": list(orderbook_bundle.reason_codes),
+                "orderbook_diagnostics": dict(orderbook_bundle.diagnostics),
+                "orderbook_feature_snapshot": dict(orderbook_bundle.feature_snapshot),
             },
         )
 
@@ -1990,6 +3253,12 @@ def monitor_trigger_signals(
     priority2_features_enabled: bool = True,
     priority2_external_features_path: Path | None = None,
     priority2_feature_columns: tuple[str, ...] | list[str] | None = None,
+    ranked_features_enabled: bool = True,
+    ranked_external_features_path: Path | None = None,
+    ranked_feature_columns: tuple[str, ...] | list[str] | None = None,
+    orderbook_features_enabled: bool = False,
+    orderbook_features_path: Path | None = None,
+    orderbook_feature_columns: tuple[str, ...] | list[str] | None = None,
     paper_trading_enabled: bool = False,
     paper_notional_usd: float = 100.0,
     paper_starting_cash_usd: float = 10000.0,
@@ -2048,6 +3317,12 @@ def monitor_trigger_signals(
             priority2_features_enabled=bool(priority2_features_enabled),
             priority2_external_features_path=priority2_external_features_path,
             priority2_feature_columns=priority2_feature_columns,
+            ranked_features_enabled=bool(ranked_features_enabled),
+            ranked_external_features_path=ranked_external_features_path,
+            ranked_feature_columns=ranked_feature_columns,
+            orderbook_features_enabled=bool(orderbook_features_enabled),
+            orderbook_features_path=orderbook_features_path,
+            orderbook_feature_columns=orderbook_feature_columns,
         )
 
         is_actionable = prediction.recommendation in {"buy", "sell"}

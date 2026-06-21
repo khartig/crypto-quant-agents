@@ -52,6 +52,29 @@ class Settings:
     priority2_retrieval_max_points: int
     priority2_retrieval_base_url: str
     priority2_local_feature_overrides_path: str | None
+    priority2_quality_gate_enabled: bool
+    priority2_quality_min_external_raw_coverage: float
+    priority2_quality_min_non_zero_coverage: float
+    priority2_quality_max_fallback_rate: float
+    priority2_quality_max_staleness_seconds: float
+    ranked_features_enabled: bool
+    ranked_external_features_path: str | None
+    ranked_feature_columns: tuple[str, ...]
+    ranked_quality_gate_enabled: bool
+    ranked_quality_min_external_raw_coverage: float
+    ranked_quality_min_non_zero_coverage: float
+    ranked_quality_max_fallback_rate: float
+    ranked_quality_max_staleness_seconds: float
+    orderbook_features_enabled: bool
+    orderbook_features_path: str | None
+    orderbook_feature_columns: tuple[str, ...]
+    orderbook_capture_sample_interval_seconds: float
+    orderbook_capture_depth_limit: int
+    orderbook_quality_gate_enabled: bool
+    orderbook_quality_min_external_raw_coverage: float
+    orderbook_quality_min_non_zero_coverage: float
+    orderbook_quality_max_fallback_rate: float
+    orderbook_quality_max_staleness_seconds: float
     risk_min_total_return: float
     risk_min_sharpe: float
     risk_max_drawdown: float
@@ -297,6 +320,167 @@ def load_settings() -> Settings:
         ).strip(),
         priority2_local_feature_overrides_path=(
             os.getenv("PRIORITY2_LOCAL_FEATURE_OVERRIDES_PATH") or None
+        ),
+        priority2_quality_gate_enabled=_as_bool(
+            os.getenv("PRIORITY2_QUALITY_GATE_ENABLED"),
+            default=True,
+        ),
+        priority2_quality_min_external_raw_coverage=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("PRIORITY2_QUALITY_MIN_EXTERNAL_RAW_COVERAGE"),
+                    default=0.20,
+                ),
+            ),
+        ),
+        priority2_quality_min_non_zero_coverage=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("PRIORITY2_QUALITY_MIN_NON_ZERO_COVERAGE"),
+                    default=0.05,
+                ),
+            ),
+        ),
+        priority2_quality_max_fallback_rate=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("PRIORITY2_QUALITY_MAX_FALLBACK_RATE"),
+                    default=0.80,
+                ),
+            ),
+        ),
+        priority2_quality_max_staleness_seconds=max(
+            0.0,
+            _as_float(
+                os.getenv("PRIORITY2_QUALITY_MAX_STALENESS_SECONDS"),
+                default=86400.0,
+            ),
+        ),
+        ranked_features_enabled=_as_bool(
+            os.getenv("RANKED_FEATURES_ENABLED"),
+            default=True,
+        ),
+        ranked_external_features_path=os.getenv("RANKED_EXTERNAL_FEATURES_PATH") or None,
+        ranked_feature_columns=_as_csv_tuple(
+            os.getenv("RANKED_FEATURE_COLUMNS"),
+            default=(
+                "flow_signed_volume_imbalance_24",
+                "derivatives_open_interest_delta_24",
+                "derivatives_basis_z_24",
+                "onchain_exchange_netflow_z_24",
+                "options_put_call_oi_ratio_z_24",
+                "regime_trend_strength_24",
+                "regime_momentum_vol_adj_24",
+            ),
+        ),
+        ranked_quality_gate_enabled=_as_bool(
+            os.getenv("RANKED_QUALITY_GATE_ENABLED"),
+            default=True,
+        ),
+        ranked_quality_min_external_raw_coverage=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("RANKED_QUALITY_MIN_EXTERNAL_RAW_COVERAGE"),
+                    default=0.15,
+                ),
+            ),
+        ),
+        ranked_quality_min_non_zero_coverage=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("RANKED_QUALITY_MIN_NON_ZERO_COVERAGE"),
+                    default=0.05,
+                ),
+            ),
+        ),
+        ranked_quality_max_fallback_rate=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("RANKED_QUALITY_MAX_FALLBACK_RATE"),
+                    default=0.85,
+                ),
+            ),
+        ),
+        ranked_quality_max_staleness_seconds=max(
+            0.0,
+            _as_float(
+                os.getenv("RANKED_QUALITY_MAX_STALENESS_SECONDS"),
+                default=86400.0,
+            ),
+        ),
+        orderbook_features_enabled=_as_bool(
+            os.getenv("ORDERBOOK_FEATURES_ENABLED"),
+            default=False,
+        ),
+        orderbook_features_path=os.getenv("ORDERBOOK_FEATURES_PATH") or None,
+        orderbook_feature_columns=_as_csv_tuple(
+            os.getenv("ORDERBOOK_FEATURE_COLUMNS"),
+            default=(
+                "orderbook_spread_feature",
+                "orderbook_depth_imbalance_feature",
+                "orderbook_microprice_deviation_feature",
+            ),
+        ),
+        orderbook_capture_sample_interval_seconds=max(
+            0.0,
+            _as_float(os.getenv("ORDERBOOK_CAPTURE_SAMPLE_INTERVAL_SECONDS"), default=1.0),
+        ),
+        orderbook_capture_depth_limit=max(
+            1,
+            _as_int(os.getenv("ORDERBOOK_CAPTURE_DEPTH_LIMIT"), default=50),
+        ),
+        orderbook_quality_gate_enabled=_as_bool(
+            os.getenv("ORDERBOOK_QUALITY_GATE_ENABLED"),
+            default=True,
+        ),
+        orderbook_quality_min_external_raw_coverage=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("ORDERBOOK_QUALITY_MIN_EXTERNAL_RAW_COVERAGE"),
+                    default=0.01,
+                ),
+            ),
+        ),
+        orderbook_quality_min_non_zero_coverage=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("ORDERBOOK_QUALITY_MIN_NON_ZERO_COVERAGE"),
+                    default=0.001,
+                ),
+            ),
+        ),
+        orderbook_quality_max_fallback_rate=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    os.getenv("ORDERBOOK_QUALITY_MAX_FALLBACK_RATE"),
+                    default=0.99,
+                ),
+            ),
+        ),
+        orderbook_quality_max_staleness_seconds=max(
+            0.0,
+            _as_float(
+                os.getenv("ORDERBOOK_QUALITY_MAX_STALENESS_SECONDS"),
+                default=7200.0,
+            ),
         ),
         risk_min_total_return=_as_float(os.getenv("RISK_MIN_TOTAL_RETURN"), default=0.0),
         risk_min_sharpe=_as_float(os.getenv("RISK_MIN_SHARPE"), default=0.0),
