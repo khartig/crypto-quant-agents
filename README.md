@@ -282,6 +282,15 @@ When `train-trigger-model` or `predict-trigger` runs with Priority 2 enabled and
 When `train-trigger-model`, `predict-trigger`, or `monitor-triggers` runs with ranked features enabled and no explicit `--ranked-external-features-path`, the pipeline uses `RANKED_EXTERNAL_FEATURES_PATH` when configured and otherwise falls back to deterministic proxy-ranked features.
 When `train-trigger-model`, `predict-trigger`, or `monitor-triggers` runs with order-book features enabled and no explicit `--orderbook-features-path`, the pipeline auto-resolves the latest aligned order-book artifact from `curated/features/orderbook/.../latest_orderbook_features_path.txt` for the same exchange/symbol/timeframe scope.
 
+### Priority 2 item 8/9 validation + benchmark artifacts
+Use these scripts to produce the roadmap item 8 (alternative-data quality/latency) and item 9 (labeling/objective benchmark + frontier plot) deliverables.
+```bash path=null start=null
+python scripts/validate_priority2_alternative_data_quality.py --exchange kraken --symbol BTC/USDT --timeframe 1h
+python scripts/run_labeling_objective_benchmark.py --exchange kraken --symbol BTC/USDT --timeframe 1h --scenario-set default
+```
+Labeling specification reference:
+- [doc/TRIGGER_LABELING_OBJECTIVE_SPEC.md](doc/TRIGGER_LABELING_OBJECTIVE_SPEC.md)
+
 ### Order book snapshot capture + retrieval
 Use this to capture depth snapshots and build aligned order-book features for trigger-model runs.
 ```bash path=null start=null
@@ -478,6 +487,8 @@ All paths below are relative to `QUANT_DATA_ROOT`.
 - Priority 2 external retrieval artifacts:
   - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_external_features.parquet`
   - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_external_feature_contract.json`
+  - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_alternative_data_quality_latency_report.json`
+  - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/priority2_alternative_data_quality_latency_report.md`
   - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_external_features_path.txt`
   - `curated/features/external/exchange=<exchange>/symbol=<pair>/interval=<tf>/latest_external_feature_contract_path.txt`
 - Order book retrieval artifacts:
@@ -498,6 +509,10 @@ All paths below are relative to `QUANT_DATA_ROOT`.
 - Ranked ablation summaries:
   - `logs/analysis/ranked_feature_ablation_<timestamp>/ranked_feature_ablation_results.json`
   - `logs/analysis/ranked_feature_ablation_<timestamp>/ranked_feature_ablation_results.md`
+- Labeling/objective benchmark artifacts:
+  - `curated/evaluations/trigger_labeling_objective_benchmark/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/trigger_labeling_objective_benchmark.json`
+  - `curated/evaluations/trigger_labeling_objective_benchmark/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/trigger_labeling_objective_benchmark.md`
+  - `curated/evaluations/trigger_labeling_objective_benchmark/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/actionable_coverage_vs_precision_frontier.png`
 - Archives:
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz`
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz.sha256`

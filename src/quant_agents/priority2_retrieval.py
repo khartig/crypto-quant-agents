@@ -15,6 +15,12 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from quant_agents.alternative_data_features import (
+    ALTERNATIVE_DATA_FEATURE_COLUMNS,
+    ALTERNATIVE_DATA_FEATURE_SCHEMA_VERSION,
+    ALTERNATIVE_DATA_RAW_COLUMN_ALIASES,
+    build_alternative_data_feature_bundle,
+)
 from quant_agents.config import Settings
 from quant_agents.priority2_features import PRIORITY2_FEATURE_COLUMNS, build_priority2_feature_bundle
 from quant_agents.storage import latest_raw_dataset, symbol_slug
@@ -769,16 +775,25 @@ def _load_local_feature_table(path: Path) -> pd.DataFrame:
     output = frame.copy()
     output["timestamp"] = pd.to_datetime(output["timestamp"], utc=True, errors="coerce")
     rename_map: dict[str, str] = {}
+    combined_aliases = {
+        **ALTERNATIVE_DATA_RAW_COLUMN_ALIASES,
+        **_LOCAL_FEATURE_COLUMN_ALIASES,
+    }
     for column in output.columns:
-        normalized = _LOCAL_FEATURE_COLUMN_ALIASES.get(str(column).strip().lower())
+        normalized = combined_aliases.get(str(column).strip().lower())
         if normalized:
             rename_map[column] = normalized
     output = output.rename(columns=rename_map)
-    keep_columns = ["timestamp", *[col for col in PRIORITY2_FEATURE_COLUMNS if col in output.columns]]
-    output = output.loc[:, keep_columns]
-    for column in PRIORITY2_FEATURE_COLUMNS:
-        if column in output.columns:
-            output[column] = pd.to_numeric(output[column], errors="coerce")
+
+    raw_local_columns = sorted(set(ALTERNATIVE_DATA_RAW_COLUMN_ALIASES.values()))
+    keep_columns = [
+        "timestamp",
+        *[col for col in PRIORITY2_FEATURE_COLUMNS if col in output.columns],
+        *[col for col in raw_local_columns if col in output.columns],
+    ]
+    output = output.loc[:, list(dict.fromkeys(keep_columns))]
+    for column in [col for col in output.columns if col != "timestamp"]:
+        output[column] = pd.to_numeric(output[column], errors="coerce")
     return (
         output.dropna(subset=["timestamp"])
         .sort_values("timestamp")
@@ -924,27 +939,75 @@ def _with_local_feature_overrides(
     aligned: pd.DataFrame,
     market_timestamps: pd.Series,
     local_features_path: Path,
-) -> tuple[pd.DataFrame, bool]:
+) -> tuple[pd.DataFrame, bool, dict[str, Any], list[str]]:
     local_frame = _load_local_feature_table(local_features_path)
     if local_frame.empty:
-        return aligned, False
+        return aligned, False, {"local_rows": 0}, ["local_priority2_overrides_empty"]
+    alternative_bundle = build_alternative_data_feature_bundle(local_frame)
+    input_coverage = dict(alternative_bundle.diagnostics.get("input_coverage", {}))
+    alternative_inputs_available = any(float(value) > 0.0 for value in input_coverage.values())
+    local_with_alternatives = local_frame.copy()
+    if alternative_inputs_available:
+        local_with_alternatives = pd.merge(
+            local_with_alternatives,
+            alternative_bundle.feature_frame,
+            how="left",
+            on="timestamp",
+            suffixes=("", "__alternative"),
+        )
+    for column in ALTERNATIVE_DATA_FEATURE_COLUMNS:
+        derived_column = f"{column}__alternative"
+        if column not in local_with_alternatives.columns:
+            local_with_alternatives[column] = np.nan
+        if alternative_inputs_available and derived_column in local_with_alternatives.columns:
+            existing = pd.to_numeric(local_with_alternatives[column], errors="coerce")
+            derived = pd.to_numeric(local_with_alternatives[derived_column], errors="coerce")
+            local_with_alternatives[column] = np.where(existing.notna(), existing, derived)
+            local_with_alternatives = local_with_alternatives.drop(columns=[derived_column])
+        local_with_alternatives[column] = pd.to_numeric(local_with_alternatives[column], errors="coerce")
     market = pd.DataFrame({"timestamp": pd.to_datetime(market_timestamps, utc=True, errors="coerce")})
     market = market.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     local_aligned = pd.merge_asof(
         market,
-        local_frame.rename(columns={"timestamp": "local_timestamp"}),
+        local_with_alternatives.rename(columns={"timestamp": "local_timestamp"}),
         left_on="timestamp",
         right_on="local_timestamp",
         direction="backward",
         allow_exact_matches=True,
     )
     output = aligned.copy()
+    override_non_null_by_column: dict[str, int] = {}
     for column in PRIORITY2_FEATURE_COLUMNS:
         if column in local_aligned.columns:
             local_series = pd.to_numeric(local_aligned[column], errors="coerce")
             current = pd.to_numeric(output[column], errors="coerce")
             output[column] = np.where(local_series.notna(), local_series, current)
-    return output, True
+            override_non_null_by_column[column] = int(local_series.notna().sum())
+    override_non_null_total = int(sum(override_non_null_by_column.values()))
+    alternative_non_null_by_feature = {
+        column: int(pd.to_numeric(local_with_alternatives[column], errors="coerce").notna().sum())
+        for column in ALTERNATIVE_DATA_FEATURE_COLUMNS
+        if column in local_with_alternatives.columns
+    }
+    diagnostics = {
+        "local_rows": int(len(local_with_alternatives)),
+        "override_non_null_total": override_non_null_total,
+        "override_non_null_by_column": override_non_null_by_column,
+        "alternative_data_feature_module": {
+            "contract": alternative_bundle.contract,
+            "schema_version": alternative_bundle.schema_version,
+            "applied_from_raw_inputs": bool(alternative_inputs_available),
+            "diagnostics": alternative_bundle.diagnostics,
+            "reason_codes": list(alternative_bundle.reason_codes),
+            "non_null_by_feature": alternative_non_null_by_feature,
+        },
+    }
+    extra_reason_codes: list[str] = []
+    if any(count > 0 for count in alternative_non_null_by_feature.values()):
+        extra_reason_codes.append("local_alternative_data_proxy_features_derived")
+    if override_non_null_total > 0:
+        extra_reason_codes.append("local_priority2_overrides_non_null")
+    return output, override_non_null_total > 0, diagnostics, extra_reason_codes
 
 
 def _sanitize_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1391,15 +1454,22 @@ def retrieve_priority2_external_features(
         reason_codes.append("priority2_proxy_fallback_from_market_frame")
 
     overrides_applied = False
+    local_override_diagnostics: dict[str, Any] = {"local_rows": 0}
     if local_feature_overrides_path is not None:
         resolved_override = local_feature_overrides_path.expanduser().resolve()
         if resolved_override.exists():
-            aligned, overrides_applied = _with_local_feature_overrides(
+            (
+                aligned,
+                overrides_applied,
+                local_override_diagnostics,
+                local_override_reason_codes,
+            ) = _with_local_feature_overrides(
                 aligned=aligned,
                 market_timestamps=market_timestamps,
                 local_features_path=resolved_override,
             )
             reason_codes.append("local_priority2_overrides_applied" if overrides_applied else "local_priority2_overrides_empty")
+            reason_codes.extend(local_override_reason_codes)
         else:
             reason_codes.append("local_priority2_overrides_missing")
 
@@ -1477,6 +1547,8 @@ def retrieve_priority2_external_features(
             "market_row_count": int(len(market_timestamps)),
         },
         "feature_columns": list(PRIORITY2_FEATURE_COLUMNS),
+        "alternative_data_feature_columns": list(ALTERNATIVE_DATA_FEATURE_COLUMNS),
+        "alternative_data_feature_schema_version": ALTERNATIVE_DATA_FEATURE_SCHEMA_VERSION,
         "row_count": int(len(sanitized)),
         "coverage_ratio": coverage_ratio,
         "coverage_quality_band": quality_band,
@@ -1492,6 +1564,7 @@ def retrieve_priority2_external_features(
             if local_feature_overrides_path is not None
             else None
         ),
+        "local_override_diagnostics": local_override_diagnostics,
         "reason_codes": sorted(set(reason_codes)),
         "artifacts": {
             "output_dir": str(output_dir),

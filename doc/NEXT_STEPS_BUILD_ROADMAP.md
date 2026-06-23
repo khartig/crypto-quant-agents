@@ -18,7 +18,8 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Priority 2 status: **in progress (actively implemented)**.
   - Agent-plane and evaluator paths now enforce Priority 2 feature-column selection plus Priority 2 external-data quality-gate behavior consistently with trigger-model paths.
   - OpenClaw request mapping and CLI wiring now expose Priority 2 feature-column and quality-gate controls end-to-end.
-  - Remaining Priority 2 focus: complete external derivatives/whale retrieval contract hardening, ingestion expansion, and downstream lift/latency validation artifacts.
+  - Roadmap item 8 deliverables are now implemented with a schema-versioned alternative-data feature module and quality/latency reporting script.
+  - Roadmap item 9 deliverables are now implemented with labeling/objective benchmark + frontier plot generation and a dedicated labeling specification doc.
 
 ## Execution protocol (strict sequencing)
 - Work strictly in order: **Priority 0 → Priority 1 → Priority 2 → Priority 3**.
@@ -114,6 +115,9 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Deliverables:
   - Alternative data feature module with schema/versioning.
   - Data quality and latency validation report.
+- Implementation assets:
+  - `src/quant_agents/alternative_data_features.py`
+  - `scripts/validate_priority2_alternative_data_quality.py`
 
 ### 9) Improve labeling/objectives beyond simple directional framing
 - Build tasks:
@@ -123,6 +127,9 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Deliverables:
   - Labeling specification and benchmark comparison.
   - Actionable coverage vs precision frontier plots.
+- Implementation assets:
+  - `doc/TRIGGER_LABELING_OBJECTIVE_SPEC.md`
+  - `scripts/run_labeling_objective_benchmark.py`
 
 ## Priority 3 — Risk, execution, and deployment hardening
 ### 10) Upgrade position sizing and risk budget logic
