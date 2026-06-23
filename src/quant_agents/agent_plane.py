@@ -35,7 +35,10 @@ from quant_agents.ollama_client import OllamaClient
 from quant_agents.paper_trading import execute_paper_trade_intent
 from quant_agents.priority2_features import (
     PRIORITY2_FEATURE_COLUMNS,
+    Priority2FeatureBundle,
+    apply_priority2_feature_column_selection,
     build_priority2_feature_bundle,
+    normalize_priority2_feature_columns,
     write_priority2_feature_artifacts,
 )
 from quant_agents.regime_detection import RegimeDetectionConfig, detect_regime_from_frame
@@ -116,7 +119,13 @@ class AgentPlaneConfig:
     ensemble_exploration_weight: float = 0.08
     ensemble_turnover_penalty_bps: float = 8.0
     priority2_features_enabled: bool = True
+    priority2_feature_columns: tuple[str, ...] = PRIORITY2_FEATURE_COLUMNS
     priority2_external_features_path: Path | None = None
+    priority2_quality_gate_enabled: bool = True
+    priority2_quality_min_external_raw_coverage: float = 0.20
+    priority2_quality_min_non_zero_coverage: float = 0.05
+    priority2_quality_max_fallback_rate: float = 0.80
+    priority2_quality_max_staleness_seconds: float = 86400.0
     source_data_path: Path | None = None
     strategy_fast_window: int | None = None
     strategy_slow_window: int | None = None
@@ -837,6 +846,216 @@ def _normalize_probability_votes(votes: dict[str, float]) -> dict[str, float]:
     return {key: float(value / total) for key, value in clean.items()}
 
 
+def _safe_finite_float(value: Any, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(parsed):
+        return float(default)
+    return float(parsed)
+
+
+def _priority2_metric_mean(
+    diagnostics: dict[str, Any],
+    *,
+    key: str,
+    selected_feature_columns: tuple[str, ...],
+    default: float,
+) -> float:
+    raw_map = diagnostics.get(key, {})
+    if not isinstance(raw_map, dict) or not selected_feature_columns:
+        return float(default)
+    values: list[float] = []
+    for column in selected_feature_columns:
+        values.append(_safe_finite_float(raw_map.get(str(column)), default=default))
+    if not values:
+        return float(default)
+    return float(np.mean(np.asarray(values, dtype=float)))
+
+
+def _extract_priority2_staleness_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+        if np.isfinite(parsed):
+            return max(0.0, parsed)
+        return None
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        try:
+            parsed = float(trimmed)
+        except ValueError:
+            return None
+        if np.isfinite(parsed):
+            return max(0.0, parsed)
+        return None
+    if isinstance(value, dict):
+        for key in (
+            "seconds",
+            "age_seconds",
+            "staleness_seconds",
+            "max_age_seconds",
+            "p95",
+            "median",
+            "max",
+        ):
+            if key in value:
+                candidate = _extract_priority2_staleness_seconds(value.get(key))
+                if candidate is not None:
+                    return candidate
+    return None
+
+
+def _scale_higher_is_better(observed: float, *, minimum: float) -> float:
+    if minimum <= 0.0:
+        return 1.0
+    return float(np.clip(observed / minimum, 0.0, 1.0))
+
+
+def _scale_lower_is_better(observed: float, *, maximum: float) -> float:
+    if maximum <= 0.0:
+        return 1.0 if observed <= 0.0 else 0.0
+    return float(np.clip(1.0 - (observed / maximum), 0.0, 1.0))
+
+
+def _apply_priority2_quality_gate(
+    *,
+    bundle: Priority2FeatureBundle,
+    selected_feature_columns: tuple[str, ...],
+    quality_gate_enabled: bool,
+    min_external_raw_coverage: float,
+    min_non_zero_coverage: float,
+    max_fallback_rate: float,
+    max_staleness_seconds: float,
+) -> Priority2FeatureBundle:
+    selected_columns = normalize_priority2_feature_columns(selected_feature_columns)
+    diagnostics = dict(bundle.diagnostics)
+    reason_codes = sorted(set(list(bundle.reason_codes)))
+    feature_frame = bundle.feature_frame.copy(deep=True)
+    feature_snapshot = dict(bundle.feature_snapshot)
+    observed_external_raw_coverage = _safe_finite_float(
+        diagnostics.get(
+            "selected_external_raw_coverage",
+            _priority2_metric_mean(
+                diagnostics,
+                key="external_raw_coverage",
+                selected_feature_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        default=0.0,
+    )
+    observed_non_zero_coverage = _safe_finite_float(
+        diagnostics.get(
+            "selected_non_zero_coverage",
+            _priority2_metric_mean(
+                diagnostics,
+                key="effective_non_zero_coverage",
+                selected_feature_columns=selected_columns,
+                default=0.0,
+            ),
+        ),
+        default=0.0,
+    )
+    observed_fallback_rate = _safe_finite_float(
+        diagnostics.get(
+            "selected_proxy_fallback_rate",
+            _priority2_metric_mean(
+                diagnostics,
+                key="proxy_fallback_rate",
+                selected_feature_columns=selected_columns,
+                default=1.0,
+            ),
+        ),
+        default=1.0,
+    )
+    staleness_payload = diagnostics.get("external_staleness_seconds", {})
+    observed_staleness_p95: float | None = None
+    if isinstance(staleness_payload, dict):
+        staleness_p95_raw = staleness_payload.get("p95")
+        if staleness_p95_raw is not None:
+            observed_staleness_p95 = _safe_finite_float(staleness_p95_raw, default=0.0)
+
+    gate_failures: list[str] = []
+    gate_applied = bool(quality_gate_enabled) and bool(bundle.features_enabled)
+    if gate_applied:
+        external_requested = bool(bundle.external_features_path)
+        external_loaded = bool(diagnostics.get("external_features_loaded", False))
+        if external_requested and (not external_loaded):
+            gate_failures.append("external_features_not_loaded")
+        if external_requested and observed_external_raw_coverage < float(min_external_raw_coverage):
+            gate_failures.append("external_raw_coverage_below_minimum")
+        if observed_non_zero_coverage < float(min_non_zero_coverage):
+            gate_failures.append("non_zero_coverage_below_minimum")
+        if external_requested and observed_fallback_rate > float(max_fallback_rate):
+            gate_failures.append("fallback_rate_above_maximum")
+        if (
+            external_requested
+            and observed_staleness_p95 is not None
+            and observed_staleness_p95 > float(max_staleness_seconds)
+        ):
+            gate_failures.append("staleness_p95_above_maximum")
+
+    diagnostics["quality_gate"] = {
+        "enabled": bool(quality_gate_enabled),
+        "applied": bool(gate_applied),
+        "selected_columns": list(selected_columns),
+        "thresholds": {
+            "min_external_raw_coverage": float(min_external_raw_coverage),
+            "min_non_zero_coverage": float(min_non_zero_coverage),
+            "max_fallback_rate": float(max_fallback_rate),
+            "max_staleness_seconds": float(max_staleness_seconds),
+        },
+        "observed": {
+            "selected_external_raw_coverage": float(observed_external_raw_coverage),
+            "selected_non_zero_coverage": float(observed_non_zero_coverage),
+            "selected_fallback_rate": float(observed_fallback_rate),
+            "staleness_p95_seconds": observed_staleness_p95,
+        },
+        "passed": bool(len(gate_failures) == 0) if gate_applied else None,
+        "failures": list(gate_failures),
+    }
+    diagnostics["quality_score"] = float(observed_external_raw_coverage * observed_non_zero_coverage)
+    diagnostics["selected_priority2_feature_columns"] = list(selected_columns)
+
+    if gate_applied and gate_failures:
+        for column in selected_columns:
+            if column in feature_frame.columns:
+                feature_frame[column] = 0.0
+            if column in feature_snapshot:
+                feature_snapshot[column] = 0.0
+        diagnostics["quality_score"] = 0.0
+        diagnostics["quality_gate"]["applied_zero_fallback"] = True
+        reason_codes.append("priority2_quality_gate_failed")
+    elif gate_applied:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("priority2_quality_gate_passed")
+    else:
+        diagnostics["quality_gate"]["applied_zero_fallback"] = False
+        reason_codes.append("priority2_quality_gate_skipped")
+
+    updated_snapshot = {
+        column: float(pd.to_numeric(feature_frame[column], errors="coerce").fillna(0.0).iloc[-1])
+        if (column in feature_frame.columns and not feature_frame.empty)
+        else 0.0
+        for column in PRIORITY2_FEATURE_COLUMNS
+    }
+    return Priority2FeatureBundle(
+        contract=bundle.contract,
+        created_at_utc=bundle.created_at_utc,
+        features_enabled=bundle.features_enabled,
+        external_features_path=bundle.external_features_path,
+        feature_frame=feature_frame,
+        feature_snapshot=updated_snapshot,
+        reason_codes=sorted(set(reason_codes)),
+        diagnostics=diagnostics,
+    )
+
+
 def _compute_phase1_feature_context(
     frame: pd.DataFrame,
     *,
@@ -846,6 +1065,7 @@ def _compute_phase1_feature_context(
     regime_persistence_bars: int,
     regime_ablation_mode: bool = False,
     regime_disabled: bool = False,
+    priority2_feature_columns: tuple[str, ...] = PRIORITY2_FEATURE_COLUMNS,
     priority2_feature_snapshot: dict[str, float] | None = None,
     priority2_reason_codes: list[str] | None = None,
     priority2_diagnostics: dict[str, Any] | None = None,
@@ -1021,6 +1241,9 @@ def _compute_phase1_feature_context(
     normalized_priority2_diagnostics = (
         dict(priority2_diagnostics) if isinstance(priority2_diagnostics, dict) else {}
     )
+    normalized_priority2_feature_columns = list(
+        normalize_priority2_feature_columns(priority2_feature_columns)
+    )
     quality_score = normalized_priority2_diagnostics.get("quality_score")
     try:
         if quality_score is not None:
@@ -1042,7 +1265,7 @@ def _compute_phase1_feature_context(
         "priority2_feature_snapshot": normalized_priority2_snapshot,
         "priority2_reason_codes": normalized_priority2_reason_codes,
         "priority2_diagnostics": normalized_priority2_diagnostics,
-        "priority2_feature_columns": list(PRIORITY2_FEATURE_COLUMNS),
+        "priority2_feature_columns": normalized_priority2_feature_columns,
         "reason_codes": sorted(set([*base_reason_codes, *normalized_priority2_reason_codes])),
     }
 
@@ -2552,10 +2775,26 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
 
     def phase1_feature_runner() -> dict[str, Any]:
         nonlocal priority2_feature_parquet_path, priority2_feature_contract_path
+        selected_priority2_feature_columns = normalize_priority2_feature_columns(
+            config.priority2_feature_columns
+        )
         priority2_bundle = build_priority2_feature_bundle(
             market_frame,
             features_enabled=bool(config.priority2_features_enabled),
             external_features_path=config.priority2_external_features_path,
+        )
+        priority2_bundle = apply_priority2_feature_column_selection(
+            bundle=priority2_bundle,
+            selected_feature_columns=selected_priority2_feature_columns,
+        )
+        priority2_bundle = _apply_priority2_quality_gate(
+            bundle=priority2_bundle,
+            selected_feature_columns=selected_priority2_feature_columns,
+            quality_gate_enabled=bool(config.priority2_quality_gate_enabled),
+            min_external_raw_coverage=float(config.priority2_quality_min_external_raw_coverage),
+            min_non_zero_coverage=float(config.priority2_quality_min_non_zero_coverage),
+            max_fallback_rate=float(config.priority2_quality_max_fallback_rate),
+            max_staleness_seconds=float(config.priority2_quality_max_staleness_seconds),
         )
         priority2_artifacts = write_priority2_feature_artifacts(
             quant_data_root=settings.quant_data_root,
@@ -2579,11 +2818,28 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "regime_enabled": bool(regime_enabled),
             "regime_ablation_mode": bool(regime_ablation_active),
             "priority2_features_enabled": bool(config.priority2_features_enabled),
+            "priority2_feature_columns": list(selected_priority2_feature_columns),
             "priority2_external_features_path": (
                 str(config.priority2_external_features_path)
                 if config.priority2_external_features_path is not None
                 else None
             ),
+            "priority2_quality_gate_enabled": bool(config.priority2_quality_gate_enabled),
+            "priority2_quality_gate_thresholds": {
+                "min_external_raw_coverage": float(
+                    np.clip(config.priority2_quality_min_external_raw_coverage, 0.0, 1.0)
+                ),
+                "min_non_zero_coverage": float(
+                    np.clip(config.priority2_quality_min_non_zero_coverage, 0.0, 1.0)
+                ),
+                "max_fallback_rate": float(
+                    np.clip(config.priority2_quality_max_fallback_rate, 0.0, 1.0)
+                ),
+                "max_staleness_seconds": max(
+                    0.0,
+                    float(config.priority2_quality_max_staleness_seconds),
+                ),
+            },
             "priority2_feature_artifacts": {
                 "priority2_feature_parquet": str(priority2_feature_parquet_path),
                 "priority2_feature_contract": str(priority2_feature_contract_path),
@@ -2596,6 +2852,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                 regime_persistence_bars=config.regime_persistence_bars,
                 regime_ablation_mode=bool(regime_ablation_active),
                 regime_disabled=not regime_enabled,
+                priority2_feature_columns=tuple(selected_priority2_feature_columns),
                 priority2_feature_snapshot=dict(priority2_bundle.feature_snapshot),
                 priority2_reason_codes=list(priority2_bundle.reason_codes),
                 priority2_diagnostics=dict(priority2_bundle.diagnostics),
@@ -3253,6 +3510,34 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             reverse=True,
         )
         ensemble_reason_codes = [str(code) for code in list(strategy_signal.ensemble_reason_codes)]
+        priority2_diagnostics_payload = phase1_feature_context.get("priority2_diagnostics")
+        priority2_diagnostics = (
+            dict(priority2_diagnostics_payload)
+            if isinstance(priority2_diagnostics_payload, dict)
+            else {}
+        )
+        priority2_quality_gate_payload = priority2_diagnostics.get("quality_gate")
+        priority2_quality_gate = (
+            dict(priority2_quality_gate_payload)
+            if isinstance(priority2_quality_gate_payload, dict)
+            else {}
+        )
+        priority2_quality_gate_applied = bool(priority2_quality_gate.get("applied", False))
+        priority2_quality_gate_passed = bool(priority2_quality_gate.get("passed", True))
+        priority2_quality_gate_failure_payload = priority2_quality_gate.get(
+            "failures",
+            priority2_quality_gate.get("failure_reason_codes", []),
+        )
+        priority2_quality_gate_failures = [
+            str(code)
+            for code in list(priority2_quality_gate_failure_payload)
+            if str(code).strip()
+        ]
+        priority2_selected_feature_columns = [
+            str(column)
+            for column in list(phase1_feature_context.get("priority2_feature_columns", []))
+            if str(column).strip()
+        ]
 
         def register_reason(reason_code: str, severity: Literal["block", "fail"], detail: str) -> None:
             if severity == "fail":
@@ -3342,6 +3627,11 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                 "priority2_reason_codes",
                 [],
             ),
+            "phase1_priority2_feature_columns": priority2_selected_feature_columns,
+            "phase1_priority2_quality_gate_applied": priority2_quality_gate_applied,
+            "phase1_priority2_quality_gate_passed": priority2_quality_gate_passed,
+            "phase1_priority2_quality_gate_failures": priority2_quality_gate_failures,
+            "phase1_priority2_quality_score": priority2_diagnostics.get("quality_score"),
             "self_critique_pass": self_critique_pass,
             "self_critique_score": self_critique_score,
             "self_critique_highest_severity": self_critique_highest,
@@ -3372,6 +3662,21 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "walkforward_quality_low_cutoff": 0.40,
             "walkforward_quality_medium_cutoff": 0.55,
             "walkforward_quality_high_cutoff": 0.70,
+            "priority2_features_enabled": bool(config.priority2_features_enabled),
+            "priority2_quality_gate_enabled": bool(config.priority2_quality_gate_enabled),
+            "priority2_quality_min_external_raw_coverage": float(
+                np.clip(config.priority2_quality_min_external_raw_coverage, 0.0, 1.0)
+            ),
+            "priority2_quality_min_non_zero_coverage": float(
+                np.clip(config.priority2_quality_min_non_zero_coverage, 0.0, 1.0)
+            ),
+            "priority2_quality_max_fallback_rate": float(
+                np.clip(config.priority2_quality_max_fallback_rate, 0.0, 1.0)
+            ),
+            "priority2_quality_max_staleness_seconds": max(
+                0.0,
+                float(config.priority2_quality_max_staleness_seconds),
+            ),
             "self_critique_min_score": config.self_critique_min_score,
             "ensemble_min_selected_arms": 1.0,
         }
@@ -3560,6 +3865,23 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
                     failure_reason_code=f"risk_block_{action}_regime_confidence_low",
                     failure_severity="block",
                     failure_detail="Detected regime confidence is below the actionable threshold.",
+                )
+            if bool(config.priority2_features_enabled) and priority2_quality_gate_applied:
+                trace_check(
+                    gate="priority2",
+                    metric="quality_gate_passed",
+                    observed_value={
+                        "passed": priority2_quality_gate_passed,
+                        "failure_reason_codes": priority2_quality_gate_failures,
+                    },
+                    threshold={"passed": True},
+                    passed=priority2_quality_gate_passed,
+                    failure_reason_code=f"risk_block_{action}_priority2_quality_gate_failed",
+                    failure_severity="block",
+                    failure_detail=(
+                        "Priority 2 feature quality gate failed; actionable trade is blocked until "
+                        "external feature quality recovers."
+                    ),
                 )
             quality_very_low = walkforward_quality_band == "very_low"
             trace_check(
@@ -4150,10 +4472,27 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "regime_ablation_mode_requested": bool(config.regime_ablation_mode),
             "regime_ablation_mode": bool(regime_ablation_active),
             "priority2_features_enabled": bool(config.priority2_features_enabled),
+            "priority2_feature_columns": list(
+                normalize_priority2_feature_columns(config.priority2_feature_columns)
+            ),
             "priority2_external_features_path": (
                 str(config.priority2_external_features_path)
                 if config.priority2_external_features_path is not None
                 else None
+            ),
+            "priority2_quality_gate_enabled": bool(config.priority2_quality_gate_enabled),
+            "priority2_quality_min_external_raw_coverage": float(
+                np.clip(config.priority2_quality_min_external_raw_coverage, 0.0, 1.0)
+            ),
+            "priority2_quality_min_non_zero_coverage": float(
+                np.clip(config.priority2_quality_min_non_zero_coverage, 0.0, 1.0)
+            ),
+            "priority2_quality_max_fallback_rate": float(
+                np.clip(config.priority2_quality_max_fallback_rate, 0.0, 1.0)
+            ),
+            "priority2_quality_max_staleness_seconds": max(
+                0.0,
+                float(config.priority2_quality_max_staleness_seconds),
             ),
             "ensemble_mode": ensemble_mode,
             "ensemble_enabled_arms": list(enabled_arms),
@@ -4212,8 +4551,35 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "phase1_regime_ablation_mode_requested": bool(config.regime_ablation_mode),
             "phase1_regime_ablation_mode": bool(regime_ablation_active),
             "priority2_features_enabled": bool(config.priority2_features_enabled),
+            "priority2_feature_columns": list(phase1_feature_context.get("priority2_feature_columns", [])),
             "priority2_feature_quality_score": (
                 phase1_feature_context.get("priority2_diagnostics", {}).get("quality_score")
+                if isinstance(phase1_feature_context.get("priority2_diagnostics"), dict)
+                else None
+            ),
+            "priority2_quality_gate_applied": (
+                phase1_feature_context.get("priority2_diagnostics", {})
+                .get("quality_gate", {})
+                .get("applied")
+                if isinstance(phase1_feature_context.get("priority2_diagnostics"), dict)
+                else None
+            ),
+            "priority2_quality_gate_passed": (
+                phase1_feature_context.get("priority2_diagnostics", {})
+                .get("quality_gate", {})
+                .get("passed")
+                if isinstance(phase1_feature_context.get("priority2_diagnostics"), dict)
+                else None
+            ),
+            "priority2_quality_gate_failure_reason_codes": (
+                phase1_feature_context.get("priority2_diagnostics", {})
+                .get("quality_gate", {})
+                .get(
+                    "failures",
+                    phase1_feature_context.get("priority2_diagnostics", {})
+                    .get("quality_gate", {})
+                    .get("failure_reason_codes"),
+                )
                 if isinstance(phase1_feature_context.get("priority2_diagnostics"), dict)
                 else None
             ),

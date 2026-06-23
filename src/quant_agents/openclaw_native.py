@@ -136,7 +136,13 @@ class OpenClawOrchestrationRequest:
     paper_fee_bps: float
     paper_slippage_bps: float
     priority2_features_enabled: bool
+    priority2_feature_columns: tuple[str, ...]
     priority2_external_features_path: str | None
+    priority2_quality_gate_enabled: bool
+    priority2_quality_min_external_raw_coverage: float
+    priority2_quality_min_non_zero_coverage: float
+    priority2_quality_max_fallback_rate: float
+    priority2_quality_max_staleness_seconds: float
     source_data_path: str | None = None
 
     @staticmethod
@@ -401,6 +407,16 @@ class OpenClawOrchestrationRequest:
                 payload.get("priority2_features_enabled"),
                 default=bool(settings.priority2_features_enabled),
             ),
+            priority2_feature_columns=tuple(
+                str(column).strip()
+                for column in (
+                    payload.get("priority2_feature_columns")
+                    if isinstance(payload.get("priority2_feature_columns"), list)
+                    else settings.priority2_feature_columns
+                )
+                if str(column).strip()
+            )
+            or tuple(settings.priority2_feature_columns),
             priority2_external_features_path=(
                 str(payload["priority2_external_features_path"])
                 if payload.get("priority2_external_features_path")
@@ -409,6 +425,55 @@ class OpenClawOrchestrationRequest:
                     if settings.priority2_external_features_path
                     else None
                 )
+            ),
+            priority2_quality_gate_enabled=_coerce_bool(
+                payload.get("priority2_quality_gate_enabled"),
+                default=bool(settings.priority2_quality_gate_enabled),
+            ),
+            priority2_quality_min_external_raw_coverage=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "priority2_quality_min_external_raw_coverage",
+                            settings.priority2_quality_min_external_raw_coverage,
+                        )
+                    ),
+                ),
+            ),
+            priority2_quality_min_non_zero_coverage=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "priority2_quality_min_non_zero_coverage",
+                            settings.priority2_quality_min_non_zero_coverage,
+                        )
+                    ),
+                ),
+            ),
+            priority2_quality_max_fallback_rate=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "priority2_quality_max_fallback_rate",
+                            settings.priority2_quality_max_fallback_rate,
+                        )
+                    ),
+                ),
+            ),
+            priority2_quality_max_staleness_seconds=max(
+                0.0,
+                float(
+                    payload.get(
+                        "priority2_quality_max_staleness_seconds",
+                        settings.priority2_quality_max_staleness_seconds,
+                    )
+                ),
             ),
             source_data_path=(str(payload["source_data_path"]) if payload.get("source_data_path") else None),
         )
@@ -496,9 +561,27 @@ class OpenClawOrchestrationRequest:
             ensemble_exploration_weight=max(0.0, float(self.ensemble_exploration_weight)),
             ensemble_turnover_penalty_bps=max(0.0, float(self.ensemble_turnover_penalty_bps)),
             priority2_features_enabled=bool(self.priority2_features_enabled),
+            priority2_feature_columns=tuple(self.priority2_feature_columns),
             priority2_external_features_path=Path(self.priority2_external_features_path).expanduser().resolve()
             if self.priority2_external_features_path
             else None,
+            priority2_quality_gate_enabled=bool(self.priority2_quality_gate_enabled),
+            priority2_quality_min_external_raw_coverage=max(
+                0.0,
+                min(1.0, float(self.priority2_quality_min_external_raw_coverage)),
+            ),
+            priority2_quality_min_non_zero_coverage=max(
+                0.0,
+                min(1.0, float(self.priority2_quality_min_non_zero_coverage)),
+            ),
+            priority2_quality_max_fallback_rate=max(
+                0.0,
+                min(1.0, float(self.priority2_quality_max_fallback_rate)),
+            ),
+            priority2_quality_max_staleness_seconds=max(
+                0.0,
+                float(self.priority2_quality_max_staleness_seconds),
+            ),
             source_data_path=Path(self.source_data_path).expanduser().resolve()
             if self.source_data_path
             else None,

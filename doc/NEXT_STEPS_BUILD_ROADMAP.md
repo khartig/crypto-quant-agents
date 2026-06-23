@@ -8,6 +8,30 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Approval and contradiction rates were unchanged between enabled and ablated profiles in tested windows.
 - One key window (`uptrend_2025q2`) was skipped due to insufficient local bars.
 - Conclusion: immediate priority is evaluation/data rigor first, then redesign regime contribution and alpha inputs.
+## Implementation status snapshot (current)
+- Priority 0 status: **implemented and gate-validated**.
+  - Canonical windows and benchmark gate artifacts are present and CI-validated.
+  - Historical coverage gaps were closed for canonical windows used by segmented evaluation.
+- Priority 1 status: **implemented and validated**.
+  - Regime conditional policy mode, touchpoint ablations, contradiction split, and cost-pressure policy were integrated and validated through suite runs.
+  - Full-window Priority 1 evaluator evidence was generated after historical backfill unblocked all canonical windows.
+- Priority 2 status: **in progress (actively implemented)**.
+  - Agent-plane and evaluator paths now enforce Priority 2 feature-column selection plus Priority 2 external-data quality-gate behavior consistently with trigger-model paths.
+  - OpenClaw request mapping and CLI wiring now expose Priority 2 feature-column and quality-gate controls end-to-end.
+  - Remaining Priority 2 focus: complete external derivatives/whale retrieval contract hardening, ingestion expansion, and downstream lift/latency validation artifacts.
+
+## Execution protocol (strict sequencing)
+- Work strictly in order: **Priority 0 → Priority 1 → Priority 2 → Priority 3**.
+- Do not start Priority 1 until Priority 0 is both implemented and validation-tested.
+- Every priority transition requires passing the active gate checks and preserving reproducible artifact history.
+
+## Priority 0 implementation assets (current)
+- Canonical windows config: `scripts/regime_window_slices.json`.
+- Single-command benchmark gate harness: `scripts/run_regime_benchmark_gate.py`.
+- Presubmit/CI validator: `scripts/validate_regime_benchmark_gate.py`.
+- Baseline snapshot: `doc/REGIME_BENCHMARK_BASELINE.json`.
+- Pass/fail policy spec: `doc/REGIME_BENCHMARK_PASS_FAIL_CRITERIA.md`.
+- CI enforcement entrypoint: `.github/workflows/ci.yml` (`validate_regime_benchmark_gate.py`).
 
 ## Priority 0 — Immediate (highest impact, unblockers)
 ### 1) Close historical coverage gaps and freeze evaluation slices

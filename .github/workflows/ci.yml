@@ -30,4 +30,4 @@ jobs:
         run: python scripts/validate_walkforward_policy_suite.py
 
       - name: Validate regime benchmark gate artifacts
-        run: python scripts/validate_regime_benchmark_gate.py
+        run: python scripts/validate_regime_benchmark_gate.py --summary-json scripts/regime_benchmark_summary_fixture.json

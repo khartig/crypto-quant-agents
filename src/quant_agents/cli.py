@@ -420,6 +420,51 @@ def _base_parser() -> argparse.ArgumentParser:
         help="Optional CSV/JSON/Parquet path with externally computed Priority 2 feature columns.",
     )
     agent_plane.add_argument(
+        "--priority2-feature-columns",
+        default=None,
+        help=(
+            "Comma-separated Priority 2 feature columns to enable "
+            "(for example open_interest_feature,participant_positioning_feature). "
+            "Use 'stable' for the default stable pair or 'all' for full Priority 2 set."
+        ),
+    )
+    agent_plane.add_argument(
+        "--priority2-quality-gate-enabled",
+        dest="priority2_quality_gate_enabled",
+        action="store_true",
+        help="Enable Priority 2 external-data quality gate in phase-1 context (default from settings).",
+    )
+    agent_plane.add_argument(
+        "--no-priority2-quality-gate-enabled",
+        dest="priority2_quality_gate_enabled",
+        action="store_false",
+        help="Disable Priority 2 external-data quality gate in phase-1 context.",
+    )
+    agent_plane.add_argument(
+        "--priority2-quality-min-external-raw-coverage",
+        type=float,
+        default=None,
+        help="Priority 2 quality gate: minimum required external raw coverage ratio.",
+    )
+    agent_plane.add_argument(
+        "--priority2-quality-min-non-zero-coverage",
+        type=float,
+        default=None,
+        help="Priority 2 quality gate: minimum required non-zero feature coverage ratio.",
+    )
+    agent_plane.add_argument(
+        "--priority2-quality-max-fallback-rate",
+        type=float,
+        default=None,
+        help="Priority 2 quality gate: maximum allowed fallback/imputation ratio.",
+    )
+    agent_plane.add_argument(
+        "--priority2-quality-max-staleness-seconds",
+        type=float,
+        default=None,
+        help="Priority 2 quality gate: maximum allowed external feature staleness in seconds.",
+    )
+    agent_plane.add_argument(
         "--regime-policy-mode",
         choices=["legacy", "conditional_v2"],
         default=None,
@@ -488,6 +533,7 @@ def _base_parser() -> argparse.ArgumentParser:
     agent_plane.set_defaults(
         regime_enabled=None,
         priority2_features_enabled=None,
+        priority2_quality_gate_enabled=None,
         regime_touchpoint_prompting_enabled=None,
         regime_touchpoint_calibration_enabled=None,
         regime_touchpoint_self_critique_enabled=None,
@@ -1855,6 +1901,56 @@ def main(argv: list[str] | None = None) -> None:
                 ),
             ),
         )
+        priority2_feature_columns = _parse_priority2_feature_columns(
+            args.priority2_feature_columns,
+            default=tuple(settings.priority2_feature_columns),
+        )
+        priority2_quality_gate_enabled = (
+            bool(args.priority2_quality_gate_enabled)
+            if args.priority2_quality_gate_enabled is not None
+            else bool(settings.priority2_quality_gate_enabled)
+        )
+        priority2_quality_min_external_raw_coverage = min(
+            1.0,
+            max(
+                0.0,
+                (
+                    args.priority2_quality_min_external_raw_coverage
+                    if args.priority2_quality_min_external_raw_coverage is not None
+                    else settings.priority2_quality_min_external_raw_coverage
+                ),
+            ),
+        )
+        priority2_quality_min_non_zero_coverage = min(
+            1.0,
+            max(
+                0.0,
+                (
+                    args.priority2_quality_min_non_zero_coverage
+                    if args.priority2_quality_min_non_zero_coverage is not None
+                    else settings.priority2_quality_min_non_zero_coverage
+                ),
+            ),
+        )
+        priority2_quality_max_fallback_rate = min(
+            1.0,
+            max(
+                0.0,
+                (
+                    args.priority2_quality_max_fallback_rate
+                    if args.priority2_quality_max_fallback_rate is not None
+                    else settings.priority2_quality_max_fallback_rate
+                ),
+            ),
+        )
+        priority2_quality_max_staleness_seconds = max(
+            0.0,
+            (
+                args.priority2_quality_max_staleness_seconds
+                if args.priority2_quality_max_staleness_seconds is not None
+                else settings.priority2_quality_max_staleness_seconds
+            ),
+        )
         config = AgentPlaneConfig(
             exchange=exchange,
             symbol=symbol,
@@ -1995,6 +2091,7 @@ def main(argv: list[str] | None = None) -> None:
                 if args.priority2_features_enabled is not None
                 else bool(settings.priority2_features_enabled)
             ),
+            priority2_feature_columns=priority2_feature_columns,
             priority2_external_features_path=(
                 Path(args.priority2_external_features_path).expanduser().resolve()
                 if args.priority2_external_features_path
@@ -2004,6 +2101,15 @@ def main(argv: list[str] | None = None) -> None:
                     else None
                 )
             ),
+            priority2_quality_gate_enabled=bool(priority2_quality_gate_enabled),
+            priority2_quality_min_external_raw_coverage=float(
+                priority2_quality_min_external_raw_coverage
+            ),
+            priority2_quality_min_non_zero_coverage=float(
+                priority2_quality_min_non_zero_coverage
+            ),
+            priority2_quality_max_fallback_rate=float(priority2_quality_max_fallback_rate),
+            priority2_quality_max_staleness_seconds=float(priority2_quality_max_staleness_seconds),
             strategy_fast_window=max(2, int(args.fast_window)) if args.fast_window is not None else None,
             strategy_slow_window=max(3, int(args.slow_window)) if args.slow_window is not None else None,
             walk_forward_train_bars=max(

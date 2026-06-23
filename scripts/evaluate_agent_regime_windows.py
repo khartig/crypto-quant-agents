@@ -585,10 +585,24 @@ def _evaluate_windows_for_profiles(
                 regime_persistence_bars=settings.regime_persistence_bars,
                 regime_ablation_mode=bool(profile.regime_ablation_mode),
                 priority2_features_enabled=bool(settings.priority2_features_enabled),
+                priority2_feature_columns=tuple(settings.priority2_feature_columns),
                 priority2_external_features_path=(
                     Path(settings.priority2_external_features_path).expanduser().resolve()
                     if settings.priority2_external_features_path
                     else None
+                ),
+                priority2_quality_gate_enabled=bool(settings.priority2_quality_gate_enabled),
+                priority2_quality_min_external_raw_coverage=float(
+                    settings.priority2_quality_min_external_raw_coverage
+                ),
+                priority2_quality_min_non_zero_coverage=float(
+                    settings.priority2_quality_min_non_zero_coverage
+                ),
+                priority2_quality_max_fallback_rate=float(
+                    settings.priority2_quality_max_fallback_rate
+                ),
+                priority2_quality_max_staleness_seconds=float(
+                    settings.priority2_quality_max_staleness_seconds
                 ),
                 walk_forward_train_bars=settings.walk_forward_train_bars,
                 walk_forward_validate_bars=settings.walk_forward_validate_bars,

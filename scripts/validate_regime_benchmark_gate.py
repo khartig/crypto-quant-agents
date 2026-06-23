@@ -15,6 +15,24 @@ REQUIRED_PROFILE_METRICS: tuple[str, ...] = (
     "mean_max_drawdown",
     "mean_total_cost_return_drag",
 )
+REQUIRED_BENCHMARK_ARTIFACT_KEYS: tuple[str, ...] = (
+    "history_summary_json",
+    "history_summary_markdown",
+    "history_metric_snapshot_json",
+    "history_dataset_manifest_json",
+    "history_delta_vs_baseline_json",
+    "latest_summary_json",
+    "latest_summary_markdown",
+    "latest_metric_snapshot_json",
+    "latest_dataset_manifest_json",
+    "latest_delta_vs_baseline_json",
+)
+REQUIRED_RESULT_ARTIFACT_KEYS: tuple[str, ...] = (
+    "backtest_evaluation",
+    "confidence_calibration",
+    "risk_decision",
+    "run_manifest",
+)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -271,10 +289,39 @@ def _validate_summary(path: Path) -> list[str]:
                 errors.append(
                     f"results[{index}] arm_cost_return_drag must be an object"
                 )
+            artifacts = row.get("artifacts")
+            if not isinstance(artifacts, dict):
+                errors.append(f"results[{index}] artifacts must be an object")
+            else:
+                for key in REQUIRED_RESULT_ARTIFACT_KEYS:
+                    value = artifacts.get(key)
+                    if not isinstance(value, str) or not str(value).strip():
+                        errors.append(
+                            f"results[{index}] artifacts missing required key `{key}`"
+                        )
 
     benchmark_artifacts = payload.get("benchmark_artifacts")
-    if benchmark_artifacts is not None and not isinstance(benchmark_artifacts, dict):
-        errors.append("summary benchmark_artifacts must be an object when provided")
+    if benchmark_artifacts is not None:
+        if not isinstance(benchmark_artifacts, dict):
+            errors.append("summary benchmark_artifacts must be an object when provided")
+        else:
+            for key in REQUIRED_BENCHMARK_ARTIFACT_KEYS:
+                value = benchmark_artifacts.get(key)
+                if not isinstance(value, str) or not str(value).strip():
+                    errors.append(
+                        f"summary benchmark_artifacts missing required key `{key}`"
+                    )
+    gate_outcome = payload.get("gate_outcome")
+    if gate_outcome is not None:
+        if not isinstance(gate_outcome, dict):
+            errors.append("summary gate_outcome must be an object when provided")
+        else:
+            status = str(gate_outcome.get("status", "")).strip().lower()
+            if status not in {"pass", "fail"}:
+                errors.append("summary gate_outcome.status must be `pass` or `fail`")
+            checks = gate_outcome.get("checks")
+            if not isinstance(checks, list) or not checks:
+                errors.append("summary gate_outcome.checks must be a non-empty array")
     errors.extend(_validate_ablation_matrix(payload.get("ablation_matrix")))
     errors.extend(
         _validate_cost_decomposition(

@@ -137,6 +137,11 @@ Key environment variables (see `.env.example`):
   - `PRIORITY2_RETRIEVAL_MAX_POINTS`
   - `PRIORITY2_RETRIEVAL_BASE_URL`
   - `PRIORITY2_LOCAL_FEATURE_OVERRIDES_PATH`
+  - `PRIORITY2_QUALITY_GATE_ENABLED`
+  - `PRIORITY2_QUALITY_MIN_EXTERNAL_RAW_COVERAGE`
+  - `PRIORITY2_QUALITY_MIN_NON_ZERO_COVERAGE`
+  - `PRIORITY2_QUALITY_MAX_FALLBACK_RATE`
+  - `PRIORITY2_QUALITY_MAX_STALENESS_SECONDS`
   - `RANKED_FEATURES_ENABLED`
   - `RANKED_EXTERNAL_FEATURES_PATH`
   - `RANKED_FEATURE_COLUMNS`
@@ -213,6 +218,11 @@ Key environment variables (see `.env.example`):
   - `REGIME_ABLATION_MODE=0`
   - `PRIORITY2_FEATURES_ENABLED=1`
   - `PRIORITY2_FEATURE_COLUMNS=open_interest_feature,participant_positioning_feature` (stable default combo)
+  - `PRIORITY2_QUALITY_GATE_ENABLED=1`
+  - `PRIORITY2_QUALITY_MIN_EXTERNAL_RAW_COVERAGE=0.20`
+  - `PRIORITY2_QUALITY_MIN_NON_ZERO_COVERAGE=0.05`
+  - `PRIORITY2_QUALITY_MAX_FALLBACK_RATE=0.80`
+  - `PRIORITY2_QUALITY_MAX_STALENESS_SECONDS=86400`
   - `RANKED_FEATURES_ENABLED=1`
   - `RANKED_FEATURE_COLUMNS=flow_signed_volume_imbalance_24,derivatives_open_interest_delta_24,derivatives_basis_z_24,onchain_exchange_netflow_z_24,options_put_call_oi_ratio_z_24,regime_trend_strength_24,regime_momentum_vol_adj_24` (stable default combo)
   - `ORDERBOOK_FEATURES_ENABLED=0` (baseline default)
@@ -297,6 +307,7 @@ quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --re
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --no-regime-enabled
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --regime-ablation-mode
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-external-features-path /mnt/quant-data/external/priority2_features_btcusdt_1h.parquet
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns stable --priority2-quality-gate-enabled --priority2-quality-min-external-raw-coverage 0.20 --priority2-quality-min-non-zero-coverage 0.05 --priority2-quality-max-fallback-rate 0.80 --priority2-quality-max-staleness-seconds 86400
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5 --paper-slippage-bps 1
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --ensemble-mode adaptive --ensemble-arms sma_baseline,technical_composite,llm_context --ensemble-decay-horizon 48 --ensemble-exploration-weight 0.15 --ensemble-turnover-penalty-bps 8
 ```

@@ -1,0 +1,160 @@
+{
+  "contract": "segmented_regime_window_evaluation.v2",
+  "profile_summary": {
+    "regime_enabled": {
+      "approval_rate": 0.5,
+      "contradiction_rate": 0.1,
+      "directional_contradiction_rate": 0.08,
+      "quality_contradiction_rate": 0.02,
+      "mean_cost_pressure_score": 0.4,
+      "mean_net_total_return": 0.02,
+      "mean_sharpe": 0.25,
+      "mean_max_drawdown": -0.1,
+      "mean_total_cost_return_drag": 0.03,
+      "reason_code_distribution": {
+        "risk_block_sell_walkforward_quality_low": 2
+      }
+    },
+    "regime_ablated": {
+      "approval_rate": 0.45,
+      "contradiction_rate": 0.12,
+      "directional_contradiction_rate": 0.09,
+      "quality_contradiction_rate": 0.03,
+      "mean_cost_pressure_score": 0.42,
+      "mean_net_total_return": 0.01,
+      "mean_sharpe": 0.2,
+      "mean_max_drawdown": -0.12,
+      "mean_total_cost_return_drag": 0.035,
+      "reason_code_distribution": {
+        "risk_block_sell_walkforward_quality_low": 3
+      }
+    }
+  },
+  "results": [
+    {
+      "profile": "regime_enabled",
+      "window": "fixture_window",
+      "approval_rate": 1.0,
+      "contradiction_rate": 0.0,
+      "directional_contradiction_rate": 0.0,
+      "quality_contradiction_rate": 0.0,
+      "cost_pressure_score": 0.25,
+      "net_total_return": 0.03,
+      "sharpe": 0.3,
+      "max_drawdown": -0.08,
+      "total_cost_return_drag": 0.02,
+      "regime_bucket": "bullish",
+      "arm_cost_return_drag": {
+        "sma_baseline": 0.01
+      },
+      "artifacts": {
+        "backtest_evaluation": "/tmp/backtest_evaluation.json",
+        "confidence_calibration": "/tmp/confidence_calibration.json",
+        "risk_decision": "/tmp/risk_decision.json",
+        "run_manifest": "/tmp/run_manifest.json"
+      }
+    },
+    {
+      "profile": "regime_ablated",
+      "window": "fixture_window",
+      "approval_rate": 0.0,
+      "contradiction_rate": 1.0,
+      "directional_contradiction_rate": 1.0,
+      "quality_contradiction_rate": 0.0,
+      "cost_pressure_score": 0.5,
+      "net_total_return": -0.01,
+      "sharpe": 0.05,
+      "max_drawdown": -0.14,
+      "total_cost_return_drag": 0.04,
+      "regime_bucket": "bearish",
+      "arm_cost_return_drag": {
+        "sma_baseline": 0.02
+      },
+      "artifacts": {
+        "backtest_evaluation": "/tmp/backtest_evaluation_ablated.json",
+        "confidence_calibration": "/tmp/confidence_calibration_ablated.json",
+        "risk_decision": "/tmp/risk_decision_ablated.json",
+        "run_manifest": "/tmp/run_manifest_ablated.json"
+      }
+    }
+  ],
+  "window_comparison": [
+    {
+      "window": "fixture_window",
+      "regime_enabled": {
+        "approval_rate": 1.0,
+        "contradiction_rate": 0.0,
+        "net_total_return": 0.03,
+        "sharpe": 0.3,
+        "max_drawdown": -0.08,
+        "total_cost_return_drag": 0.02
+      },
+      "regime_ablated": {
+        "approval_rate": 0.0,
+        "contradiction_rate": 1.0,
+        "net_total_return": -0.01,
+        "sharpe": 0.05,
+        "max_drawdown": -0.14,
+        "total_cost_return_drag": 0.04
+      }
+    }
+  ],
+  "ablation_matrix": {
+    "contract": "priority1_ablation_matrix.v1",
+    "reference_profile": "regime_enabled",
+    "rows": [
+      {
+        "profile": "regime_enabled",
+        "touchpoints": {
+          "prompting": true,
+          "calibration": true,
+          "self_critique": true,
+          "risk_gate": true
+        },
+        "metrics": {
+          "mean_net_total_return": 0.02
+        }
+      },
+      {
+        "profile": "regime_ablated",
+        "touchpoints": {
+          "prompting": false,
+          "calibration": false,
+          "self_critique": false,
+          "risk_gate": false
+        },
+        "metrics": {
+          "mean_net_total_return": 0.01
+        }
+      }
+    ]
+  },
+  "cost_decomposition": {
+    "contract": "cost_drag_decomposition.v1",
+    "by_profile_regime_bucket": [],
+    "by_profile_regime_bucket_arm": []
+  },
+  "benchmark_artifacts": {
+    "history_summary_json": "/tmp/history/summary.json",
+    "history_summary_markdown": "/tmp/history/summary.md",
+    "history_metric_snapshot_json": "/tmp/history/metric_snapshot.json",
+    "history_dataset_manifest_json": "/tmp/history/dataset_manifest.json",
+    "history_delta_vs_baseline_json": "/tmp/history/delta_vs_baseline.json",
+    "latest_summary_json": "/tmp/latest/summary.json",
+    "latest_summary_markdown": "/tmp/latest/summary.md",
+    "latest_metric_snapshot_json": "/tmp/latest/metric_snapshot.json",
+    "latest_dataset_manifest_json": "/tmp/latest/dataset_manifest.json",
+    "latest_delta_vs_baseline_json": "/tmp/latest/delta_vs_baseline.json"
+  },
+  "gate_outcome": {
+    "status": "pass",
+    "checks": [
+      {
+        "name": "fixture_check",
+        "pass": true,
+        "observed": 1,
+        "expected": 1
+      }
+    ]
+  }
+}
