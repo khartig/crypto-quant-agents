@@ -12,7 +12,7 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
 - Produces explainable trigger predictions with class probabilities and top feature reasons.
 - Monitors the market continuously and emits trigger notifications (local log + optional webhook).
 - Applies deterministic risk thresholds before any execution.
-- Emits and executes paper-trade intents in a local ledger.
+- Emits and executes paper-trade intents in a local ledger with adaptive risk-budget sizing and execution realism controls.
 - Generates ops reports and structured run artifacts.
 - Ships a Next.js dashboard project for interactive prediction/alert review and model/trade performance analysis.
 - Supports OpenClaw-native orchestration with async job supervision and strict verification gating.
@@ -33,9 +33,9 @@ Large outputs are written under `QUANT_DATA_ROOT` (default: `/mnt/quant-data`).
 5. **Risk decision**  
    Deterministic gate checks data-quality status + backtest metrics + signal confidence.
 6. **Execution gateway**  
-   If approved, emit actionable paper intent (`buy`/`sell`); otherwise block.
+   If approved, emit actionable paper intent (`buy`/`sell`) with volatility/confidence/drawdown-aware sizing; otherwise block.
 7. **Paper execution**  
-   Deterministic paper execution updates portfolio state and fills log (long-only; `sell` closes/reduces existing long inventory).
+   Deterministic paper execution updates portfolio state and fills log (long-only; `sell` closes/reduces existing long inventory) with spread/latency/liquidity-aware fill realism.
 8. **Ops report + manifest**  
    Generate markdown summary and run manifest with artifact pointers.
 9. **(OpenClaw path) strict verification gate**  
@@ -201,6 +201,21 @@ Key environment variables (see `.env.example`):
   - `PAPER_TRADE_STARTING_CASH_USD`
   - `PAPER_TRADE_FEE_BPS`
   - `PAPER_TRADE_SLIPPAGE_BPS`
+  - `PAPER_SIZING_ENABLED`
+  - `PAPER_SIZING_TARGET_ANNUAL_VOLATILITY`
+  - `PAPER_SIZING_CONFIDENCE_FLOOR`
+  - `PAPER_SIZING_CONFIDENCE_CEILING`
+  - `PAPER_SIZING_MIN_FRACTION`
+  - `PAPER_SIZING_MAX_FRACTION`
+  - `PAPER_SIZING_DRAWDOWN_THROTTLE_START`
+  - `PAPER_SIZING_DRAWDOWN_KILL_SWITCH`
+  - `PAPER_SIZING_FALLBACK_NOTIONAL_USD`
+  - `EXECUTION_REALISM_SPREAD_BPS`
+  - `EXECUTION_REALISM_LATENCY_MS`
+  - `EXECUTION_REALISM_LATENCY_SLIPPAGE_BPS_PER_SECOND`
+  - `EXECUTION_REALISM_LIQUIDITY_SCORE`
+  - `EXECUTION_REALISM_MARKET_DEPTH_NOTIONAL_USD`
+  - `EXECUTION_REALISM_NOTIONAL_IMPACT_COEFF`
 - Paper account connectivity probe:
   - `PAPER_ACCOUNT_PROVIDER`
   - `PAPER_ACCOUNT_EXCHANGE`
@@ -242,6 +257,22 @@ Key environment variables (see `.env.example`):
 - Cost model:
   - `BACKTEST_FEE_BPS=5.0`, `BACKTEST_SLIPPAGE_BPS=2.5`
   - `WALK_FORWARD_FEE_BPS=5.0`, `WALK_FORWARD_SLIPPAGE_BPS=2.5`
+- Priority 3 risk/execution:
+  - `PAPER_SIZING_ENABLED=1`
+  - `PAPER_SIZING_TARGET_ANNUAL_VOLATILITY=0.35`
+  - `PAPER_SIZING_CONFIDENCE_FLOOR=0.55`
+  - `PAPER_SIZING_CONFIDENCE_CEILING=0.90`
+  - `PAPER_SIZING_MIN_FRACTION=0.25`
+  - `PAPER_SIZING_MAX_FRACTION=1.50`
+  - `PAPER_SIZING_DRAWDOWN_THROTTLE_START=0.10`
+  - `PAPER_SIZING_DRAWDOWN_KILL_SWITCH=0.20`
+  - `PAPER_SIZING_FALLBACK_NOTIONAL_USD=50.0`
+  - `EXECUTION_REALISM_SPREAD_BPS=1.0`
+  - `EXECUTION_REALISM_LATENCY_MS=250.0`
+  - `EXECUTION_REALISM_LATENCY_SLIPPAGE_BPS_PER_SECOND=0.5`
+  - `EXECUTION_REALISM_LIQUIDITY_SCORE=0.85`
+  - `EXECUTION_REALISM_MARKET_DEPTH_NOTIONAL_USD=2500.0`
+  - `EXECUTION_REALISM_NOTIONAL_IMPACT_COEFF=2.0`
 - Trigger model:
   - `TRIGGER_MODEL_LABELING_MODE=triple_barrier_v2`
   - `TRIGGER_MODEL_TRADE_QUALITY_MIN_SCORE=0.55`
@@ -291,6 +322,16 @@ python scripts/run_labeling_objective_benchmark.py --exchange kraken --symbol BT
 Labeling specification reference:
 - [doc/TRIGGER_LABELING_OBJECTIVE_SPEC.md](doc/TRIGGER_LABELING_OBJECTIVE_SPEC.md)
 
+### Priority 3 risk/execution/readiness validation artifacts
+Use these scripts to produce roadmap item 10/11/12 deliverables.
+```bash path=null start=null
+python scripts/run_execution_realism_stress_suite.py --exchange kraken --symbol BTC/USDT --timeframe 1h
+python scripts/run_live_readiness_stage_gate.py --exchange kraken --symbol BTC/USDT --timeframe 1h --required-stage paper_forward
+```
+References:
+- [doc/RISK_BUDGET_POLICY.md](doc/RISK_BUDGET_POLICY.md)
+- [doc/LIVE_READINESS_RUNBOOK.md](doc/LIVE_READINESS_RUNBOOK.md)
+
 ### Order book snapshot capture + retrieval
 Use this to capture depth snapshots and build aligned order-book features for trigger-model runs.
 ```bash path=null start=null
@@ -318,6 +359,7 @@ quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --re
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-external-features-path /mnt/quant-data/external/priority2_features_btcusdt_1h.parquet
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --priority2-features-enabled --priority2-feature-columns stable --priority2-quality-gate-enabled --priority2-quality-min-external-raw-coverage 0.20 --priority2-quality-min-non-zero-coverage 0.05 --priority2-quality-max-fallback-rate 0.80 --priority2-quality-max-staleness-seconds 86400
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-notional-usd 100 --paper-starting-cash-usd 10000 --paper-fee-bps 5 --paper-slippage-bps 1
+quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --paper-sizing-enabled --paper-sizing-target-annual-volatility 0.35 --paper-sizing-confidence-floor 0.55 --paper-sizing-confidence-ceiling 0.90 --paper-sizing-min-fraction 0.25 --paper-sizing-max-fraction 1.50 --paper-sizing-drawdown-throttle-start 0.10 --paper-sizing-drawdown-kill-switch 0.20 --paper-sizing-fallback-notional-usd 50 --execution-realism-spread-bps 1.0 --execution-realism-latency-ms 250 --execution-realism-latency-slippage-bps-per-second 0.5 --execution-realism-liquidity-score 0.85 --execution-realism-market-depth-notional-usd 2500 --execution-realism-notional-impact-coeff 2.0
 quant-agents agent-plane --exchange kraken --symbol BTC/USDT --timeframe 1h --ensemble-mode adaptive --ensemble-arms sma_baseline,technical_composite,llm_context --ensemble-decay-horizon 48 --ensemble-exploration-weight 0.15 --ensemble-turnover-penalty-bps 8
 ```
 
@@ -513,6 +555,13 @@ All paths below are relative to `QUANT_DATA_ROOT`.
   - `curated/evaluations/trigger_labeling_objective_benchmark/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/trigger_labeling_objective_benchmark.json`
   - `curated/evaluations/trigger_labeling_objective_benchmark/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/trigger_labeling_objective_benchmark.md`
   - `curated/evaluations/trigger_labeling_objective_benchmark/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/actionable_coverage_vs_precision_frontier.png`
+- Execution realism stress artifacts:
+  - `curated/evaluations/execution_realism_stress_suite/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/execution_realism_stress_suite.json`
+  - `curated/evaluations/execution_realism_stress_suite/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/execution_realism_stress_suite.md`
+  - `curated/evaluations/execution_realism_stress_suite/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/execution_realism_cost_drag_sensitivity.png`
+- Live readiness stage-gate artifacts:
+  - `curated/evaluations/live_readiness_stage_gate/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/live_readiness_stage_gate_report.json`
+  - `curated/evaluations/live_readiness_stage_gate/exchange=<exchange>/symbol=<pair>/interval=<tf>/run_id=<run_id>/live_readiness_stage_gate_report.md`
 - Archives:
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz`
   - `archive/monthly/<yyyy-mm>/backtests/sma_crossover/<run_id>.tar.gz.sha256`

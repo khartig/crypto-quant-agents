@@ -135,6 +135,21 @@ class OpenClawOrchestrationRequest:
     paper_starting_cash_usd: float
     paper_fee_bps: float
     paper_slippage_bps: float
+    paper_sizing_enabled: bool
+    paper_sizing_target_annual_volatility: float
+    paper_sizing_confidence_floor: float
+    paper_sizing_confidence_ceiling: float
+    paper_sizing_min_fraction: float
+    paper_sizing_max_fraction: float
+    paper_sizing_drawdown_throttle_start: float
+    paper_sizing_drawdown_kill_switch: float
+    paper_sizing_fallback_notional_usd: float
+    execution_realism_spread_bps: float
+    execution_realism_latency_ms: float
+    execution_realism_latency_slippage_bps_per_second: float
+    execution_realism_liquidity_score: float
+    execution_realism_market_depth_notional_usd: float
+    execution_realism_notional_impact_coeff: float
     priority2_features_enabled: bool
     priority2_feature_columns: tuple[str, ...]
     priority2_external_features_path: str | None
@@ -403,6 +418,151 @@ class OpenClawOrchestrationRequest:
             paper_slippage_bps=float(
                 payload.get("paper_slippage_bps", settings.paper_trade_slippage_bps)
             ),
+            paper_sizing_enabled=_coerce_bool(
+                payload.get("paper_sizing_enabled"),
+                default=bool(settings.paper_sizing_enabled),
+            ),
+            paper_sizing_target_annual_volatility=max(
+                0.01,
+                float(
+                    payload.get(
+                        "paper_sizing_target_annual_volatility",
+                        settings.paper_sizing_target_annual_volatility,
+                    )
+                ),
+            ),
+            paper_sizing_confidence_floor=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "paper_sizing_confidence_floor",
+                            settings.paper_sizing_confidence_floor,
+                        )
+                    ),
+                ),
+            ),
+            paper_sizing_confidence_ceiling=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "paper_sizing_confidence_ceiling",
+                            settings.paper_sizing_confidence_ceiling,
+                        )
+                    ),
+                ),
+            ),
+            paper_sizing_min_fraction=max(
+                0.0,
+                float(
+                    payload.get(
+                        "paper_sizing_min_fraction",
+                        settings.paper_sizing_min_fraction,
+                    )
+                ),
+            ),
+            paper_sizing_max_fraction=max(
+                0.01,
+                float(
+                    payload.get(
+                        "paper_sizing_max_fraction",
+                        settings.paper_sizing_max_fraction,
+                    )
+                ),
+            ),
+            paper_sizing_drawdown_throttle_start=max(
+                0.0,
+                min(
+                    0.95,
+                    float(
+                        payload.get(
+                            "paper_sizing_drawdown_throttle_start",
+                            settings.paper_sizing_drawdown_throttle_start,
+                        )
+                    ),
+                ),
+            ),
+            paper_sizing_drawdown_kill_switch=max(
+                0.01,
+                min(
+                    0.99,
+                    float(
+                        payload.get(
+                            "paper_sizing_drawdown_kill_switch",
+                            settings.paper_sizing_drawdown_kill_switch,
+                        )
+                    ),
+                ),
+            ),
+            paper_sizing_fallback_notional_usd=max(
+                0.0,
+                float(
+                    payload.get(
+                        "paper_sizing_fallback_notional_usd",
+                        settings.paper_sizing_fallback_notional_usd,
+                    )
+                ),
+            ),
+            execution_realism_spread_bps=max(
+                0.0,
+                float(
+                    payload.get(
+                        "execution_realism_spread_bps",
+                        settings.execution_realism_spread_bps,
+                    )
+                ),
+            ),
+            execution_realism_latency_ms=max(
+                0.0,
+                float(
+                    payload.get(
+                        "execution_realism_latency_ms",
+                        settings.execution_realism_latency_ms,
+                    )
+                ),
+            ),
+            execution_realism_latency_slippage_bps_per_second=max(
+                0.0,
+                float(
+                    payload.get(
+                        "execution_realism_latency_slippage_bps_per_second",
+                        settings.execution_realism_latency_slippage_bps_per_second,
+                    )
+                ),
+            ),
+            execution_realism_liquidity_score=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        payload.get(
+                            "execution_realism_liquidity_score",
+                            settings.execution_realism_liquidity_score,
+                        )
+                    ),
+                ),
+            ),
+            execution_realism_market_depth_notional_usd=max(
+                1.0,
+                float(
+                    payload.get(
+                        "execution_realism_market_depth_notional_usd",
+                        settings.execution_realism_market_depth_notional_usd,
+                    )
+                ),
+            ),
+            execution_realism_notional_impact_coeff=max(
+                0.0,
+                float(
+                    payload.get(
+                        "execution_realism_notional_impact_coeff",
+                        settings.execution_realism_notional_impact_coeff,
+                    )
+                ),
+            ),
             priority2_features_enabled=_coerce_bool(
                 payload.get("priority2_features_enabled"),
                 default=bool(settings.priority2_features_enabled),
@@ -505,6 +665,39 @@ class OpenClawOrchestrationRequest:
             paper_starting_cash_usd=self.paper_starting_cash_usd,
             paper_fee_bps=self.paper_fee_bps,
             paper_slippage_bps=max(0.0, float(self.paper_slippage_bps)),
+            paper_sizing_enabled=bool(self.paper_sizing_enabled),
+            paper_sizing_target_annual_volatility=max(
+                0.01,
+                float(self.paper_sizing_target_annual_volatility),
+            ),
+            paper_sizing_confidence_floor=max(0.0, min(1.0, float(self.paper_sizing_confidence_floor))),
+            paper_sizing_confidence_ceiling=max(0.0, min(1.0, float(self.paper_sizing_confidence_ceiling))),
+            paper_sizing_min_fraction=max(0.0, float(self.paper_sizing_min_fraction)),
+            paper_sizing_max_fraction=max(0.01, float(self.paper_sizing_max_fraction)),
+            paper_sizing_drawdown_throttle_start=max(
+                0.0,
+                min(0.95, float(self.paper_sizing_drawdown_throttle_start)),
+            ),
+            paper_sizing_drawdown_kill_switch=max(
+                0.01,
+                min(0.99, float(self.paper_sizing_drawdown_kill_switch)),
+            ),
+            paper_sizing_fallback_notional_usd=max(0.0, float(self.paper_sizing_fallback_notional_usd)),
+            execution_realism_spread_bps=max(0.0, float(self.execution_realism_spread_bps)),
+            execution_realism_latency_ms=max(0.0, float(self.execution_realism_latency_ms)),
+            execution_realism_latency_slippage_bps_per_second=max(
+                0.0,
+                float(self.execution_realism_latency_slippage_bps_per_second),
+            ),
+            execution_realism_liquidity_score=max(0.0, min(1.0, float(self.execution_realism_liquidity_score))),
+            execution_realism_market_depth_notional_usd=max(
+                1.0,
+                float(self.execution_realism_market_depth_notional_usd),
+            ),
+            execution_realism_notional_impact_coeff=max(
+                0.0,
+                float(self.execution_realism_notional_impact_coeff),
+            ),
             minimum_bars=self.minimum_bars,
             regime_enabled=bool(self.regime_enabled),
             regime_detector_mode=(

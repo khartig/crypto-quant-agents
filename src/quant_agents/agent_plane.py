@@ -32,7 +32,10 @@ from quant_agents.backtest import (
 )
 from quant_agents.config import Settings
 from quant_agents.ollama_client import OllamaClient
-from quant_agents.paper_trading import execute_paper_trade_intent
+from quant_agents.paper_trading import (
+    execute_paper_trade_intent,
+    summarize_paper_portfolio_risk,
+)
 from quant_agents.priority2_features import (
     PRIORITY2_FEATURE_COLUMNS,
     Priority2FeatureBundle,
@@ -81,6 +84,21 @@ class AgentPlaneConfig:
     paper_fee_bps: float
     paper_slippage_bps: float
     minimum_bars: int
+    paper_sizing_enabled: bool = True
+    paper_sizing_target_annual_volatility: float = 0.35
+    paper_sizing_confidence_floor: float = 0.55
+    paper_sizing_confidence_ceiling: float = 0.90
+    paper_sizing_min_fraction: float = 0.25
+    paper_sizing_max_fraction: float = 1.50
+    paper_sizing_drawdown_throttle_start: float = 0.10
+    paper_sizing_drawdown_kill_switch: float = 0.20
+    paper_sizing_fallback_notional_usd: float = 50.0
+    execution_realism_spread_bps: float = 1.0
+    execution_realism_latency_ms: float = 250.0
+    execution_realism_latency_slippage_bps_per_second: float = 0.5
+    execution_realism_liquidity_score: float = 0.85
+    execution_realism_market_depth_notional_usd: float = 2500.0
+    execution_realism_notional_impact_coeff: float = 2.0
     regime_enabled: bool = True
     regime_detector_mode: str = "score"
     regime_policy_mode: str = "legacy"
@@ -4142,20 +4160,149 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
         actionable = risk_decision.approved and strategy_signal.recommendation in {"buy", "sell"}
         now = datetime.now(timezone.utc)
         destination_path: str | None = None
+        closes = pd.to_numeric(market_frame["close"], errors="coerce").dropna()
+        mark_price = float(closes.iloc[-1]) if not closes.empty else None
+        base_notional_usd = max(0.0, float(config.paper_notional_usd))
+
+        sizing_policy = {
+            "paper_sizing_enabled": bool(config.paper_sizing_enabled),
+            "target_annual_volatility": max(0.01, float(config.paper_sizing_target_annual_volatility)),
+            "confidence_floor": float(
+                min(config.paper_sizing_confidence_floor, config.paper_sizing_confidence_ceiling)
+            ),
+            "confidence_ceiling": float(
+                max(config.paper_sizing_confidence_floor, config.paper_sizing_confidence_ceiling)
+            ),
+            "min_fraction": float(max(0.0, config.paper_sizing_min_fraction)),
+            "max_fraction": float(max(0.01, config.paper_sizing_max_fraction)),
+            "drawdown_throttle_start": float(
+                min(config.paper_sizing_drawdown_throttle_start, config.paper_sizing_drawdown_kill_switch)
+            ),
+            "drawdown_kill_switch": float(
+                max(config.paper_sizing_drawdown_throttle_start, config.paper_sizing_drawdown_kill_switch)
+            ),
+            "fallback_notional_usd": float(max(0.0, config.paper_sizing_fallback_notional_usd)),
+            "regime_independent_fallback_profile": True,
+        }
+        sizing_diagnostics: dict[str, Any] = {
+            "base_notional_usd": base_notional_usd,
+            "final_notional_usd": base_notional_usd,
+            "volatility_scale": 1.0,
+            "confidence_scale": 1.0,
+            "drawdown_throttle_scale": 1.0,
+            "combined_scale": 1.0,
+            "volatility_annualized": None,
+            "drawdown_ratio": 0.0,
+            "kill_switch_triggered": False,
+            "fallback_profile_applied": False,
+            "fallback_reason": None,
+            "calibrated_confidence": float(
+                np.clip(
+                    confidence_calibration.get("calibrated_confidence", risk_decision.recommendation_confidence),
+                    0.0,
+                    1.0,
+                )
+            ),
+        }
+        resolved_notional_usd = base_notional_usd
+        extra_block_reason: str | None = None
+
+        if actionable:
+            portfolio_risk = summarize_paper_portfolio_risk(
+                quant_data_root=settings.quant_data_root,
+                symbol=config.symbol,
+                mark_price=mark_price,
+                starting_cash_usd=config.paper_starting_cash_usd,
+                fee_bps=config.paper_fee_bps,
+            )
+            drawdown_ratio = float(np.clip(portfolio_risk.get("drawdown_ratio", 0.0), 0.0, 1.0))
+            throttle_start = float(
+                min(
+                    sizing_policy["drawdown_throttle_start"],
+                    sizing_policy["drawdown_kill_switch"],
+                )
+            )
+            kill_switch = drawdown_ratio >= float(sizing_policy["drawdown_kill_switch"])
+            throttle_scale = 1.0
+            if drawdown_ratio >= throttle_start and not kill_switch:
+                span = max(1e-9, float(sizing_policy["drawdown_kill_switch"]) - throttle_start)
+                throttle_scale = max(
+                    float(sizing_policy["min_fraction"]),
+                    1.0 - ((drawdown_ratio - throttle_start) / span),
+                )
+            sizing_diagnostics["drawdown_ratio"] = drawdown_ratio
+            sizing_diagnostics["kill_switch_triggered"] = bool(kill_switch)
+            sizing_diagnostics["drawdown_throttle_scale"] = float(throttle_scale)
+            sizing_diagnostics["portfolio_risk"] = portfolio_risk
+
+            if kill_switch:
+                actionable = False
+                extra_block_reason = "paper_drawdown_kill_switch_triggered"
+            else:
+                if closes.size >= 12:
+                    returns = closes.pct_change().dropna().tail(max(24, min(192, int(closes.size))))
+                    periods_per_year = max(1, _periods_per_year(config.timeframe))
+                    realized_vol = (
+                        float(returns.std(ddof=0) * np.sqrt(periods_per_year))
+                        if not returns.empty
+                        else 0.0
+                    )
+                else:
+                    realized_vol = 0.0
+
+                floor = float(sizing_policy["confidence_floor"])
+                ceiling = float(sizing_policy["confidence_ceiling"])
+                min_fraction = float(sizing_policy["min_fraction"])
+                max_fraction = max(min_fraction, float(sizing_policy["max_fraction"]))
+                confidence = float(sizing_diagnostics["calibrated_confidence"])
+                confidence_denominator = max(1e-9, ceiling - floor)
+                confidence_norm = float(np.clip((confidence - floor) / confidence_denominator, 0.0, 1.0))
+                confidence_scale = min_fraction + ((max_fraction - min_fraction) * confidence_norm)
+                target_annual_vol = float(sizing_policy["target_annual_volatility"])
+                if bool(config.paper_sizing_enabled) and realized_vol > 0.0:
+                    volatility_scale = float(np.clip(target_annual_vol / realized_vol, min_fraction, max_fraction))
+                    combined_scale = float(
+                        np.clip(volatility_scale * confidence_scale * throttle_scale, min_fraction, max_fraction)
+                    )
+                    resolved_notional_usd = base_notional_usd * combined_scale
+                else:
+                    volatility_scale = 1.0
+                    combined_scale = float(np.clip(confidence_scale * throttle_scale, min_fraction, max_fraction))
+                    resolved_notional_usd = max(0.0, float(sizing_policy["fallback_notional_usd"])) * combined_scale
+                    sizing_diagnostics["fallback_profile_applied"] = True
+                    sizing_diagnostics["fallback_reason"] = (
+                        "paper_sizing_disabled"
+                        if not bool(config.paper_sizing_enabled)
+                        else "volatility_unavailable"
+                    )
+                sizing_diagnostics["volatility_annualized"] = float(realized_vol)
+                sizing_diagnostics["volatility_scale"] = float(volatility_scale)
+                sizing_diagnostics["confidence_scale"] = float(confidence_scale)
+                sizing_diagnostics["combined_scale"] = float(combined_scale)
+                sizing_diagnostics["final_notional_usd"] = float(resolved_notional_usd)
+
+                if resolved_notional_usd <= 0.0:
+                    actionable = False
+                    extra_block_reason = "paper_notional_non_positive_after_sizing"
+
         if actionable:
             destination = (
                 settings.quant_data_root / "paper-trading" / f"{now:%Y-%m-%d}" / f"paper_trade_intent_{run_id}.json"
             )
             destination_path = str(destination)
-
-        if actionable:
             reason = "deterministic_gate_passed"
             action: Recommendation = strategy_signal.recommendation
             status: Literal["emitted", "blocked"] = "emitted"
         else:
-            reason = ",".join(risk_decision.reason_codes) if risk_decision.reason_codes else "blocked"
+            base_reason = ",".join(risk_decision.reason_codes) if risk_decision.reason_codes else "blocked"
+            reason = (
+                f"{base_reason},{extra_block_reason}"
+                if extra_block_reason and base_reason
+                else (extra_block_reason or base_reason)
+            )
             action = "hold"
             status = "blocked"
+            resolved_notional_usd = 0.0
 
         return PaperTradeIntent(
             contract="paper_trade_intent.v1",
@@ -4167,10 +4314,13 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             symbol=config.symbol,
             timeframe=config.timeframe,
             action=action,
-            notional_usd=float(config.paper_notional_usd),
+            notional_usd=float(resolved_notional_usd),
+            base_notional_usd=float(base_notional_usd),
             risk_approved=risk_decision.approved,
             reason=reason,
             destination_path=destination_path,
+            sizing_policy=sizing_policy,
+            sizing_diagnostics=sizing_diagnostics,
             arm_votes=dict(risk_decision.arm_votes),
             arm_weights=dict(risk_decision.arm_weights),
             selected_arms=list(risk_decision.selected_arms),
@@ -4206,6 +4356,12 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             starting_cash_usd=config.paper_starting_cash_usd,
             fee_bps=config.paper_fee_bps,
             slippage_bps=config.paper_slippage_bps,
+            spread_bps=config.execution_realism_spread_bps,
+            latency_ms=config.execution_realism_latency_ms,
+            latency_slippage_bps_per_second=config.execution_realism_latency_slippage_bps_per_second,
+            liquidity_score=config.execution_realism_liquidity_score,
+            market_depth_notional_usd=config.execution_realism_market_depth_notional_usd,
+            notional_impact_coeff=config.execution_realism_notional_impact_coeff,
         )
 
     paper_trade_execution, paper_execution_step = _run_step_with_retries(
@@ -4288,12 +4444,21 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "status": paper_trade_intent.status,
             "action": paper_trade_intent.action,
             "notional_usd": paper_trade_intent.notional_usd,
+            "base_notional_usd": paper_trade_intent.base_notional_usd,
+            "sizing_policy": paper_trade_intent.sizing_policy,
+            "sizing_diagnostics": paper_trade_intent.sizing_diagnostics,
             "destination_path": paper_trade_intent.destination_path,
         },
         "execution": {
             "status": paper_trade_execution.execution_status,
             "executed_action": paper_trade_execution.executed_action,
             "executed_notional_usd": paper_trade_execution.executed_notional_usd,
+            "base_requested_notional_usd": paper_trade_execution.base_requested_notional_usd,
+            "fill_ratio": paper_trade_execution.fill_ratio,
+            "spread_bps": paper_trade_execution.spread_bps,
+            "latency_ms": paper_trade_execution.latency_ms,
+            "liquidity_score": paper_trade_execution.liquidity_score,
+            "effective_slippage_bps": paper_trade_execution.effective_slippage_bps,
             "execution_price": paper_trade_execution.execution_price,
             "fee_usd": paper_trade_execution.fee_usd,
             "slippage_bps": paper_trade_execution.slippage_bps,
@@ -4301,6 +4466,7 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "position_qty_after": paper_trade_execution.position_qty_after,
             "position_avg_entry_after": paper_trade_execution.position_avg_entry_after,
             "reason": paper_trade_execution.reason,
+            "execution_diagnostics": paper_trade_execution.execution_diagnostics,
             "portfolio_state_path": paper_trade_execution.portfolio_state_path,
             "fills_log_path": paper_trade_execution.fills_log_path,
             "execution_record_path": paper_trade_execution.execution_record_path,
@@ -4509,6 +4675,41 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "paper_starting_cash_usd": config.paper_starting_cash_usd,
             "paper_fee_bps": config.paper_fee_bps,
             "paper_slippage_bps": config.paper_slippage_bps,
+            "paper_sizing_enabled": bool(config.paper_sizing_enabled),
+            "paper_sizing_target_annual_volatility": float(
+                max(0.01, config.paper_sizing_target_annual_volatility)
+            ),
+            "paper_sizing_confidence_floor": float(
+                np.clip(config.paper_sizing_confidence_floor, 0.0, 1.0)
+            ),
+            "paper_sizing_confidence_ceiling": float(
+                np.clip(config.paper_sizing_confidence_ceiling, 0.0, 1.0)
+            ),
+            "paper_sizing_min_fraction": float(max(0.0, config.paper_sizing_min_fraction)),
+            "paper_sizing_max_fraction": float(max(0.01, config.paper_sizing_max_fraction)),
+            "paper_sizing_drawdown_throttle_start": float(
+                np.clip(config.paper_sizing_drawdown_throttle_start, 0.0, 0.95)
+            ),
+            "paper_sizing_drawdown_kill_switch": float(
+                np.clip(config.paper_sizing_drawdown_kill_switch, 0.01, 0.99)
+            ),
+            "paper_sizing_fallback_notional_usd": float(
+                max(0.0, config.paper_sizing_fallback_notional_usd)
+            ),
+            "execution_realism_spread_bps": float(max(0.0, config.execution_realism_spread_bps)),
+            "execution_realism_latency_ms": float(max(0.0, config.execution_realism_latency_ms)),
+            "execution_realism_latency_slippage_bps_per_second": float(
+                max(0.0, config.execution_realism_latency_slippage_bps_per_second)
+            ),
+            "execution_realism_liquidity_score": float(
+                np.clip(config.execution_realism_liquidity_score, 0.0, 1.0)
+            ),
+            "execution_realism_market_depth_notional_usd": float(
+                max(1.0, config.execution_realism_market_depth_notional_usd)
+            ),
+            "execution_realism_notional_impact_coeff": float(
+                max(0.0, config.execution_realism_notional_impact_coeff)
+            ),
             "thresholds": _json_safe(asdict(config.thresholds)),
         },
         "steps": [_json_safe(asdict(record)) for record in step_records],
@@ -4542,6 +4743,16 @@ def run_agent_plane(settings: Settings, config: AgentPlaneConfig) -> AgentPlaneR
             "risk_approved": risk_decision.approved,
             "intent_status": paper_trade_intent.status,
             "paper_trade_execution_status": paper_trade_execution.execution_status,
+            "paper_intent_notional_usd": paper_trade_intent.notional_usd,
+            "paper_intent_base_notional_usd": paper_trade_intent.base_notional_usd,
+            "paper_intent_sizing_policy": paper_trade_intent.sizing_policy,
+            "paper_intent_sizing_diagnostics": paper_trade_intent.sizing_diagnostics,
+            "paper_execution_fill_ratio": paper_trade_execution.fill_ratio,
+            "paper_execution_spread_bps": paper_trade_execution.spread_bps,
+            "paper_execution_latency_ms": paper_trade_execution.latency_ms,
+            "paper_execution_liquidity_score": paper_trade_execution.liquidity_score,
+            "paper_execution_effective_slippage_bps": paper_trade_execution.effective_slippage_bps,
+            "paper_execution_diagnostics": paper_trade_execution.execution_diagnostics,
             "deterministic_gate": risk_decision.deterministic_gate,
             "calibrated_confidence": confidence_calibration.get("calibrated_confidence"),
             "phase1_regime": strategy_signal.regime,

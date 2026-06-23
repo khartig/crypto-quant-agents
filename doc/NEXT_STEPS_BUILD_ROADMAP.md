@@ -15,11 +15,15 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Priority 1 status: **implemented and validated**.
   - Regime conditional policy mode, touchpoint ablations, contradiction split, and cost-pressure policy were integrated and validated through suite runs.
   - Full-window Priority 1 evaluator evidence was generated after historical backfill unblocked all canonical windows.
-- Priority 2 status: **in progress (actively implemented)**.
+- Priority 2 status: **implemented and validated**.
   - Agent-plane and evaluator paths now enforce Priority 2 feature-column selection plus Priority 2 external-data quality-gate behavior consistently with trigger-model paths.
   - OpenClaw request mapping and CLI wiring now expose Priority 2 feature-column and quality-gate controls end-to-end.
   - Roadmap item 8 deliverables are now implemented with a schema-versioned alternative-data feature module and quality/latency reporting script.
   - Roadmap item 9 deliverables are now implemented with labeling/objective benchmark + frontier plot generation and a dedicated labeling specification doc.
+- Priority 3 status: **implemented (validation artifacts integrated)**.
+  - Agent-plane now supports volatility/confidence/drawdown-aware paper notional sizing with fallback profile diagnostics.
+  - Paper execution now persists spread/latency/liquidity/impact realism diagnostics in execution artifacts and run manifests.
+  - Execution realism stress suite and live-readiness stage-gate dashboard scripts are available for repeatable validation.
 
 ## Execution protocol (strict sequencing)
 - Work strictly in order: **Priority 0 → Priority 1 → Priority 2 → Priority 3**.
@@ -140,6 +144,10 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Deliverables:
   - Risk budget policy document.
   - Backtest + paper-trade validation showing improved drawdown behavior.
+- Implementation assets:
+  - `doc/RISK_BUDGET_POLICY.md`
+  - `src/quant_agents/agent_plane.py`
+  - `src/quant_agents/agent_contracts.py`
 
 ### 11) Improve execution realism
 - Build tasks:
@@ -148,6 +156,9 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Deliverables:
   - Execution realism test suite.
   - Cost drag vs execution assumption sensitivity report.
+- Implementation assets:
+  - `src/quant_agents/paper_trading.py`
+  - `scripts/run_execution_realism_stress_suite.py`
 
 ### 12) Formal paper-to-live readiness gates
 - Build tasks:
@@ -157,6 +168,9 @@ The goal is to improve out-of-sample **net** performance, reduce drawdown, and i
 - Deliverables:
   - Live-readiness checklist and runbook.
   - Stage-gate dashboard of required metrics.
+- Implementation assets:
+  - `doc/LIVE_READINESS_RUNBOOK.md`
+  - `scripts/run_live_readiness_stage_gate.py`
 
 ## Recommended execution sequence
 1. Complete Priority 0 before any major model redesign.

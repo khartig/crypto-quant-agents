@@ -111,6 +111,21 @@ class Settings:
     paper_trade_starting_cash_usd: float
     paper_trade_fee_bps: float
     paper_trade_slippage_bps: float
+    paper_sizing_enabled: bool
+    paper_sizing_target_annual_volatility: float
+    paper_sizing_confidence_floor: float
+    paper_sizing_confidence_ceiling: float
+    paper_sizing_min_fraction: float
+    paper_sizing_max_fraction: float
+    paper_sizing_drawdown_throttle_start: float
+    paper_sizing_drawdown_kill_switch: float
+    paper_sizing_fallback_notional_usd: float
+    execution_realism_spread_bps: float
+    execution_realism_latency_ms: float
+    execution_realism_latency_slippage_bps_per_second: float
+    execution_realism_liquidity_score: float
+    execution_realism_market_depth_notional_usd: float
+    execution_realism_notional_impact_coeff: float
     paper_account_provider: str
     paper_account_exchange: str
     paper_account_sandbox: bool
@@ -646,6 +661,84 @@ def load_settings() -> Settings:
         paper_trade_slippage_bps=max(
             0.0,
             _as_float(os.getenv("PAPER_TRADE_SLIPPAGE_BPS"), default=1.0),
+        ),
+        paper_sizing_enabled=_as_bool(os.getenv("PAPER_SIZING_ENABLED"), default=True),
+        paper_sizing_target_annual_volatility=max(
+            0.01,
+            _as_float(os.getenv("PAPER_SIZING_TARGET_ANNUAL_VOLATILITY"), default=0.35),
+        ),
+        paper_sizing_confidence_floor=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("PAPER_SIZING_CONFIDENCE_FLOOR"), default=0.55),
+            ),
+        ),
+        paper_sizing_confidence_ceiling=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("PAPER_SIZING_CONFIDENCE_CEILING"), default=0.90),
+            ),
+        ),
+        paper_sizing_min_fraction=max(
+            0.0,
+            _as_float(os.getenv("PAPER_SIZING_MIN_FRACTION"), default=0.25),
+        ),
+        paper_sizing_max_fraction=max(
+            0.01,
+            _as_float(os.getenv("PAPER_SIZING_MAX_FRACTION"), default=1.50),
+        ),
+        paper_sizing_drawdown_throttle_start=min(
+            0.95,
+            max(
+                0.0,
+                _as_float(os.getenv("PAPER_SIZING_DRAWDOWN_THROTTLE_START"), default=0.10),
+            ),
+        ),
+        paper_sizing_drawdown_kill_switch=min(
+            0.99,
+            max(
+                0.01,
+                _as_float(os.getenv("PAPER_SIZING_DRAWDOWN_KILL_SWITCH"), default=0.20),
+            ),
+        ),
+        paper_sizing_fallback_notional_usd=max(
+            0.0,
+            _as_float(os.getenv("PAPER_SIZING_FALLBACK_NOTIONAL_USD"), default=50.0),
+        ),
+        execution_realism_spread_bps=max(
+            0.0,
+            _as_float(os.getenv("EXECUTION_REALISM_SPREAD_BPS"), default=1.0),
+        ),
+        execution_realism_latency_ms=max(
+            0.0,
+            _as_float(os.getenv("EXECUTION_REALISM_LATENCY_MS"), default=250.0),
+        ),
+        execution_realism_latency_slippage_bps_per_second=max(
+            0.0,
+            _as_float(
+                os.getenv("EXECUTION_REALISM_LATENCY_SLIPPAGE_BPS_PER_SECOND"),
+                default=0.5,
+            ),
+        ),
+        execution_realism_liquidity_score=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("EXECUTION_REALISM_LIQUIDITY_SCORE"), default=0.85),
+            ),
+        ),
+        execution_realism_market_depth_notional_usd=max(
+            1.0,
+            _as_float(
+                os.getenv("EXECUTION_REALISM_MARKET_DEPTH_NOTIONAL_USD"),
+                default=2500.0,
+            ),
+        ),
+        execution_realism_notional_impact_coeff=max(
+            0.0,
+            _as_float(os.getenv("EXECUTION_REALISM_NOTIONAL_IMPACT_COEFF"), default=2.0),
         ),
         paper_account_provider=os.getenv("PAPER_ACCOUNT_PROVIDER", "tradingview"),
         paper_account_exchange=os.getenv("PAPER_ACCOUNT_EXCHANGE", "kraken"),

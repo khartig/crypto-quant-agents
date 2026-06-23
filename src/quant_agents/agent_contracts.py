@@ -147,6 +147,9 @@ class PaperTradeIntent:
     risk_approved: bool
     reason: str
     destination_path: str | None
+    base_notional_usd: float = 0.0
+    sizing_policy: dict[str, Any] = field(default_factory=dict)
+    sizing_diagnostics: dict[str, Any] = field(default_factory=dict)
     arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)
     arm_weights: dict[str, float] = field(default_factory=dict)
     selected_arms: list[str] = field(default_factory=list)
@@ -180,6 +183,13 @@ class PaperTradeExecution:
     portfolio_state_path: str | None
     fills_log_path: str | None
     execution_record_path: str | None
+    base_requested_notional_usd: float = 0.0
+    fill_ratio: float = 0.0
+    spread_bps: float = 0.0
+    latency_ms: float = 0.0
+    liquidity_score: float = 1.0
+    effective_slippage_bps: float = 0.0
+    execution_diagnostics: dict[str, Any] = field(default_factory=dict)
     arm_votes: dict[str, dict[str, Any]] = field(default_factory=dict)
     arm_weights: dict[str, float] = field(default_factory=dict)
     selected_arms: list[str] = field(default_factory=list)

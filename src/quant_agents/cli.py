@@ -766,6 +766,103 @@ def _base_parser() -> argparse.ArgumentParser:
         default=None,
         help="Per-trade slippage in basis points used by deterministic paper execution.",
     )
+    agent_plane.add_argument(
+        "--paper-sizing-enabled",
+        dest="paper_sizing_enabled",
+        action="store_true",
+        help="Enable volatility/confidence-based risk-budget sizing for paper intents.",
+    )
+    agent_plane.add_argument(
+        "--no-paper-sizing-enabled",
+        dest="paper_sizing_enabled",
+        action="store_false",
+        help="Disable adaptive risk-budget sizing and use fallback sizing profile.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-target-annual-volatility",
+        type=float,
+        default=None,
+        help="Target annualized volatility used by paper notional scaling.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-confidence-floor",
+        type=float,
+        default=None,
+        help="Lower confidence bound used to normalize confidence-based sizing.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-confidence-ceiling",
+        type=float,
+        default=None,
+        help="Upper confidence bound used to normalize confidence-based sizing.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-min-fraction",
+        type=float,
+        default=None,
+        help="Minimum sizing fraction relative to base paper notional.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-max-fraction",
+        type=float,
+        default=None,
+        help="Maximum sizing fraction relative to base paper notional.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-drawdown-throttle-start",
+        type=float,
+        default=None,
+        help="Drawdown ratio where paper sizing throttle begins.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-drawdown-kill-switch",
+        type=float,
+        default=None,
+        help="Drawdown ratio where actionable paper intents are blocked.",
+    )
+    agent_plane.add_argument(
+        "--paper-sizing-fallback-notional-usd",
+        type=float,
+        default=None,
+        help="Fallback paper notional used when adaptive sizing cannot resolve volatility.",
+    )
+    agent_plane.add_argument(
+        "--execution-realism-spread-bps",
+        type=float,
+        default=None,
+        help="Quoted spread in bps injected into deterministic paper execution.",
+    )
+    agent_plane.add_argument(
+        "--execution-realism-latency-ms",
+        type=float,
+        default=None,
+        help="Execution latency in milliseconds used by deterministic fill simulation.",
+    )
+    agent_plane.add_argument(
+        "--execution-realism-latency-slippage-bps-per-second",
+        type=float,
+        default=None,
+        help="Additional slippage bps applied per second of execution latency.",
+    )
+    agent_plane.add_argument(
+        "--execution-realism-liquidity-score",
+        type=float,
+        default=None,
+        help="Liquidity score (0..1) driving partial-fill realism in deterministic execution.",
+    )
+    agent_plane.add_argument(
+        "--execution-realism-market-depth-notional-usd",
+        type=float,
+        default=None,
+        help="Approximate top-of-book market depth in USD used for impact estimation.",
+    )
+    agent_plane.add_argument(
+        "--execution-realism-notional-impact-coeff",
+        type=float,
+        default=None,
+        help="Impact coefficient applied to notional-vs-depth slippage pressure.",
+    )
+    agent_plane.set_defaults(paper_sizing_enabled=None)
     paper_account = subparsers.add_parser(
         "paper-account-check",
         help="Validate connectivity to configured paper-account provider.",
@@ -2005,6 +2102,110 @@ def main(argv: list[str] | None = None) -> None:
                 args.paper_slippage_bps
                 if args.paper_slippage_bps is not None
                 else settings.paper_trade_slippage_bps
+            ),
+            paper_sizing_enabled=(
+                bool(args.paper_sizing_enabled)
+                if args.paper_sizing_enabled is not None
+                else bool(settings.paper_sizing_enabled)
+            ),
+            paper_sizing_target_annual_volatility=max(
+                0.01,
+                args.paper_sizing_target_annual_volatility
+                if args.paper_sizing_target_annual_volatility is not None
+                else settings.paper_sizing_target_annual_volatility,
+            ),
+            paper_sizing_confidence_floor=min(
+                1.0,
+                max(
+                    0.0,
+                    args.paper_sizing_confidence_floor
+                    if args.paper_sizing_confidence_floor is not None
+                    else settings.paper_sizing_confidence_floor,
+                ),
+            ),
+            paper_sizing_confidence_ceiling=min(
+                1.0,
+                max(
+                    0.0,
+                    args.paper_sizing_confidence_ceiling
+                    if args.paper_sizing_confidence_ceiling is not None
+                    else settings.paper_sizing_confidence_ceiling,
+                ),
+            ),
+            paper_sizing_min_fraction=max(
+                0.0,
+                args.paper_sizing_min_fraction
+                if args.paper_sizing_min_fraction is not None
+                else settings.paper_sizing_min_fraction,
+            ),
+            paper_sizing_max_fraction=max(
+                0.01,
+                args.paper_sizing_max_fraction
+                if args.paper_sizing_max_fraction is not None
+                else settings.paper_sizing_max_fraction,
+            ),
+            paper_sizing_drawdown_throttle_start=min(
+                0.95,
+                max(
+                    0.0,
+                    args.paper_sizing_drawdown_throttle_start
+                    if args.paper_sizing_drawdown_throttle_start is not None
+                    else settings.paper_sizing_drawdown_throttle_start,
+                ),
+            ),
+            paper_sizing_drawdown_kill_switch=min(
+                0.99,
+                max(
+                    0.01,
+                    args.paper_sizing_drawdown_kill_switch
+                    if args.paper_sizing_drawdown_kill_switch is not None
+                    else settings.paper_sizing_drawdown_kill_switch,
+                ),
+            ),
+            paper_sizing_fallback_notional_usd=max(
+                0.0,
+                args.paper_sizing_fallback_notional_usd
+                if args.paper_sizing_fallback_notional_usd is not None
+                else settings.paper_sizing_fallback_notional_usd,
+            ),
+            execution_realism_spread_bps=max(
+                0.0,
+                args.execution_realism_spread_bps
+                if args.execution_realism_spread_bps is not None
+                else settings.execution_realism_spread_bps,
+            ),
+            execution_realism_latency_ms=max(
+                0.0,
+                args.execution_realism_latency_ms
+                if args.execution_realism_latency_ms is not None
+                else settings.execution_realism_latency_ms,
+            ),
+            execution_realism_latency_slippage_bps_per_second=max(
+                0.0,
+                args.execution_realism_latency_slippage_bps_per_second
+                if args.execution_realism_latency_slippage_bps_per_second is not None
+                else settings.execution_realism_latency_slippage_bps_per_second,
+            ),
+            execution_realism_liquidity_score=min(
+                1.0,
+                max(
+                    0.0,
+                    args.execution_realism_liquidity_score
+                    if args.execution_realism_liquidity_score is not None
+                    else settings.execution_realism_liquidity_score,
+                ),
+            ),
+            execution_realism_market_depth_notional_usd=max(
+                1.0,
+                args.execution_realism_market_depth_notional_usd
+                if args.execution_realism_market_depth_notional_usd is not None
+                else settings.execution_realism_market_depth_notional_usd,
+            ),
+            execution_realism_notional_impact_coeff=max(
+                0.0,
+                args.execution_realism_notional_impact_coeff
+                if args.execution_realism_notional_impact_coeff is not None
+                else settings.execution_realism_notional_impact_coeff,
             ),
             minimum_bars=max(
                 10,
