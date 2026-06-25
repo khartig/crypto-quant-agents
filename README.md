@@ -331,6 +331,7 @@ python scripts/run_live_readiness_stage_gate.py --exchange kraken --symbol BTC/U
 References:
 - [doc/RISK_BUDGET_POLICY.md](doc/RISK_BUDGET_POLICY.md)
 - [doc/LIVE_READINESS_RUNBOOK.md](doc/LIVE_READINESS_RUNBOOK.md)
+- [doc/PROFITABILITY_OPTIMIZATION_FLOW.md](doc/PROFITABILITY_OPTIMIZATION_FLOW.md)
 
 ### Order book snapshot capture + retrieval
 Use this to capture depth snapshots and build aligned order-book features for trigger-model runs.

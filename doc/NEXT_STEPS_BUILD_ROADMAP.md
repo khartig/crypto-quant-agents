@@ -3,6 +3,11 @@
 This document captures the prioritized future build plan after the regime-detection rollout and true-ablation comparison.
 The goal is to improve out-of-sample **net** performance, reduce drawdown, and increase production readiness.
 
+## Operational profitability loop reference
+- Standard optimization runbook:
+  - `doc/PROFITABILITY_OPTIMIZATION_FLOW.md`
+- Use this as the default iterative workflow for candidate discovery, robustness filtering, and promotion gating.
+
 ## Current baseline context
 - Recent segmented evaluation showed regime-enabled logic underperforming regime-ablated on mean net return, drawdown, and cost drag.
 - Approval and contradiction rates were unchanged between enabled and ablated profiles in tested windows.

@@ -79,7 +79,13 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     + RANKED_FEATURE_COLUMNS
     + ORDERBOOK_FEATURE_COLUMNS
 )
-EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "execution_backtest_realized_pnl_delta_usd"
+EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "constraint_aware_execution_with_uptrend_lift.v3"
+THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS = 10
+THRESHOLD_SELECTION_MIN_FILL_RATE = 0.55
+THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT = 1.0
+THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN = 0.005
+THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR = 0.35
+THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION = 0.60
 
 
 @dataclass(frozen=True)
@@ -1703,9 +1709,46 @@ def _run_execution_aligned_backtest(
     reason_counts: Counter[str] = Counter()
     attempted = 0
     executed = 0
+    actionable_intent_buy_count = 0
+    actionable_intent_sell_count = 0
 
     first_mark_price = 0.0
     last_mark_price = 0.0
+    base_notional_usd = max(0.0, float(paper_notional_usd))
+    uptrend_long_bias_min_exposure_fraction = float(
+        np.clip(THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION, 0.0, 1.0)
+    )
+    uptrend_long_bias_forced_buy_count = 0
+    uptrend_long_bias_suppressed_sell_count = 0
+    exposure_fraction_samples: list[float] = []
+
+    valid_mark_prices = np.asarray(close_prices, dtype=float)
+    valid_mark_prices = valid_mark_prices[
+        np.isfinite(valid_mark_prices) & (valid_mark_prices > 0.0)
+    ]
+    preliminary_first_mark_price = (
+        float(valid_mark_prices[0]) if valid_mark_prices.size > 0 else 0.0
+    )
+    preliminary_last_mark_price = (
+        float(valid_mark_prices[-1]) if valid_mark_prices.size > 0 else 0.0
+    )
+    uptrend_long_bias_active = bool(
+        uptrend_long_bias_min_exposure_fraction > 0.0
+        and preliminary_first_mark_price > 0.0
+        and preliminary_last_mark_price > preliminary_first_mark_price
+    )
+
+    def _current_exposure_snapshot(mark_price: float) -> tuple[float, float, float, float]:
+        position_payload = dict(state.get("positions", {})).get(symbol, {})
+        quantity = float(position_payload.get("quantity", 0.0))
+        cash = float(state.get("cash_usd", starting_cash))
+        equity = cash + (quantity * mark_price)
+        exposure_fraction = (
+            _safe_div(float(quantity * mark_price), float(equity))
+            if mark_price > 0.0
+            else 0.0
+        )
+        return float(exposure_fraction), float(cash), float(quantity), float(equity)
     for label, mark_price_raw in zip(predicted, close_prices):
         mark_price = (
             float(mark_price_raw)
@@ -1716,15 +1759,55 @@ def _run_execution_aligned_backtest(
             if first_mark_price <= 0.0:
                 first_mark_price = mark_price
             last_mark_price = mark_price
-        if label not in {"buy", "sell"}:
+        if mark_price is None or mark_price <= 0.0:
             continue
+
+        action = str(label) if label in {"buy", "sell"} else "hold"
+        requested_notional_usd = float(base_notional_usd)
+        (
+            current_exposure_fraction,
+            current_cash_usd,
+            current_quantity,
+            current_equity,
+        ) = _current_exposure_snapshot(mark_price)
+        current_position_notional = float(max(0.0, current_quantity * mark_price))
+        if uptrend_long_bias_active:
+            target_position_notional = float(
+                max(0.0, uptrend_long_bias_min_exposure_fraction * max(0.0, current_equity))
+            )
+            deficit_notional = float(target_position_notional - current_position_notional)
+            if deficit_notional > 0.0:
+                if action != "buy":
+                    uptrend_long_bias_forced_buy_count += 1
+                action = "buy"
+                requested_notional_usd = float(
+                    min(
+                        max(base_notional_usd, deficit_notional),
+                        max(0.0, current_cash_usd),
+                    )
+                )
+            elif action == "sell" and current_position_notional <= target_position_notional:
+                action = "hold"
+                uptrend_long_bias_suppressed_sell_count += 1
+
+        if action == "buy" and requested_notional_usd <= 0.0:
+            action = "hold"
+
+        if action not in {"buy", "sell"}:
+            exposure_fraction_samples.append(float(current_exposure_fraction))
+            continue
+
         attempted += 1
+        if action == "buy":
+            actionable_intent_buy_count += 1
+        elif action == "sell":
+            actionable_intent_sell_count += 1
         execution = simulate_paper_trade_execution_step(
             state=state,
             symbol=symbol,
             intent_status="emitted",
-            intent_action=label,
-            requested_notional_usd=max(0.0, float(paper_notional_usd)),
+            intent_action=action,
+            requested_notional_usd=max(0.0, float(requested_notional_usd)),
             mark_price=mark_price,
             fee_bps=max(0.0, float(paper_fee_bps)),
             slippage_bps=max(0.0, float(paper_slippage_bps)),
@@ -1737,6 +1820,8 @@ def _run_execution_aligned_backtest(
         reason_counts.update([reason])
         if execution_status == "executed":
             executed += 1
+        post_exposure_fraction, _, _, _ = _current_exposure_snapshot(mark_price)
+        exposure_fraction_samples.append(float(post_exposure_fraction))
 
     position = dict(state.get("positions", {})).get(symbol, {})
     final_cash = float(state.get("cash_usd", starting_cash))
@@ -1747,12 +1832,62 @@ def _run_execution_aligned_backtest(
     final_equity = final_cash + (final_quantity * last_mark_price)
     equity_delta = final_equity - starting_cash
     rejection_count = int(status_counts.get("rejected", 0))
+    fill_rate = _safe_div(float(executed), float(attempted))
+    rejection_rate = _safe_div(float(rejection_count), float(attempted))
+    equity_return = _safe_div(float(equity_delta), float(starting_cash))
+    buy_hold_return = (
+        _safe_div(float(last_mark_price - first_mark_price), float(first_mark_price))
+        if first_mark_price > 0.0 and last_mark_price > 0.0
+        else 0.0
+    )
+    buy_hold_equity_after_usd = float(starting_cash * (1.0 + buy_hold_return))
+    buy_hold_equity_delta_usd = float(buy_hold_equity_after_usd - starting_cash)
+    buy_hold_relative_lift = float(equity_return - buy_hold_return)
+    uptrend_lift_term = float(buy_hold_relative_lift) if buy_hold_return > 0.0 else 0.0
+    uptrend_buy_attempt_share = _safe_div(float(actionable_intent_buy_count), float(attempted))
+    uptrend_sell_attempt_share = _safe_div(float(actionable_intent_sell_count), float(attempted))
+    uptrend_net_long_action_balance = int(actionable_intent_buy_count - actionable_intent_sell_count)
+    uptrend_long_bias_mean_exposure_fraction = (
+        float(np.mean(exposure_fraction_samples)) if exposure_fraction_samples else 0.0
+    )
+    min_uptrend_equity_return = float(max(0.0, THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN))
+    uptrend_regime_detected = bool(buy_hold_return > 0.0)
+    uptrend_capture_pass = bool(
+        (not uptrend_regime_detected) or (equity_return >= min_uptrend_equity_return)
+    )
+    if uptrend_regime_detected and min_uptrend_equity_return > 0.0:
+        uptrend_capture_ratio = float(
+            np.clip(
+                _safe_div(float(equity_return), float(min_uptrend_equity_return)),
+                -1.0,
+                1.0,
+            )
+        )
+    else:
+        uptrend_capture_ratio = 1.0
+    if uptrend_long_bias_active and uptrend_long_bias_min_exposure_fraction > 0.0:
+        uptrend_long_bias_exposure_ratio = float(
+            min(
+                1.0,
+                _safe_div(
+                    float(uptrend_long_bias_mean_exposure_fraction),
+                    float(uptrend_long_bias_min_exposure_fraction),
+                ),
+            )
+        )
+        uptrend_long_bias_exposure_pass = bool(
+            uptrend_long_bias_mean_exposure_fraction
+            >= (uptrend_long_bias_min_exposure_fraction * 0.95)
+        )
+    else:
+        uptrend_long_bias_exposure_ratio = 1.0
+        uptrend_long_bias_exposure_pass = True
     return {
         "paper_trades_attempted": int(attempted),
         "paper_trades_executed": int(executed),
         "paper_trades_rejected": rejection_count,
-        "fill_rate": _safe_div(float(executed), float(attempted)),
-        "rejection_rate": _safe_div(float(rejection_count), float(attempted)),
+        "fill_rate": fill_rate,
+        "rejection_rate": rejection_rate,
         "status_counts": dict(status_counts),
         "action_counts": dict(action_counts),
         "reason_counts": dict(reason_counts),
@@ -1763,7 +1898,44 @@ def _run_execution_aligned_backtest(
         "equity_before_usd": float(starting_cash),
         "equity_after_usd": float(final_equity),
         "equity_delta_usd": float(equity_delta),
-        "equity_return": _safe_div(float(equity_delta), float(starting_cash)),
+        "equity_return": equity_return,
+        "buy_hold_return": float(buy_hold_return),
+        "buy_hold_equity_after_usd": float(buy_hold_equity_after_usd),
+        "buy_hold_equity_delta_usd": float(buy_hold_equity_delta_usd),
+        "buy_hold_relative_lift": float(buy_hold_relative_lift),
+        "uptrend_lift_term": float(uptrend_lift_term),
+        "uptrend_buy_attempt_share": float(uptrend_buy_attempt_share),
+        "uptrend_sell_attempt_share": float(uptrend_sell_attempt_share),
+        "uptrend_net_long_action_balance": int(uptrend_net_long_action_balance),
+        "uptrend_long_bias_mean_exposure_fraction": float(
+            uptrend_long_bias_mean_exposure_fraction
+        ),
+        "uptrend_long_bias_forced_buy_count": int(uptrend_long_bias_forced_buy_count),
+        "uptrend_long_bias_suppressed_sell_count": int(
+            uptrend_long_bias_suppressed_sell_count
+        ),
+        "selection_constraint_min_trade_attempts": int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS),
+        "selection_constraint_min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
+        "selection_constraint_min_uptrend_equity_return": float(min_uptrend_equity_return),
+        "selection_constraint_uptrend_long_bias_active": bool(uptrend_long_bias_active),
+        "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
+            uptrend_long_bias_min_exposure_fraction
+        ),
+        "selection_constraint_uptrend_long_bias_exposure_pass": bool(
+            uptrend_long_bias_exposure_pass
+        ),
+        "selection_constraint_uptrend_long_bias_exposure_ratio": float(
+            uptrend_long_bias_exposure_ratio
+        ),
+        "selection_constraint_trade_activity_pass": bool(
+            attempted >= int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS)
+        ),
+        "selection_constraint_fill_rate_pass": bool(
+            fill_rate >= float(THRESHOLD_SELECTION_MIN_FILL_RATE)
+        ),
+        "selection_constraint_uptrend_regime_detected": bool(uptrend_regime_detected),
+        "selection_constraint_uptrend_capture_pass": bool(uptrend_capture_pass),
+        "selection_constraint_uptrend_capture_ratio": float(uptrend_capture_ratio),
         "first_mark_price": float(first_mark_price),
         "last_mark_price": float(last_mark_price),
         "paper_notional_usd": float(max(0.0, paper_notional_usd)),
@@ -1881,34 +2053,69 @@ def _candidate_threshold_pairs(
     buy_threshold: float,
     sell_threshold: float,
 ) -> list[tuple[float, float]]:
-    min_threshold = 0.004
-    max_threshold = 0.012
-    base_values = {0.004, 0.005, 0.006, 0.008, 0.010, 0.012}
-    base_values.add(float(np.clip(max(0.0005, buy_threshold), min_threshold, max_threshold)))
-    base_values.add(float(np.clip(max(0.0005, abs(sell_threshold)), min_threshold, max_threshold)))
-    ordered = sorted(
+    min_buy_threshold = 0.0005
+    max_buy_threshold = 0.012
+    min_sell_threshold = 0.004
+    max_sell_threshold = 0.080
+    base_buy_values = {0.0005, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.010, 0.012}
+    base_sell_values = {0.004, 0.005, 0.006, 0.008, 0.010, 0.012, 0.016, 0.020, 0.030, 0.040, 0.060, 0.080}
+    base_buy_values.add(
+        float(np.clip(max(0.0005, buy_threshold), min_buy_threshold, max_buy_threshold))
+    )
+    base_sell_values.add(
+        float(np.clip(max(0.0005, abs(sell_threshold)), min_sell_threshold, max_sell_threshold))
+    )
+    ordered_buy = sorted(
         value
-        for value in base_values
-        if min_threshold <= float(value) <= max_threshold
+        for value in base_buy_values
+        if min_buy_threshold <= float(value) <= max_buy_threshold
+    )
+    ordered_sell = sorted(
+        value
+        for value in base_sell_values
+        if min_sell_threshold <= float(value) <= max_sell_threshold
     )
     pairs: list[tuple[float, float]] = []
-    for buy_value in ordered:
-        for sell_value in ordered:
+    for buy_value in ordered_buy:
+        for sell_value in ordered_sell:
             pairs.append((float(buy_value), float(sell_value)))
     return pairs
 
 
 def _candidate_action_confidence_thresholds(minimum_threshold: float) -> list[float]:
-    floor = float(np.clip(minimum_threshold, 0.0, 1.0))
-    base = {0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, floor}
+    configured_floor = float(np.clip(minimum_threshold, 0.0, 1.0))
+    rescue_floor = float(np.clip(THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR, 0.0, 1.0))
+    candidate_floor = min(configured_floor, rescue_floor)
+    base = {
+        candidate_floor,
+        configured_floor,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+    }
     return [
         value
         for value in sorted(float(np.clip(item, 0.0, 1.0)) for item in base)
-        if value >= floor
+        if value >= candidate_floor
     ]
 
 
-def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, float, float, float, float, float, float]:
+def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
+    execution_trade_attempts = int(
+        metrics.get(
+            "execution_trade_attempts",
+            metrics.get("paper_trades_attempted", 0),
+        )
+    )
     execution_realized_pnl_delta_usd = float(
         metrics.get(
             "execution_realized_pnl_delta_usd",
@@ -1927,7 +2134,128 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, float, fl
     execution_rejection_rate = float(
         metrics.get("execution_rejection_rate", metrics.get("rejection_rate", 0.0))
     )
+    buy_hold_relative_lift = float(
+        metrics.get(
+            "buy_hold_relative_lift",
+            metrics.get("execution_buy_hold_relative_lift", 0.0),
+        )
+    )
+    buy_hold_return = float(
+        metrics.get(
+            "buy_hold_return",
+            metrics.get("execution_buy_hold_return", 0.0),
+        )
+    )
+    uptrend_lift_term = float(
+        metrics.get(
+            "uptrend_lift_term",
+            metrics.get("execution_uptrend_lift_term", buy_hold_relative_lift),
+        )
+    )
+    min_trade_attempts = max(
+        1,
+        int(
+            metrics.get(
+                "selection_constraint_min_trade_attempts",
+                THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS,
+            )
+        ),
+    )
+    min_fill_rate = float(
+        np.clip(
+            float(
+                metrics.get(
+                    "selection_constraint_min_fill_rate",
+                    THRESHOLD_SELECTION_MIN_FILL_RATE,
+                )
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    uptrend_lift_weight = float(
+        max(
+            0.0,
+            metrics.get(
+                "selection_constraint_uptrend_lift_weight",
+                THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT,
+            ),
+        )
+    )
+    min_uptrend_equity_return = float(
+        max(
+            0.0,
+            metrics.get(
+                "selection_constraint_min_uptrend_equity_return",
+                THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN,
+            ),
+        )
+    )
+    uptrend_regime_detected = bool(
+        metrics.get(
+            "selection_constraint_uptrend_regime_detected",
+            buy_hold_return > 0.0,
+        )
+    )
+    if "selection_constraint_uptrend_capture_pass" in metrics:
+        uptrend_capture_pass = float(bool(metrics.get("selection_constraint_uptrend_capture_pass")))
+    else:
+        uptrend_capture_pass = float(
+            (not uptrend_regime_detected) or (execution_equity_return >= min_uptrend_equity_return)
+        )
+    if "selection_constraint_uptrend_capture_ratio" in metrics:
+        uptrend_capture_ratio = float(metrics.get("selection_constraint_uptrend_capture_ratio", 0.0))
+    elif uptrend_regime_detected and min_uptrend_equity_return > 0.0:
+        uptrend_capture_ratio = float(
+            np.clip(
+                _safe_div(float(execution_equity_return), float(min_uptrend_equity_return)),
+                -1.0,
+                1.0,
+            )
+        )
+    else:
+        uptrend_capture_ratio = 1.0
+    if "selection_constraint_uptrend_long_bias_exposure_pass" in metrics:
+        uptrend_long_bias_exposure_pass = float(
+            bool(metrics.get("selection_constraint_uptrend_long_bias_exposure_pass"))
+        )
+    else:
+        uptrend_long_bias_exposure_pass = 1.0
+    uptrend_long_bias_exposure_ratio = float(
+        metrics.get("selection_constraint_uptrend_long_bias_exposure_ratio", 1.0)
+    )
+    if not np.isfinite(uptrend_long_bias_exposure_ratio):
+        uptrend_long_bias_exposure_ratio = 1.0
+    uptrend_long_bias_exposure_ratio = float(np.clip(uptrend_long_bias_exposure_ratio, -1.0, 1.0))
+    trade_attempt_pass = float(execution_trade_attempts >= min_trade_attempts)
+    fill_rate_pass = float(execution_fill_rate >= min_fill_rate)
+    combined_constraint_pass = float(
+        trade_attempt_pass > 0.0
+        and fill_rate_pass > 0.0
+        and uptrend_capture_pass > 0.0
+        and uptrend_long_bias_exposure_pass > 0.0
+    )
+    trade_attempt_ratio = min(
+        1.0,
+        _safe_div(float(execution_trade_attempts), float(min_trade_attempts)),
+    )
+    fill_rate_ratio = (
+        min(1.0, _safe_div(float(execution_fill_rate), float(min_fill_rate)))
+        if min_fill_rate > 0.0
+        else 1.0
+    )
     return (
+        combined_constraint_pass,
+        trade_attempt_pass,
+        fill_rate_pass,
+        uptrend_capture_pass,
+        uptrend_long_bias_exposure_pass,
+        trade_attempt_ratio,
+        fill_rate_ratio,
+        uptrend_capture_ratio,
+        uptrend_long_bias_exposure_ratio,
+        float(uptrend_lift_term * uptrend_lift_weight),
+        buy_hold_relative_lift,
         execution_realized_pnl_delta_usd,
         execution_equity_return,
         execution_equity_delta_usd,
@@ -1937,7 +2265,8 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, float, fl
         -execution_rejection_rate,
     )
 
-def _evaluation_selection_rank(evaluation: dict[str, Any]) -> tuple[float, float, float, float, float, float, float, float]:
+
+def _evaluation_selection_rank(evaluation: dict[str, Any]) -> tuple[float, ...]:
     actionable = (
         dict(evaluation.get("actionable_metrics", {}))
         if isinstance(evaluation.get("actionable_metrics", {}), dict)
@@ -1973,26 +2302,49 @@ def _select_best_model_family(
     paper_starting_cash_usd: float,
     paper_fee_bps: float,
     paper_slippage_bps: float,
-) -> tuple[dict[str, Any], str, dict[str, Any], list[dict[str, Any]]]:
+    optimize_action_confidence: bool = False,
+) -> tuple[dict[str, Any], str, dict[str, Any], list[dict[str, Any]], float]:
     candidate_models = _fit_model_family_candidates(train_frame)
     family_metrics: list[dict[str, Any]] = []
     best_family = "gaussian_nb"
     best_model = candidate_models[best_family]
     best_evaluation: dict[str, Any] | None = None
-    best_rank: tuple[float, float, float, float, float, float, float, float] | None = None
+    best_rank: tuple[float, ...] | None = None
+    best_selected_action_confidence_threshold = float(np.clip(action_confidence_threshold, 0.0, 1.0))
 
     for family, model_payload in candidate_models.items():
-        evaluation = _evaluate_model(
-            model_payload=model_payload,
-            test_frame=test_frame,
-            symbol=symbol,
-            one_way_cost_bps=one_way_cost_bps,
-            action_confidence_threshold=action_confidence_threshold,
-            paper_notional_usd=paper_notional_usd,
-            paper_starting_cash_usd=paper_starting_cash_usd,
-            paper_fee_bps=paper_fee_bps,
-            paper_slippage_bps=paper_slippage_bps,
-        )
+        selected_action_confidence_threshold = float(np.clip(action_confidence_threshold, 0.0, 1.0))
+        frontier_row_count = 0
+        if optimize_action_confidence:
+            (
+                selected_action_confidence_threshold,
+                evaluation,
+                frontier_rows,
+            ) = _select_action_confidence_frontier(
+                model_payload=model_payload,
+                test_frame=test_frame,
+                symbol=symbol,
+                one_way_cost_bps=one_way_cost_bps,
+                paper_notional_usd=paper_notional_usd,
+                paper_starting_cash_usd=paper_starting_cash_usd,
+                paper_fee_bps=paper_fee_bps,
+                paper_slippage_bps=paper_slippage_bps,
+                minimum_threshold=action_confidence_threshold,
+                optimize_thresholds=True,
+            )
+            frontier_row_count = int(len(frontier_rows))
+        else:
+            evaluation = _evaluate_model(
+                model_payload=model_payload,
+                test_frame=test_frame,
+                symbol=symbol,
+                one_way_cost_bps=one_way_cost_bps,
+                action_confidence_threshold=action_confidence_threshold,
+                paper_notional_usd=paper_notional_usd,
+                paper_starting_cash_usd=paper_starting_cash_usd,
+                paper_fee_bps=paper_fee_bps,
+                paper_slippage_bps=paper_slippage_bps,
+            )
         rank = _evaluation_selection_rank(evaluation)
         actionable = (
             dict(evaluation.get("actionable_metrics", {}))
@@ -2012,6 +2364,7 @@ def _select_best_model_family(
         family_metrics.append(
             {
                 "model_family": family,
+                "selected_action_confidence_threshold": float(selected_action_confidence_threshold),
                 "accuracy": float(evaluation.get("accuracy", 0.0)),
                 "net_expectancy_per_actionable": float(
                     expectancy.get("net_expectancy_per_actionable", 0.0)
@@ -2020,12 +2373,16 @@ def _select_best_model_family(
                     execution.get("realized_pnl_delta_usd", 0.0)
                 ),
                 "execution_equity_return": float(execution.get("equity_return", 0.0)),
+                "execution_trade_attempts": int(execution.get("paper_trades_attempted", 0)),
                 "execution_fill_rate": float(execution.get("fill_rate", 0.0)),
                 "execution_rejection_rate": float(execution.get("rejection_rate", 0.0)),
+                "buy_hold_relative_lift": float(execution.get("buy_hold_relative_lift", 0.0)),
+                "uptrend_lift_term": float(execution.get("uptrend_lift_term", 0.0)),
                 "actionable_rate": float(actionable.get("actionable_rate", 0.0)),
                 "binary_actionable_precision": float(
                     actionable.get("binary_actionable_precision", 0.0)
                 ),
+                "frontier_row_count": frontier_row_count,
                 "selection_rank": [float(value) for value in rank],
             }
         )
@@ -2034,24 +2391,49 @@ def _select_best_model_family(
             best_family = family
             best_model = model_payload
             best_evaluation = evaluation
+            best_selected_action_confidence_threshold = float(selected_action_confidence_threshold)
 
     if best_evaluation is None:
-        best_evaluation = _evaluate_model(
-            model_payload=best_model,
-            test_frame=test_frame,
-            symbol=symbol,
-            one_way_cost_bps=one_way_cost_bps,
-            action_confidence_threshold=action_confidence_threshold,
-            paper_notional_usd=paper_notional_usd,
-            paper_starting_cash_usd=paper_starting_cash_usd,
-            paper_fee_bps=paper_fee_bps,
-            paper_slippage_bps=paper_slippage_bps,
-        )
+        if optimize_action_confidence:
+            (
+                best_selected_action_confidence_threshold,
+                best_evaluation,
+                _,
+            ) = _select_action_confidence_frontier(
+                model_payload=best_model,
+                test_frame=test_frame,
+                symbol=symbol,
+                one_way_cost_bps=one_way_cost_bps,
+                paper_notional_usd=paper_notional_usd,
+                paper_starting_cash_usd=paper_starting_cash_usd,
+                paper_fee_bps=paper_fee_bps,
+                paper_slippage_bps=paper_slippage_bps,
+                minimum_threshold=action_confidence_threshold,
+                optimize_thresholds=True,
+            )
+        else:
+            best_evaluation = _evaluate_model(
+                model_payload=best_model,
+                test_frame=test_frame,
+                symbol=symbol,
+                one_way_cost_bps=one_way_cost_bps,
+                action_confidence_threshold=action_confidence_threshold,
+                paper_notional_usd=paper_notional_usd,
+                paper_starting_cash_usd=paper_starting_cash_usd,
+                paper_fee_bps=paper_fee_bps,
+                paper_slippage_bps=paper_slippage_bps,
+            )
     family_metrics.sort(
         key=lambda item: tuple(float(value) for value in item.get("selection_rank", [])),
         reverse=True,
     )
-    return best_model, best_family, best_evaluation, family_metrics
+    return (
+        best_model,
+        best_family,
+        best_evaluation,
+        family_metrics,
+        float(best_selected_action_confidence_threshold),
+    )
 
 
 def _select_action_confidence_frontier(
@@ -2075,7 +2457,7 @@ def _select_action_confidence_frontier(
     selected_threshold = float(np.clip(minimum_threshold, 0.0, 1.0))
     selected_evaluation: dict[str, Any] | None = None
     frontier_rows: list[dict[str, Any]] = []
-    best_rank: tuple[float, float, float, float, float, float, float] | None = None
+    best_rank: tuple[float, ...] | None = None
 
     for threshold in candidate_thresholds:
         evaluation = _evaluate_model(
@@ -2099,8 +2481,11 @@ def _select_action_confidence_frontier(
         execution_realized_pnl_delta_usd = float(
             execution_backtest.get("realized_pnl_delta_usd", 0.0)
         )
+        execution_trade_attempts = int(execution_backtest.get("paper_trades_attempted", 0))
         execution_fill_rate = float(execution_backtest.get("fill_rate", 0.0))
         execution_rejection_rate = float(execution_backtest.get("rejection_rate", 0.0))
+        buy_hold_relative_lift = float(execution_backtest.get("buy_hold_relative_lift", 0.0))
+        uptrend_lift_term = float(execution_backtest.get("uptrend_lift_term", 0.0))
         row = {
             "threshold": float(threshold),
             "accuracy": float(evaluation.get("accuracy", 0.0)),
@@ -2116,8 +2501,64 @@ def _select_action_confidence_frontier(
             "execution_equity_return": execution_equity_return,
             "execution_equity_delta_usd": execution_equity_delta_usd,
             "execution_realized_pnl_delta_usd": execution_realized_pnl_delta_usd,
+            "execution_trade_attempts": int(execution_trade_attempts),
             "execution_fill_rate": execution_fill_rate,
             "execution_rejection_rate": execution_rejection_rate,
+            "buy_hold_return": float(execution_backtest.get("buy_hold_return", 0.0)),
+            "buy_hold_relative_lift": buy_hold_relative_lift,
+            "uptrend_lift_term": uptrend_lift_term,
+            "uptrend_buy_attempt_share": float(
+                execution_backtest.get("uptrend_buy_attempt_share", 0.0)
+            ),
+            "uptrend_sell_attempt_share": float(
+                execution_backtest.get("uptrend_sell_attempt_share", 0.0)
+            ),
+            "uptrend_net_long_action_balance": int(
+                execution_backtest.get("uptrend_net_long_action_balance", 0)
+            ),
+            "uptrend_long_bias_mean_exposure_fraction": float(
+                execution_backtest.get("uptrend_long_bias_mean_exposure_fraction", 0.0)
+            ),
+            "selection_constraint_min_trade_attempts": int(
+                THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS
+            ),
+            "selection_constraint_min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
+            "selection_constraint_min_uptrend_equity_return": float(
+                THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
+            ),
+            "selection_constraint_uptrend_lift_weight": float(
+                THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT
+            ),
+            "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
+                THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+            ),
+            "selection_constraint_confidence_rescue_floor": float(
+                THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
+            ),
+            "selection_constraint_uptrend_regime_detected": bool(
+                execution_backtest.get("selection_constraint_uptrend_regime_detected", False)
+            ),
+            "selection_constraint_uptrend_capture_pass": bool(
+                execution_backtest.get("selection_constraint_uptrend_capture_pass", True)
+            ),
+            "selection_constraint_uptrend_capture_ratio": float(
+                execution_backtest.get("selection_constraint_uptrend_capture_ratio", 1.0)
+            ),
+            "selection_constraint_uptrend_long_bias_active": bool(
+                execution_backtest.get("selection_constraint_uptrend_long_bias_active", False)
+            ),
+            "selection_constraint_uptrend_long_bias_exposure_pass": bool(
+                execution_backtest.get(
+                    "selection_constraint_uptrend_long_bias_exposure_pass",
+                    True,
+                )
+            ),
+            "selection_constraint_uptrend_long_bias_exposure_ratio": float(
+                execution_backtest.get(
+                    "selection_constraint_uptrend_long_bias_exposure_ratio",
+                    1.0,
+                )
+            ),
         }
         frontier_rows.append(row)
         rank = _execution_selection_rank(row)
@@ -2163,8 +2604,66 @@ def _select_action_confidence_frontier(
                 "execution_realized_pnl_delta_usd": float(
                     execution_backtest.get("realized_pnl_delta_usd", 0.0)
                 ),
+                "execution_trade_attempts": int(execution_backtest.get("paper_trades_attempted", 0)),
                 "execution_fill_rate": float(execution_backtest.get("fill_rate", 0.0)),
                 "execution_rejection_rate": float(execution_backtest.get("rejection_rate", 0.0)),
+                "buy_hold_return": float(execution_backtest.get("buy_hold_return", 0.0)),
+                "buy_hold_relative_lift": float(
+                    execution_backtest.get("buy_hold_relative_lift", 0.0)
+                ),
+                "uptrend_lift_term": float(execution_backtest.get("uptrend_lift_term", 0.0)),
+                "uptrend_buy_attempt_share": float(
+                    execution_backtest.get("uptrend_buy_attempt_share", 0.0)
+                ),
+                "uptrend_sell_attempt_share": float(
+                    execution_backtest.get("uptrend_sell_attempt_share", 0.0)
+                ),
+                "uptrend_net_long_action_balance": int(
+                    execution_backtest.get("uptrend_net_long_action_balance", 0)
+                ),
+                "uptrend_long_bias_mean_exposure_fraction": float(
+                    execution_backtest.get("uptrend_long_bias_mean_exposure_fraction", 0.0)
+                ),
+                "selection_constraint_min_trade_attempts": int(
+                    THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS
+                ),
+                "selection_constraint_min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
+                "selection_constraint_min_uptrend_equity_return": float(
+                    THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
+                ),
+                "selection_constraint_uptrend_lift_weight": float(
+                    THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT
+                ),
+                "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
+                    THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+                ),
+                "selection_constraint_confidence_rescue_floor": float(
+                    THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
+                ),
+                "selection_constraint_uptrend_regime_detected": bool(
+                    execution_backtest.get("selection_constraint_uptrend_regime_detected", False)
+                ),
+                "selection_constraint_uptrend_capture_pass": bool(
+                    execution_backtest.get("selection_constraint_uptrend_capture_pass", True)
+                ),
+                "selection_constraint_uptrend_capture_ratio": float(
+                    execution_backtest.get("selection_constraint_uptrend_capture_ratio", 1.0)
+                ),
+                "selection_constraint_uptrend_long_bias_active": bool(
+                    execution_backtest.get("selection_constraint_uptrend_long_bias_active", False)
+                ),
+                "selection_constraint_uptrend_long_bias_exposure_pass": bool(
+                    execution_backtest.get(
+                        "selection_constraint_uptrend_long_bias_exposure_pass",
+                        True,
+                    )
+                ),
+                "selection_constraint_uptrend_long_bias_exposure_ratio": float(
+                    execution_backtest.get(
+                        "selection_constraint_uptrend_long_bias_exposure_ratio",
+                        1.0,
+                    )
+                ),
             }
         )
     return selected_threshold, selected_evaluation, frontier_rows
@@ -2404,6 +2903,7 @@ def train_trigger_model(
                 candidate_model_family,
                 candidate_eval,
                 candidate_family_metrics,
+                candidate_action_confidence_threshold,
             ) = _select_best_model_family(
                 train_frame=candidate_train,
                 test_frame=candidate_test,
@@ -2414,6 +2914,7 @@ def train_trigger_model(
                 paper_starting_cash_usd=resolved_paper_starting_cash_usd,
                 paper_fee_bps=resolved_paper_fee_bps,
                 paper_slippage_bps=resolved_paper_slippage_bps,
+                optimize_action_confidence=True,
             )
             expectancy = dict(candidate_eval.get("expectancy_metrics", {}))
             actionable = dict(candidate_eval.get("actionable_metrics", {}))
@@ -2428,6 +2929,9 @@ def train_trigger_model(
                     "buy_threshold": candidate_buy,
                     "sell_threshold": candidate_sell,
                     "trade_quality_min_score": resolved_trade_quality_min_score,
+                    "selected_action_confidence_threshold": float(
+                        candidate_action_confidence_threshold
+                    ),
                     "sample_count": int(len(candidate_labeled)),
                     "train_count": int(candidate_train_count),
                     "test_count": int(candidate_test_count),
@@ -2441,13 +2945,75 @@ def train_trigger_model(
                     "execution_realized_pnl_delta_usd": float(
                         execution_backtest.get("realized_pnl_delta_usd", 0.0)
                     ),
+                    "execution_trade_attempts": int(
+                        execution_backtest.get("paper_trades_attempted", 0)
+                    ),
                     "execution_fill_rate": float(execution_backtest.get("fill_rate", 0.0)),
                     "execution_rejection_rate": float(execution_backtest.get("rejection_rate", 0.0)),
+                    "buy_hold_return": float(execution_backtest.get("buy_hold_return", 0.0)),
+                    "buy_hold_relative_lift": float(
+                        execution_backtest.get("buy_hold_relative_lift", 0.0)
+                    ),
+                    "uptrend_lift_term": float(execution_backtest.get("uptrend_lift_term", 0.0)),
+                    "uptrend_buy_attempt_share": float(
+                        execution_backtest.get("uptrend_buy_attempt_share", 0.0)
+                    ),
+                    "uptrend_sell_attempt_share": float(
+                        execution_backtest.get("uptrend_sell_attempt_share", 0.0)
+                    ),
+                    "uptrend_net_long_action_balance": int(
+                        execution_backtest.get("uptrend_net_long_action_balance", 0)
+                    ),
+                    "uptrend_long_bias_mean_exposure_fraction": float(
+                        execution_backtest.get("uptrend_long_bias_mean_exposure_fraction", 0.0)
+                    ),
                     "actionable_rate": float(actionable.get("actionable_rate", 0.0)),
                     "binary_actionable_precision": float(
                         actionable.get("binary_actionable_precision", 0.0)
                     ),
                     "trade_quality_pass_rate": quality_pass_rate,
+                    "selection_constraint_min_trade_attempts": int(
+                        THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS
+                    ),
+                    "selection_constraint_min_fill_rate": float(
+                        THRESHOLD_SELECTION_MIN_FILL_RATE
+                    ),
+                    "selection_constraint_min_uptrend_equity_return": float(
+                        THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
+                    ),
+                    "selection_constraint_uptrend_lift_weight": float(
+                        THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT
+                    ),
+                    "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
+                        THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+                    ),
+                    "selection_constraint_confidence_rescue_floor": float(
+                        THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
+                    ),
+                    "selection_constraint_uptrend_regime_detected": bool(
+                        execution_backtest.get("selection_constraint_uptrend_regime_detected", False)
+                    ),
+                    "selection_constraint_uptrend_capture_pass": bool(
+                        execution_backtest.get("selection_constraint_uptrend_capture_pass", True)
+                    ),
+                    "selection_constraint_uptrend_capture_ratio": float(
+                        execution_backtest.get("selection_constraint_uptrend_capture_ratio", 1.0)
+                    ),
+                    "selection_constraint_uptrend_long_bias_active": bool(
+                        execution_backtest.get("selection_constraint_uptrend_long_bias_active", False)
+                    ),
+                    "selection_constraint_uptrend_long_bias_exposure_pass": bool(
+                        execution_backtest.get(
+                            "selection_constraint_uptrend_long_bias_exposure_pass",
+                            True,
+                        )
+                    ),
+                    "selection_constraint_uptrend_long_bias_exposure_ratio": float(
+                        execution_backtest.get(
+                            "selection_constraint_uptrend_long_bias_exposure_ratio",
+                            1.0,
+                        )
+                    ),
                     "selected_model_family": candidate_model_family,
                     "model_family_candidates": candidate_family_metrics,
                 }
@@ -2486,7 +3052,7 @@ def train_trigger_model(
     evaluation: dict[str, Any] | None = None
     action_confidence_frontier: list[dict[str, Any]] = []
     model_family_selection_rows: list[dict[str, Any]] = []
-    best_family_rank: tuple[float, float, float, float, float, float, float, float] | None = None
+    best_family_rank: tuple[float, ...] | None = None
     for family, candidate_model in model_candidates.items():
         (
             candidate_threshold,
@@ -2689,6 +3255,16 @@ def train_trigger_model(
         "threshold_optimization": {
             "enabled": bool(optimize_thresholds),
             "objective": EXECUTION_THRESHOLD_SELECTION_OBJECTIVE,
+            "constraint_settings": {
+                "min_trade_attempts": int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS),
+                "min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
+                "min_uptrend_equity_return": float(THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN),
+                "uptrend_lift_weight": float(THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT),
+                "uptrend_long_bias_min_exposure_fraction": float(
+                    THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+                ),
+                "confidence_rescue_floor": float(THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR),
+            },
             "candidate_count": int(len(threshold_candidates)),
             "selected": {
                 "buy_threshold": float(selected_buy_threshold),
@@ -2700,6 +3276,20 @@ def train_trigger_model(
             "top_candidates": threshold_candidates[:10],
             "action_confidence_frontier": {
                 "objective": EXECUTION_THRESHOLD_SELECTION_OBJECTIVE,
+                "constraint_settings": {
+                    "min_trade_attempts": int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS),
+                    "min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
+                    "min_uptrend_equity_return": float(
+                        THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
+                    ),
+                    "uptrend_lift_weight": float(THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT),
+                    "uptrend_long_bias_min_exposure_fraction": float(
+                        THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+                    ),
+                    "confidence_rescue_floor": float(
+                        THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
+                    ),
+                },
                 "candidate_count": int(len(action_confidence_frontier)),
                 "selected_threshold": float(selected_action_confidence_threshold),
                 "rows": action_confidence_frontier[:20],
