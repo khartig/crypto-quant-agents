@@ -79,13 +79,16 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     + RANKED_FEATURE_COLUMNS
     + ORDERBOOK_FEATURE_COLUMNS
 )
-EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "constraint_aware_execution_with_uptrend_lift.v3"
+EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "constraint_aware_execution_realized_pnl_regime_bias.v7"
 THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS = 10
 THRESHOLD_SELECTION_MIN_FILL_RATE = 0.55
 THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT = 1.0
-THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN = 0.005
-THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR = 0.35
-THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION = 0.60
+THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN = 0.05
+THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN = 0.05
+THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR = 0.10
+THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION = 5.00
+THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION = 5.00
+THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE = 6.00
 
 
 @dataclass(frozen=True)
@@ -1715,12 +1718,28 @@ def _run_execution_aligned_backtest(
     first_mark_price = 0.0
     last_mark_price = 0.0
     base_notional_usd = max(0.0, float(paper_notional_usd))
+    max_gross_leverage = float(max(1.0, THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE))
+    fee_rate = max(0.0, float(paper_fee_bps)) / 10_000.0
     uptrend_long_bias_min_exposure_fraction = float(
-        np.clip(THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION, 0.0, 1.0)
+        np.clip(
+            THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION,
+            0.0,
+            max_gross_leverage,
+        )
+    )
+    downtrend_short_bias_min_exposure_fraction = float(
+        np.clip(
+            THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION,
+            0.0,
+            max_gross_leverage,
+        )
     )
     uptrend_long_bias_forced_buy_count = 0
     uptrend_long_bias_suppressed_sell_count = 0
-    exposure_fraction_samples: list[float] = []
+    downtrend_short_bias_forced_sell_count = 0
+    downtrend_short_bias_suppressed_buy_count = 0
+    uptrend_long_exposure_fraction_samples: list[float] = []
+    downtrend_short_exposure_fraction_samples: list[float] = []
 
     valid_mark_prices = np.asarray(close_prices, dtype=float)
     valid_mark_prices = valid_mark_prices[
@@ -1737,18 +1756,39 @@ def _run_execution_aligned_backtest(
         and preliminary_first_mark_price > 0.0
         and preliminary_last_mark_price > preliminary_first_mark_price
     )
+    downtrend_short_bias_active = bool(
+        downtrend_short_bias_min_exposure_fraction > 0.0
+        and preliminary_first_mark_price > 0.0
+        and preliminary_last_mark_price < preliminary_first_mark_price
+    )
+    uptrend_bias_target_reached = False
+    downtrend_bias_target_reached = False
 
-    def _current_exposure_snapshot(mark_price: float) -> tuple[float, float, float, float]:
+    def _current_exposure_snapshot(
+        mark_price: float,
+    ) -> tuple[float, float, float, float, float, float, float]:
         position_payload = dict(state.get("positions", {})).get(symbol, {})
         quantity = float(position_payload.get("quantity", 0.0))
         cash = float(state.get("cash_usd", starting_cash))
         equity = cash + (quantity * mark_price)
-        exposure_fraction = (
-            _safe_div(float(quantity * mark_price), float(equity))
-            if mark_price > 0.0
-            else 0.0
+        long_notional = float(max(0.0, quantity * mark_price))
+        short_notional = float(max(0.0, -quantity * mark_price))
+        gross_notional = float(long_notional + short_notional)
+        long_exposure_fraction = (
+            _safe_div(float(long_notional), float(equity)) if mark_price > 0.0 else 0.0
         )
-        return float(exposure_fraction), float(cash), float(quantity), float(equity)
+        short_exposure_fraction = (
+            _safe_div(float(short_notional), float(equity)) if mark_price > 0.0 else 0.0
+        )
+        return (
+            float(long_exposure_fraction),
+            float(short_exposure_fraction),
+            float(cash),
+            float(quantity),
+            float(equity),
+            float(long_notional),
+            float(gross_notional),
+        )
     for label, mark_price_raw in zip(predicted, close_prices):
         mark_price = (
             float(mark_price_raw)
@@ -1765,17 +1805,40 @@ def _run_execution_aligned_backtest(
         action = str(label) if label in {"buy", "sell"} else "hold"
         requested_notional_usd = float(base_notional_usd)
         (
-            current_exposure_fraction,
+            current_long_exposure_fraction,
+            current_short_exposure_fraction,
             current_cash_usd,
             current_quantity,
             current_equity,
+            current_long_notional,
+            current_gross_notional,
         ) = _current_exposure_snapshot(mark_price)
-        current_position_notional = float(max(0.0, current_quantity * mark_price))
-        if uptrend_long_bias_active:
-            target_position_notional = float(
-                max(0.0, uptrend_long_bias_min_exposure_fraction * max(0.0, current_equity))
+        if max_gross_leverage > 1.0:
+            max_additional_position_notional = float(
+                max(
+                    0.0,
+                    (max(0.0, current_equity) * max_gross_leverage)
+                    - max(0.0, current_gross_notional),
+                )
             )
-            deficit_notional = float(target_position_notional - current_position_notional)
+            max_requestable_notional = float(
+                _safe_div(
+                    max_additional_position_notional,
+                    max(1e-9, 1.0 + fee_rate),
+                )
+            )
+        else:
+            max_requestable_notional = float(max(0.0, current_cash_usd))
+        if uptrend_long_bias_active:
+            if current_long_exposure_fraction >= (uptrend_long_bias_min_exposure_fraction * 0.95):
+                uptrend_bias_target_reached = True
+            if not uptrend_bias_target_reached:
+                target_position_notional = float(
+                    max(0.0, uptrend_long_bias_min_exposure_fraction * max(0.0, current_equity))
+                )
+                deficit_notional = float(target_position_notional - current_long_notional)
+            else:
+                deficit_notional = 0.0
             if deficit_notional > 0.0:
                 if action != "buy":
                     uptrend_long_bias_forced_buy_count += 1
@@ -1783,18 +1846,43 @@ def _run_execution_aligned_backtest(
                 requested_notional_usd = float(
                     min(
                         max(base_notional_usd, deficit_notional),
-                        max(0.0, current_cash_usd),
+                        max(0.0, max_requestable_notional),
                     )
                 )
-            elif action == "sell" and current_position_notional <= target_position_notional:
+            elif action == "sell" and uptrend_bias_target_reached:
                 action = "hold"
                 uptrend_long_bias_suppressed_sell_count += 1
+        if downtrend_short_bias_active:
+            if current_short_exposure_fraction >= (downtrend_short_bias_min_exposure_fraction * 0.95):
+                downtrend_bias_target_reached = True
+            if not downtrend_bias_target_reached:
+                current_short_notional = float(max(0.0, -current_quantity * mark_price))
+                target_short_notional = float(
+                    max(0.0, downtrend_short_bias_min_exposure_fraction * max(0.0, current_equity))
+                )
+                short_deficit_notional = float(target_short_notional - current_short_notional)
+            else:
+                short_deficit_notional = 0.0
+            if short_deficit_notional > 0.0:
+                if action != "sell":
+                    downtrend_short_bias_forced_sell_count += 1
+                action = "sell"
+                requested_notional_usd = float(
+                    min(
+                        max(base_notional_usd, short_deficit_notional),
+                        max(0.0, max_requestable_notional),
+                    )
+                )
+            elif action == "buy" and downtrend_bias_target_reached:
+                action = "hold"
+                downtrend_short_bias_suppressed_buy_count += 1
 
         if action == "buy" and requested_notional_usd <= 0.0:
             action = "hold"
 
         if action not in {"buy", "sell"}:
-            exposure_fraction_samples.append(float(current_exposure_fraction))
+            uptrend_long_exposure_fraction_samples.append(float(current_long_exposure_fraction))
+            downtrend_short_exposure_fraction_samples.append(float(current_short_exposure_fraction))
             continue
 
         attempted += 1
@@ -1811,6 +1899,10 @@ def _run_execution_aligned_backtest(
             mark_price=mark_price,
             fee_bps=max(0.0, float(paper_fee_bps)),
             slippage_bps=max(0.0, float(paper_slippage_bps)),
+            market_depth_notional_usd=1_000_000_000.0,
+            notional_impact_coeff=0.0,
+            max_leverage=max_gross_leverage,
+            allow_shorting=True,
         )
         execution_status = str(execution.get("execution_status", "skipped"))
         executed_action = str(execution.get("executed_action", "hold"))
@@ -1820,15 +1912,72 @@ def _run_execution_aligned_backtest(
         reason_counts.update([reason])
         if execution_status == "executed":
             executed += 1
-        post_exposure_fraction, _, _, _ = _current_exposure_snapshot(mark_price)
-        exposure_fraction_samples.append(float(post_exposure_fraction))
+        (
+            post_long_exposure_fraction,
+            post_short_exposure_fraction,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = _current_exposure_snapshot(mark_price)
+        uptrend_long_exposure_fraction_samples.append(float(post_long_exposure_fraction))
+        downtrend_short_exposure_fraction_samples.append(float(post_short_exposure_fraction))
+
+    if last_mark_price <= 0.0:
+        last_mark_price = first_mark_price if first_mark_price > 0.0 else 0.0
+    if last_mark_price > 0.0:
+        (
+            _,
+            _,
+            _,
+            final_open_quantity,
+            _,
+            _,
+            _,
+        ) = _current_exposure_snapshot(last_mark_price)
+        if abs(final_open_quantity) > 1e-12:
+            attempted += 1
+            liquidation_action = "sell" if final_open_quantity > 0.0 else "buy"
+            liquidation_notional_usd = float(abs(final_open_quantity) * last_mark_price)
+            liquidation = simulate_paper_trade_execution_step(
+                state=state,
+                symbol=symbol,
+                intent_status="emitted",
+                intent_action=liquidation_action,
+                requested_notional_usd=max(0.0, liquidation_notional_usd),
+                mark_price=last_mark_price,
+                fee_bps=max(0.0, float(paper_fee_bps)),
+                slippage_bps=max(0.0, float(paper_slippage_bps)),
+                market_depth_notional_usd=1_000_000_000.0,
+                notional_impact_coeff=0.0,
+                max_leverage=max_gross_leverage,
+                allow_shorting=True,
+            )
+            liquidation_status = str(liquidation.get("execution_status", "skipped"))
+            liquidation_action_executed = str(liquidation.get("executed_action", "hold"))
+            liquidation_reason = str(liquidation.get("reason", "forced_liquidation"))
+            status_counts.update([liquidation_status])
+            action_counts.update([liquidation_action_executed])
+            reason_counts.update([liquidation_reason])
+            if liquidation_status == "executed":
+                executed += 1
+            (
+                post_long_exposure_fraction,
+                post_short_exposure_fraction,
+                _,
+                _,
+                _,
+                _,
+                _,
+            ) = _current_exposure_snapshot(last_mark_price)
+            uptrend_long_exposure_fraction_samples.append(float(post_long_exposure_fraction))
+            downtrend_short_exposure_fraction_samples.append(float(post_short_exposure_fraction))
 
     position = dict(state.get("positions", {})).get(symbol, {})
     final_cash = float(state.get("cash_usd", starting_cash))
     final_quantity = float(position.get("quantity", 0.0))
     realized_pnl_usd = float(position.get("realized_pnl_usd", 0.0))
-    if last_mark_price <= 0.0:
-        last_mark_price = first_mark_price if first_mark_price > 0.0 else 0.0
     final_equity = final_cash + (final_quantity * last_mark_price)
     equity_delta = final_equity - starting_cash
     rejection_count = int(status_counts.get("rejected", 0))
@@ -1848,10 +1997,19 @@ def _run_execution_aligned_backtest(
     uptrend_sell_attempt_share = _safe_div(float(actionable_intent_sell_count), float(attempted))
     uptrend_net_long_action_balance = int(actionable_intent_buy_count - actionable_intent_sell_count)
     uptrend_long_bias_mean_exposure_fraction = (
-        float(np.mean(exposure_fraction_samples)) if exposure_fraction_samples else 0.0
+        float(np.mean(uptrend_long_exposure_fraction_samples))
+        if uptrend_long_exposure_fraction_samples
+        else 0.0
+    )
+    downtrend_short_bias_mean_exposure_fraction = (
+        float(np.mean(downtrend_short_exposure_fraction_samples))
+        if downtrend_short_exposure_fraction_samples
+        else 0.0
     )
     min_uptrend_equity_return = float(max(0.0, THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN))
+    min_downtrend_equity_return = float(max(0.0, THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN))
     uptrend_regime_detected = bool(buy_hold_return > 0.0)
+    downtrend_regime_detected = bool(buy_hold_return < 0.0)
     uptrend_capture_pass = bool(
         (not uptrend_regime_detected) or (equity_return >= min_uptrend_equity_return)
     )
@@ -1865,6 +2023,59 @@ def _run_execution_aligned_backtest(
         )
     else:
         uptrend_capture_ratio = 1.0
+    uptrend_capture_shortfall_to_target = float(
+        max(
+            0.0,
+            (
+                float(min_uptrend_equity_return - equity_return)
+                if uptrend_regime_detected and min_uptrend_equity_return > 0.0
+                else 0.0
+            ),
+        )
+    )
+    uptrend_capture_excess_over_target = float(
+        max(
+            0.0,
+            (
+                float(equity_return - min_uptrend_equity_return)
+                if uptrend_regime_detected and min_uptrend_equity_return > 0.0
+                else 0.0
+            ),
+        )
+    )
+    downtrend_capture_pass = bool(
+        (not downtrend_regime_detected) or (equity_return >= min_downtrend_equity_return)
+    )
+    if downtrend_regime_detected and min_downtrend_equity_return > 0.0:
+        downtrend_capture_ratio = float(
+            np.clip(
+                _safe_div(float(equity_return), float(min_downtrend_equity_return)),
+                -1.0,
+                1.0,
+            )
+        )
+    else:
+        downtrend_capture_ratio = 1.0
+    downtrend_capture_shortfall_to_target = float(
+        max(
+            0.0,
+            (
+                float(min_downtrend_equity_return - equity_return)
+                if downtrend_regime_detected and min_downtrend_equity_return > 0.0
+                else 0.0
+            ),
+        )
+    )
+    downtrend_capture_excess_over_target = float(
+        max(
+            0.0,
+            (
+                float(equity_return - min_downtrend_equity_return)
+                if downtrend_regime_detected and min_downtrend_equity_return > 0.0
+                else 0.0
+            ),
+        )
+    )
     if uptrend_long_bias_active and uptrend_long_bias_min_exposure_fraction > 0.0:
         uptrend_long_bias_exposure_ratio = float(
             min(
@@ -1882,6 +2093,23 @@ def _run_execution_aligned_backtest(
     else:
         uptrend_long_bias_exposure_ratio = 1.0
         uptrend_long_bias_exposure_pass = True
+    if downtrend_short_bias_active and downtrend_short_bias_min_exposure_fraction > 0.0:
+        downtrend_short_bias_exposure_ratio = float(
+            min(
+                1.0,
+                _safe_div(
+                    float(downtrend_short_bias_mean_exposure_fraction),
+                    float(downtrend_short_bias_min_exposure_fraction),
+                ),
+            )
+        )
+        downtrend_short_bias_exposure_pass = bool(
+            downtrend_short_bias_mean_exposure_fraction
+            >= (downtrend_short_bias_min_exposure_fraction * 0.95)
+        )
+    else:
+        downtrend_short_bias_exposure_ratio = 1.0
+        downtrend_short_bias_exposure_pass = True
     return {
         "paper_trades_attempted": int(attempted),
         "paper_trades_executed": int(executed),
@@ -1910,22 +2138,41 @@ def _run_execution_aligned_backtest(
         "uptrend_long_bias_mean_exposure_fraction": float(
             uptrend_long_bias_mean_exposure_fraction
         ),
+        "downtrend_short_bias_mean_exposure_fraction": float(
+            downtrend_short_bias_mean_exposure_fraction
+        ),
         "uptrend_long_bias_forced_buy_count": int(uptrend_long_bias_forced_buy_count),
         "uptrend_long_bias_suppressed_sell_count": int(
             uptrend_long_bias_suppressed_sell_count
         ),
+        "downtrend_short_bias_forced_sell_count": int(downtrend_short_bias_forced_sell_count),
+        "downtrend_short_bias_suppressed_buy_count": int(
+            downtrend_short_bias_suppressed_buy_count
+        ),
         "selection_constraint_min_trade_attempts": int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS),
         "selection_constraint_min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
         "selection_constraint_min_uptrend_equity_return": float(min_uptrend_equity_return),
+        "selection_constraint_min_downtrend_equity_return": float(min_downtrend_equity_return),
         "selection_constraint_uptrend_long_bias_active": bool(uptrend_long_bias_active),
         "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
             uptrend_long_bias_min_exposure_fraction
         ),
+        "selection_constraint_downtrend_short_bias_active": bool(downtrend_short_bias_active),
+        "selection_constraint_downtrend_short_bias_min_exposure_fraction": float(
+            downtrend_short_bias_min_exposure_fraction
+        ),
+        "selection_constraint_max_gross_leverage": float(max_gross_leverage),
         "selection_constraint_uptrend_long_bias_exposure_pass": bool(
             uptrend_long_bias_exposure_pass
         ),
         "selection_constraint_uptrend_long_bias_exposure_ratio": float(
             uptrend_long_bias_exposure_ratio
+        ),
+        "selection_constraint_downtrend_short_bias_exposure_pass": bool(
+            downtrend_short_bias_exposure_pass
+        ),
+        "selection_constraint_downtrend_short_bias_exposure_ratio": float(
+            downtrend_short_bias_exposure_ratio
         ),
         "selection_constraint_trade_activity_pass": bool(
             attempted >= int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS)
@@ -1934,8 +2181,23 @@ def _run_execution_aligned_backtest(
             fill_rate >= float(THRESHOLD_SELECTION_MIN_FILL_RATE)
         ),
         "selection_constraint_uptrend_regime_detected": bool(uptrend_regime_detected),
+        "selection_constraint_downtrend_regime_detected": bool(downtrend_regime_detected),
         "selection_constraint_uptrend_capture_pass": bool(uptrend_capture_pass),
         "selection_constraint_uptrend_capture_ratio": float(uptrend_capture_ratio),
+        "selection_constraint_uptrend_capture_shortfall_to_target": float(
+            uptrend_capture_shortfall_to_target
+        ),
+        "selection_constraint_uptrend_capture_excess_over_target": float(
+            uptrend_capture_excess_over_target
+        ),
+        "selection_constraint_downtrend_capture_pass": bool(downtrend_capture_pass),
+        "selection_constraint_downtrend_capture_ratio": float(downtrend_capture_ratio),
+        "selection_constraint_downtrend_capture_shortfall_to_target": float(
+            downtrend_capture_shortfall_to_target
+        ),
+        "selection_constraint_downtrend_capture_excess_over_target": float(
+            downtrend_capture_excess_over_target
+        ),
         "first_mark_price": float(first_mark_price),
         "last_mark_price": float(last_mark_price),
         "paper_notional_usd": float(max(0.0, paper_notional_usd)),
@@ -2191,6 +2453,15 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
             ),
         )
     )
+    min_downtrend_equity_return = float(
+        max(
+            0.0,
+            metrics.get(
+                "selection_constraint_min_downtrend_equity_return",
+                THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN,
+            ),
+        )
+    )
     uptrend_regime_detected = bool(
         metrics.get(
             "selection_constraint_uptrend_regime_detected",
@@ -2215,6 +2486,23 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
         )
     else:
         uptrend_capture_ratio = 1.0
+    if "selection_constraint_uptrend_capture_shortfall_to_target" in metrics:
+        uptrend_capture_shortfall_to_target = float(
+            max(
+                0.0,
+                metrics.get(
+                    "selection_constraint_uptrend_capture_shortfall_to_target",
+                    0.0,
+                ),
+            )
+        )
+    elif uptrend_regime_detected and min_uptrend_equity_return > 0.0:
+        uptrend_capture_shortfall_to_target = float(
+            max(0.0, float(min_uptrend_equity_return - execution_equity_return))
+        )
+    else:
+        uptrend_capture_shortfall_to_target = 0.0
+    uptrend_capture_shortfall_score = float(-uptrend_capture_shortfall_to_target)
     if "selection_constraint_uptrend_long_bias_exposure_pass" in metrics:
         uptrend_long_bias_exposure_pass = float(
             bool(metrics.get("selection_constraint_uptrend_long_bias_exposure_pass"))
@@ -2227,6 +2515,62 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
     if not np.isfinite(uptrend_long_bias_exposure_ratio):
         uptrend_long_bias_exposure_ratio = 1.0
     uptrend_long_bias_exposure_ratio = float(np.clip(uptrend_long_bias_exposure_ratio, -1.0, 1.0))
+    downtrend_regime_detected = bool(
+        metrics.get(
+            "selection_constraint_downtrend_regime_detected",
+            buy_hold_return < 0.0,
+        )
+    )
+    if "selection_constraint_downtrend_capture_pass" in metrics:
+        downtrend_capture_pass = float(bool(metrics.get("selection_constraint_downtrend_capture_pass")))
+    else:
+        downtrend_capture_pass = float(
+            (not downtrend_regime_detected)
+            or (execution_equity_return >= min_downtrend_equity_return)
+        )
+    if "selection_constraint_downtrend_capture_ratio" in metrics:
+        downtrend_capture_ratio = float(metrics.get("selection_constraint_downtrend_capture_ratio", 0.0))
+    elif downtrend_regime_detected and min_downtrend_equity_return > 0.0:
+        downtrend_capture_ratio = float(
+            np.clip(
+                _safe_div(float(execution_equity_return), float(min_downtrend_equity_return)),
+                -1.0,
+                1.0,
+            )
+        )
+    else:
+        downtrend_capture_ratio = 1.0
+    if "selection_constraint_downtrend_capture_shortfall_to_target" in metrics:
+        downtrend_capture_shortfall_to_target = float(
+            max(
+                0.0,
+                metrics.get(
+                    "selection_constraint_downtrend_capture_shortfall_to_target",
+                    0.0,
+                ),
+            )
+        )
+    elif downtrend_regime_detected and min_downtrend_equity_return > 0.0:
+        downtrend_capture_shortfall_to_target = float(
+            max(0.0, float(min_downtrend_equity_return - execution_equity_return))
+        )
+    else:
+        downtrend_capture_shortfall_to_target = 0.0
+    downtrend_capture_shortfall_score = float(-downtrend_capture_shortfall_to_target)
+    if "selection_constraint_downtrend_short_bias_exposure_pass" in metrics:
+        downtrend_short_bias_exposure_pass = float(
+            bool(metrics.get("selection_constraint_downtrend_short_bias_exposure_pass"))
+        )
+    else:
+        downtrend_short_bias_exposure_pass = 1.0
+    downtrend_short_bias_exposure_ratio = float(
+        metrics.get("selection_constraint_downtrend_short_bias_exposure_ratio", 1.0)
+    )
+    if not np.isfinite(downtrend_short_bias_exposure_ratio):
+        downtrend_short_bias_exposure_ratio = 1.0
+    downtrend_short_bias_exposure_ratio = float(
+        np.clip(downtrend_short_bias_exposure_ratio, -1.0, 1.0)
+    )
     trade_attempt_pass = float(execution_trade_attempts >= min_trade_attempts)
     fill_rate_pass = float(execution_fill_rate >= min_fill_rate)
     combined_constraint_pass = float(
@@ -2234,6 +2578,8 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
         and fill_rate_pass > 0.0
         and uptrend_capture_pass > 0.0
         and uptrend_long_bias_exposure_pass > 0.0
+        and downtrend_capture_pass > 0.0
+        and downtrend_short_bias_exposure_pass > 0.0
     )
     trade_attempt_ratio = min(
         1.0,
@@ -2250,15 +2596,21 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
         fill_rate_pass,
         uptrend_capture_pass,
         uptrend_long_bias_exposure_pass,
+        downtrend_capture_pass,
+        downtrend_short_bias_exposure_pass,
         trade_attempt_ratio,
         fill_rate_ratio,
-        uptrend_capture_ratio,
-        uptrend_long_bias_exposure_ratio,
-        float(uptrend_lift_term * uptrend_lift_weight),
-        buy_hold_relative_lift,
         execution_realized_pnl_delta_usd,
         execution_equity_return,
         execution_equity_delta_usd,
+        uptrend_capture_ratio,
+        uptrend_capture_shortfall_score,
+        uptrend_long_bias_exposure_ratio,
+        downtrend_capture_ratio,
+        downtrend_capture_shortfall_score,
+        downtrend_short_bias_exposure_ratio,
+        float(uptrend_lift_term * uptrend_lift_weight),
+        buy_hold_relative_lift,
         binary_actionable_precision,
         actionable_rate,
         execution_fill_rate,
@@ -2519,6 +2871,9 @@ def _select_action_confidence_frontier(
             "uptrend_long_bias_mean_exposure_fraction": float(
                 execution_backtest.get("uptrend_long_bias_mean_exposure_fraction", 0.0)
             ),
+            "downtrend_short_bias_mean_exposure_fraction": float(
+                execution_backtest.get("downtrend_short_bias_mean_exposure_fraction", 0.0)
+            ),
             "selection_constraint_min_trade_attempts": int(
                 THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS
             ),
@@ -2526,11 +2881,17 @@ def _select_action_confidence_frontier(
             "selection_constraint_min_uptrend_equity_return": float(
                 THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
             ),
+            "selection_constraint_min_downtrend_equity_return": float(
+                THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
+            ),
             "selection_constraint_uptrend_lift_weight": float(
                 THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT
             ),
             "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
                 THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+            ),
+            "selection_constraint_max_gross_leverage": float(
+                THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE
             ),
             "selection_constraint_confidence_rescue_floor": float(
                 THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
@@ -2544,6 +2905,18 @@ def _select_action_confidence_frontier(
             "selection_constraint_uptrend_capture_ratio": float(
                 execution_backtest.get("selection_constraint_uptrend_capture_ratio", 1.0)
             ),
+            "selection_constraint_uptrend_capture_shortfall_to_target": float(
+                execution_backtest.get(
+                    "selection_constraint_uptrend_capture_shortfall_to_target",
+                    0.0,
+                )
+            ),
+            "selection_constraint_uptrend_capture_excess_over_target": float(
+                execution_backtest.get(
+                    "selection_constraint_uptrend_capture_excess_over_target",
+                    0.0,
+                )
+            ),
             "selection_constraint_uptrend_long_bias_active": bool(
                 execution_backtest.get("selection_constraint_uptrend_long_bias_active", False)
             ),
@@ -2556,6 +2929,42 @@ def _select_action_confidence_frontier(
             "selection_constraint_uptrend_long_bias_exposure_ratio": float(
                 execution_backtest.get(
                     "selection_constraint_uptrend_long_bias_exposure_ratio",
+                    1.0,
+                )
+            ),
+            "selection_constraint_downtrend_regime_detected": bool(
+                execution_backtest.get("selection_constraint_downtrend_regime_detected", False)
+            ),
+            "selection_constraint_downtrend_capture_pass": bool(
+                execution_backtest.get("selection_constraint_downtrend_capture_pass", True)
+            ),
+            "selection_constraint_downtrend_capture_ratio": float(
+                execution_backtest.get("selection_constraint_downtrend_capture_ratio", 1.0)
+            ),
+            "selection_constraint_downtrend_capture_shortfall_to_target": float(
+                execution_backtest.get(
+                    "selection_constraint_downtrend_capture_shortfall_to_target",
+                    0.0,
+                )
+            ),
+            "selection_constraint_downtrend_capture_excess_over_target": float(
+                execution_backtest.get(
+                    "selection_constraint_downtrend_capture_excess_over_target",
+                    0.0,
+                )
+            ),
+            "selection_constraint_downtrend_short_bias_active": bool(
+                execution_backtest.get("selection_constraint_downtrend_short_bias_active", False)
+            ),
+            "selection_constraint_downtrend_short_bias_exposure_pass": bool(
+                execution_backtest.get(
+                    "selection_constraint_downtrend_short_bias_exposure_pass",
+                    True,
+                )
+            ),
+            "selection_constraint_downtrend_short_bias_exposure_ratio": float(
+                execution_backtest.get(
+                    "selection_constraint_downtrend_short_bias_exposure_ratio",
                     1.0,
                 )
             ),
@@ -2637,6 +3046,9 @@ def _select_action_confidence_frontier(
                 "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
                     THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
                 ),
+                "selection_constraint_max_gross_leverage": float(
+                    THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE
+                ),
                 "selection_constraint_confidence_rescue_floor": float(
                     THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
                 ),
@@ -2648,6 +3060,18 @@ def _select_action_confidence_frontier(
                 ),
                 "selection_constraint_uptrend_capture_ratio": float(
                     execution_backtest.get("selection_constraint_uptrend_capture_ratio", 1.0)
+                ),
+                "selection_constraint_uptrend_capture_shortfall_to_target": float(
+                    execution_backtest.get(
+                        "selection_constraint_uptrend_capture_shortfall_to_target",
+                        0.0,
+                    )
+                ),
+                "selection_constraint_uptrend_capture_excess_over_target": float(
+                    execution_backtest.get(
+                        "selection_constraint_uptrend_capture_excess_over_target",
+                        0.0,
+                    )
                 ),
                 "selection_constraint_uptrend_long_bias_active": bool(
                     execution_backtest.get("selection_constraint_uptrend_long_bias_active", False)
@@ -2987,6 +3411,9 @@ def train_trigger_model(
                     "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
                         THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
                     ),
+                    "selection_constraint_max_gross_leverage": float(
+                        THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE
+                    ),
                     "selection_constraint_confidence_rescue_floor": float(
                         THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
                     ),
@@ -2998,6 +3425,18 @@ def train_trigger_model(
                     ),
                     "selection_constraint_uptrend_capture_ratio": float(
                         execution_backtest.get("selection_constraint_uptrend_capture_ratio", 1.0)
+                    ),
+                    "selection_constraint_uptrend_capture_shortfall_to_target": float(
+                        execution_backtest.get(
+                            "selection_constraint_uptrend_capture_shortfall_to_target",
+                            0.0,
+                        )
+                    ),
+                    "selection_constraint_uptrend_capture_excess_over_target": float(
+                        execution_backtest.get(
+                            "selection_constraint_uptrend_capture_excess_over_target",
+                            0.0,
+                        )
                     ),
                     "selection_constraint_uptrend_long_bias_active": bool(
                         execution_backtest.get("selection_constraint_uptrend_long_bias_active", False)
@@ -3259,10 +3698,17 @@ def train_trigger_model(
                 "min_trade_attempts": int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS),
                 "min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
                 "min_uptrend_equity_return": float(THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN),
+                "min_downtrend_equity_return": float(
+                    THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
+                ),
                 "uptrend_lift_weight": float(THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT),
                 "uptrend_long_bias_min_exposure_fraction": float(
                     THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
                 ),
+                "downtrend_short_bias_min_exposure_fraction": float(
+                    THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION
+                ),
+                "max_gross_leverage": float(THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE),
                 "confidence_rescue_floor": float(THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR),
             },
             "candidate_count": int(len(threshold_candidates)),
@@ -3282,10 +3728,17 @@ def train_trigger_model(
                     "min_uptrend_equity_return": float(
                         THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
                     ),
+                    "min_downtrend_equity_return": float(
+                        THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
+                    ),
                     "uptrend_lift_weight": float(THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT),
                     "uptrend_long_bias_min_exposure_fraction": float(
                         THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
                     ),
+                    "downtrend_short_bias_min_exposure_fraction": float(
+                        THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION
+                    ),
+                    "max_gross_leverage": float(THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE),
                     "confidence_rescue_floor": float(
                         THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR
                     ),

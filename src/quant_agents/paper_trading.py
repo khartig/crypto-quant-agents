@@ -196,6 +196,8 @@ def simulate_paper_trade_execution_step(
     liquidity_score: float = 1.0,
     market_depth_notional_usd: float = 2500.0,
     notional_impact_coeff: float = 2.0,
+    max_leverage: float = 1.0,
+    allow_shorting: bool = False,
 ) -> dict[str, Any]:
     position = _ensure_position(state, symbol)
     fee_rate = max(0.0, float(fee_bps)) / 10_000.0
@@ -236,6 +238,18 @@ def simulate_paper_trade_execution_step(
     requested_effective_notional = requested_notional_usd * fill_ratio
     partial_fill = False
 
+    def _max_requestable_notional(price: float, cash_usd: float, quantity: float) -> float:
+        leverage_cap = max(1.0, float(max_leverage))
+        gross_notional_before = abs(quantity) * price
+        equity_before = cash_usd + (quantity * price)
+        if leverage_cap > 1.0:
+            max_additional_gross_notional = max(
+                0.0,
+                (equity_before * leverage_cap) - gross_notional_before,
+            )
+            return max_additional_gross_notional / max(1e-9, (1.0 + fee_rate))
+        return cash_usd / max(1e-9, (1.0 + fee_rate))
+
     if intent_status != "emitted":
         reason = f"intent_{intent_status}"
     elif intent_action == "buy":
@@ -244,39 +258,65 @@ def simulate_paper_trade_execution_step(
             reason = "invalid_mark_price"
         else:
             execution_price = float(mark_price) * (1.0 + slippage_rate)
-            cash_before = _coerce_float(state.get("cash_usd"), 0.0)
-            max_notional = cash_before / (1.0 + fee_rate)
-            if requested_effective_notional <= 0.0:
+            if execution_price <= 0.0:
                 execution_status = "rejected"
-                reason = "liquidity_blocked_buy"
+                reason = "invalid_execution_price_after_slippage"
+                execution_price = None
             else:
-                executed_notional_usd = min(requested_effective_notional, max(0.0, max_notional))
-            if executed_notional_usd <= 0:
-                execution_status = "rejected"
-                if reason == "intent_not_emitted":
-                    reason = "insufficient_cash"
-            else:
-                execution_status = "executed"
-                executed_action = "buy"
-                partial_fill = executed_notional_usd + 1e-9 < requested_notional_usd
-                reason = "executed_buy_partial" if partial_fill else "executed_buy"
-                executed_quantity = (
-                    executed_notional_usd / execution_price if execution_price and execution_price > 0 else 0.0
-                )
-                fee_usd = executed_notional_usd * fee_rate
-                state["cash_usd"] = cash_before - executed_notional_usd - fee_usd
+                cash_before = _coerce_float(state.get("cash_usd"), 0.0)
                 old_qty = _coerce_float(position.get("quantity"), 0.0)
                 old_avg = _coerce_float(position.get("avg_entry_price"), 0.0)
-                new_qty = old_qty + executed_quantity
-                existing_cost_basis = old_qty * old_avg
-                new_cost_basis = existing_cost_basis + executed_notional_usd + fee_usd
-                new_avg = (
-                    (new_cost_basis / new_qty)
-                    if new_qty > 0
-                    else 0.0
+                max_notional = max(
+                    0.0,
+                    _max_requestable_notional(execution_price, cash_before, old_qty),
                 )
-                position["quantity"] = new_qty
-                position["avg_entry_price"] = new_avg
+                if requested_effective_notional <= 0.0:
+                    execution_status = "rejected"
+                    reason = "liquidity_blocked_buy"
+                elif allow_shorting and old_qty < 0.0:
+                    cover_capacity_notional = abs(old_qty) * execution_price
+                    executed_notional_usd = min(requested_effective_notional, cover_capacity_notional)
+                    if executed_notional_usd <= 0.0:
+                        execution_status = "rejected"
+                        reason = "liquidity_blocked_buy"
+                    else:
+                        execution_status = "executed"
+                        executed_action = "buy"
+                        partial_fill = executed_notional_usd + 1e-9 < requested_notional_usd
+                        reason = "executed_cover_short_partial" if partial_fill else "executed_cover_short"
+                        executed_quantity = executed_notional_usd / execution_price
+                        fee_usd = executed_notional_usd * fee_rate
+                        state["cash_usd"] = cash_before - executed_notional_usd - fee_usd
+                        gross_realized_pnl_delta = (old_avg - execution_price) * executed_quantity
+                        realized_pnl_delta_usd = gross_realized_pnl_delta - fee_usd
+                        new_qty = old_qty + executed_quantity
+                        if new_qty >= -1e-12:
+                            new_qty = 0.0
+                            position["avg_entry_price"] = 0.0
+                        position["quantity"] = new_qty
+                        position["realized_pnl_usd"] = (
+                            _coerce_float(position.get("realized_pnl_usd"), 0.0) + realized_pnl_delta_usd
+                        )
+                else:
+                    executed_notional_usd = min(requested_effective_notional, max_notional)
+                    if executed_notional_usd <= 0.0:
+                        execution_status = "rejected"
+                        reason = "insufficient_cash"
+                    else:
+                        execution_status = "executed"
+                        executed_action = "buy"
+                        partial_fill = executed_notional_usd + 1e-9 < requested_notional_usd
+                        reason = "executed_buy_partial" if partial_fill else "executed_buy"
+                        executed_quantity = executed_notional_usd / execution_price
+                        fee_usd = executed_notional_usd * fee_rate
+                        state["cash_usd"] = cash_before - executed_notional_usd - fee_usd
+                        old_long_qty = max(0.0, old_qty)
+                        existing_cost_basis = old_long_qty * old_avg
+                        new_qty = old_long_qty + executed_quantity
+                        new_cost_basis = existing_cost_basis + executed_notional_usd + fee_usd
+                        new_avg = (new_cost_basis / new_qty) if new_qty > 0 else 0.0
+                        position["quantity"] = new_qty
+                        position["avg_entry_price"] = new_avg
     elif intent_action == "sell":
         if not valid_price:
             execution_status = "rejected"
@@ -288,42 +328,81 @@ def simulate_paper_trade_execution_step(
                 reason = "invalid_execution_price_after_slippage"
                 execution_price = None
             else:
-                available_qty = max(0.0, _coerce_float(position.get("quantity"), 0.0))
+                cash_before = _coerce_float(state.get("cash_usd"), 0.0)
+                old_qty = _coerce_float(position.get("quantity"), 0.0)
+                old_avg = _coerce_float(position.get("avg_entry_price"), 0.0)
                 requested_qty = (
                     requested_effective_notional / execution_price
                     if execution_price > 0.0
                     else 0.0
                 )
-                executed_quantity = min(requested_qty, available_qty)
-                if executed_quantity <= 0:
-                    execution_status = "rejected"
-                    reason = "liquidity_blocked_sell" if requested_effective_notional <= 0.0 else "no_long_position_to_sell"
-                else:
-                    execution_status = "executed"
-                    executed_action = "sell"
-                    partial_fill = (
-                        executed_quantity + 1e-9
-                        < (
-                            (requested_notional_usd / execution_price)
-                            if execution_price > 0.0
+                if old_qty > 0.0:
+                    executed_quantity = min(requested_qty, old_qty)
+                    if executed_quantity <= 0.0:
+                        execution_status = "rejected"
+                        reason = (
+                            "liquidity_blocked_sell"
+                            if requested_effective_notional <= 0.0
+                            else "no_long_position_to_sell"
+                        )
+                    else:
+                        execution_status = "executed"
+                        executed_action = "sell"
+                        partial_fill = (
+                            executed_quantity + 1e-9
+                            < (
+                                (requested_notional_usd / execution_price)
+                                if execution_price > 0.0
+                                else 0.0
+                            )
+                        )
+                        reason = "executed_sell_partial" if partial_fill else "executed_sell"
+                        executed_notional_usd = executed_quantity * execution_price
+                        fee_usd = executed_notional_usd * fee_rate
+                        state["cash_usd"] = cash_before + executed_notional_usd - fee_usd
+                        gross_realized_pnl_delta = (execution_price - old_avg) * executed_quantity
+                        realized_pnl_delta_usd = gross_realized_pnl_delta - fee_usd
+                        new_qty = old_qty - executed_quantity
+                        if new_qty <= 1e-12:
+                            new_qty = 0.0
+                            position["avg_entry_price"] = 0.0
+                        position["quantity"] = new_qty
+                        position["realized_pnl_usd"] = (
+                            _coerce_float(position.get("realized_pnl_usd"), 0.0) + realized_pnl_delta_usd
+                        )
+                elif allow_shorting:
+                    max_notional = max(
+                        0.0,
+                        _max_requestable_notional(execution_price, cash_before, old_qty),
+                    )
+                    executed_notional_usd = min(requested_effective_notional, max_notional)
+                    if executed_notional_usd <= 0.0:
+                        execution_status = "rejected"
+                        reason = "insufficient_margin"
+                    else:
+                        execution_status = "executed"
+                        executed_action = "sell"
+                        partial_fill = executed_notional_usd + 1e-9 < requested_notional_usd
+                        reason = "executed_short_sell_partial" if partial_fill else "executed_short_sell"
+                        executed_quantity = executed_notional_usd / execution_price
+                        fee_usd = executed_notional_usd * fee_rate
+                        state["cash_usd"] = cash_before + executed_notional_usd - fee_usd
+                        prev_short_qty = max(0.0, -old_qty)
+                        new_short_qty = prev_short_qty + executed_quantity
+                        new_short_avg = (
+                            ((prev_short_qty * old_avg) + (executed_quantity * execution_price))
+                            / new_short_qty
+                            if new_short_qty > 0.0
                             else 0.0
                         )
-                    )
-                    reason = "executed_sell_partial" if partial_fill else "executed_sell"
-                    executed_notional_usd = executed_quantity * execution_price
-                    fee_usd = executed_notional_usd * fee_rate
-                    cash_before = _coerce_float(state.get("cash_usd"), 0.0)
-                    state["cash_usd"] = cash_before + executed_notional_usd - fee_usd
-                    avg_entry_price = _coerce_float(position.get("avg_entry_price"), 0.0)
-                    gross_realized_pnl_delta = (execution_price - avg_entry_price) * executed_quantity
-                    realized_pnl_delta_usd = gross_realized_pnl_delta - fee_usd
-                    new_qty = available_qty - executed_quantity
-                    if new_qty <= 1e-12:
-                        new_qty = 0.0
-                        position["avg_entry_price"] = 0.0
-                    position["quantity"] = new_qty
-                    position["realized_pnl_usd"] = (
-                        _coerce_float(position.get("realized_pnl_usd"), 0.0) + realized_pnl_delta_usd
+                        position["quantity"] = -new_short_qty
+                        position["avg_entry_price"] = new_short_avg
+                else:
+                    execution_status = "rejected"
+                    reason = (
+                        "liquidity_blocked_sell"
+                        if requested_effective_notional <= 0.0
+                        else "no_long_position_to_sell"
                     )
     else:
         reason = "non_actionable_intent"

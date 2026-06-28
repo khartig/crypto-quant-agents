@@ -1,0 +1,146 @@
+{
+  "contract": "trigger_ranked_ablation_plan.v1",
+  "name": "single_feature_interaction_hard5pct_v3_zero_friction_targeted",
+  "description": "Zero-friction aggressive stress test on targeted top scenarios after v1/v2 ranking tie patterns.",
+  "scope": {
+    "exchange": "binanceus",
+    "symbol": "BTC/USDT",
+    "timeframe": "30m"
+  },
+  "validation_splits": [
+    {
+      "name": "uptrend_2025_04",
+      "regime": "uptrend",
+      "start_utc": "2025-04-01T00:00:00Z",
+      "end_utc": "2025-05-01T00:00:00Z",
+      "expected_bars": 1440,
+      "minimum_rows": 1200
+    },
+    {
+      "name": "flat_2025_11",
+      "regime": "flat",
+      "start_utc": "2025-11-01T00:00:00Z",
+      "end_utc": "2025-12-01T00:00:00Z",
+      "expected_bars": 1440,
+      "minimum_rows": 1200
+    },
+    {
+      "name": "downtrend_2026_05",
+      "regime": "downtrend",
+      "start_utc": "2026-05-01T00:00:00Z",
+      "end_utc": "2026-06-01T00:00:00Z",
+      "expected_bars": 1488,
+      "minimum_rows": 1200
+    }
+  ],
+  "training_defaults": {
+    "horizon_bars": 1,
+    "buy_threshold": 0.002,
+    "sell_threshold": 0.004,
+    "min_train_samples": 300,
+    "cost_bps": 0.0,
+    "optimize_thresholds": true,
+    "labeling_mode": "triple_barrier_v2",
+    "trade_quality_min_score": 0.2,
+    "action_confidence_threshold": 0.2
+  },
+  "evaluation_priority_metrics": [
+    "execution_backtest_realized_pnl_delta_usd",
+    "execution_backtest_equity_return",
+    "net_expectancy_per_actionable",
+    "accuracy"
+  ],
+  "ablation_scenarios": [
+    {
+      "name": "baseline_ohlcv_only",
+      "description": "Control with no Priority2/ranked features.",
+      "priority2_features_enabled": false,
+      "priority2_feature_columns": [
+        "open_interest_feature",
+        "participant_positioning_feature"
+      ],
+      "ranked_features_enabled": false,
+      "ranked_feature_columns": [
+        "derivatives_funding_rate_z_24"
+      ],
+      "orderbook_features_enabled": false
+    },
+    {
+      "name": "p2_pair_interaction",
+      "description": "Priority2 pair interaction baseline.",
+      "priority2_features_enabled": true,
+      "priority2_feature_columns": [
+        "open_interest_feature",
+        "participant_positioning_feature"
+      ],
+      "ranked_features_enabled": false,
+      "ranked_feature_columns": [
+        "derivatives_funding_rate_z_24"
+      ],
+      "orderbook_features_enabled": false
+    },
+    {
+      "name": "p2_pair_plus_ranked_funding",
+      "description": "Interaction: Priority2 pair + funding z-score.",
+      "priority2_features_enabled": true,
+      "priority2_feature_columns": [
+        "open_interest_feature",
+        "participant_positioning_feature"
+      ],
+      "ranked_features_enabled": true,
+      "ranked_external_features_path": "/mnt/quant-data/external/ranked/exchange=binanceus/symbol=BTC-USDT/interval=30m/ranked_external_features_20250101T000000Z_20260615T230000Z_from_priority2_real.parquet",
+      "ranked_feature_columns": [
+        "derivatives_funding_rate_z_24"
+      ],
+      "orderbook_features_enabled": false
+    },
+    {
+      "name": "p2_pair_plus_ranked_long_short",
+      "description": "Interaction: Priority2 pair + long/short ratio z-score.",
+      "priority2_features_enabled": true,
+      "priority2_feature_columns": [
+        "open_interest_feature",
+        "participant_positioning_feature"
+      ],
+      "ranked_features_enabled": true,
+      "ranked_external_features_path": "/mnt/quant-data/external/ranked/exchange=binanceus/symbol=BTC-USDT/interval=30m/ranked_external_features_20250101T000000Z_20260615T230000Z_from_priority2_real.parquet",
+      "ranked_feature_columns": [
+        "derivatives_long_short_ratio_z_24"
+      ],
+      "orderbook_features_enabled": false
+    },
+    {
+      "name": "p2_pair_plus_ranked_funding_long_short",
+      "description": "Interaction: Priority2 pair + funding + long/short.",
+      "priority2_features_enabled": true,
+      "priority2_feature_columns": [
+        "open_interest_feature",
+        "participant_positioning_feature"
+      ],
+      "ranked_features_enabled": true,
+      "ranked_external_features_path": "/mnt/quant-data/external/ranked/exchange=binanceus/symbol=BTC-USDT/interval=30m/ranked_external_features_20250101T000000Z_20260615T230000Z_from_priority2_real.parquet",
+      "ranked_feature_columns": [
+        "derivatives_funding_rate_z_24",
+        "derivatives_long_short_ratio_z_24"
+      ],
+      "orderbook_features_enabled": false
+    },
+    {
+      "name": "p2_pair_plus_ranked_funding_long_short_taker24",
+      "description": "Interaction: Priority2 pair + funding + long/short + taker buy share 24.",
+      "priority2_features_enabled": true,
+      "priority2_feature_columns": [
+        "open_interest_feature",
+        "participant_positioning_feature"
+      ],
+      "ranked_features_enabled": true,
+      "ranked_external_features_path": "/mnt/quant-data/external/ranked/exchange=binanceus/symbol=BTC-USDT/interval=30m/ranked_external_features_20250101T000000Z_20260615T230000Z_from_priority2_real.parquet",
+      "ranked_feature_columns": [
+        "derivatives_funding_rate_z_24",
+        "derivatives_long_short_ratio_z_24",
+        "flow_taker_buy_share_24"
+      ],
+      "orderbook_features_enabled": false
+    }
+  ]
+}

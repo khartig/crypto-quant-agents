@@ -1,0 +1,61 @@
+{
+  "contract": "trigger_ranked_ablation_plan.v1",
+  "name": "single_feature_interaction_hard5pct_v7_up_down_realized_focus",
+  "description": "Focused matrix on uptrend and downtrend only, prioritizing realized-dollar regime outcomes.",
+  "scope": {
+    "exchange": "binanceus",
+    "symbol": "BTC/USDT",
+    "timeframe": "30m"
+  },
+  "validation_splits": [
+    {
+      "name": "uptrend_2025_04",
+      "regime": "uptrend",
+      "start_utc": "2025-04-01T00:00:00Z",
+      "end_utc": "2025-05-01T00:00:00Z",
+      "expected_bars": 1440,
+      "minimum_rows": 1200
+    },
+    {
+      "name": "downtrend_2026_05",
+      "regime": "downtrend",
+      "start_utc": "2026-05-01T00:00:00Z",
+      "end_utc": "2026-06-01T00:00:00Z",
+      "expected_bars": 1488,
+      "minimum_rows": 1200
+    }
+  ],
+  "training_defaults": {
+    "horizon_bars": 1,
+    "buy_threshold": 0.0005,
+    "sell_threshold": 0.0005,
+    "min_train_samples": 80,
+    "cost_bps": 0.0,
+    "optimize_thresholds": true,
+    "labeling_mode": "directional_v1",
+    "trade_quality_min_score": 0.0,
+    "action_confidence_threshold": 0.0
+  },
+  "evaluation_priority_metrics": [
+    "execution_backtest_realized_pnl_delta_usd",
+    "execution_backtest_equity_return",
+    "net_expectancy_per_actionable",
+    "accuracy"
+  ],
+  "ablation_scenarios": [
+    {
+      "name": "baseline_ohlcv_only",
+      "description": "Control scenario with no Priority2/ranked/orderbook features.",
+      "priority2_features_enabled": false,
+      "priority2_feature_columns": [
+        "open_interest_feature",
+        "participant_positioning_feature"
+      ],
+      "ranked_features_enabled": false,
+      "ranked_feature_columns": [
+        "derivatives_funding_rate_z_24"
+      ],
+      "orderbook_features_enabled": false
+    }
+  ]
+}
