@@ -326,6 +326,7 @@ def main() -> None:
                     orderbook_features_enabled=bool(scenario.get("orderbook_features_enabled", False)),
                     orderbook_features_path=_path_or_none(scenario.get("orderbook_features_path")),
                     orderbook_feature_columns=orderbook_columns,
+                    selection_regime_hint=str(split.get("regime", "unknown")),
                 )
                 model_payload = json.loads(result.model_path.read_text(encoding="utf-8"))
                 training_metrics = (

@@ -79,16 +79,27 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     + RANKED_FEATURE_COLUMNS
     + ORDERBOOK_FEATURE_COLUMNS
 )
-EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "constraint_aware_execution_realized_pnl_regime_bias.v7"
+EXECUTION_THRESHOLD_SELECTION_OBJECTIVE = "constraint_aware_execution_realized_pnl_regime_bias.v8_flat"
 THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS = 10
 THRESHOLD_SELECTION_MIN_FILL_RATE = 0.55
 THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT = 1.0
 THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN = 0.05
 THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN = 0.05
+THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN = 0.05
+THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN = 0.05
 THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR = 0.10
 THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION = 5.00
 THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION = 5.00
 THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE = 6.00
+THRESHOLD_SELECTION_FLAT_NOTIONAL_MULTIPLIER = 4.00
+
+def _normalize_regime_hint(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if value in {"uptrend", "flat", "downtrend"}:
+        return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -1696,7 +1707,9 @@ def _run_execution_aligned_backtest(
     paper_starting_cash_usd: float,
     paper_fee_bps: float,
     paper_slippage_bps: float,
+    regime_hint: str | None = None,
 ) -> dict[str, Any]:
+    resolved_regime_hint = _normalize_regime_hint(regime_hint)
     starting_cash = max(0.0, float(paper_starting_cash_usd))
     state: dict[str, Any] = {
         "contract": "paper_portfolio_state.v1",
@@ -1718,8 +1731,14 @@ def _run_execution_aligned_backtest(
     first_mark_price = 0.0
     last_mark_price = 0.0
     base_notional_usd = max(0.0, float(paper_notional_usd))
+    flat_notional_multiplier = float(max(1.0, THRESHOLD_SELECTION_FLAT_NOTIONAL_MULTIPLIER))
+    if resolved_regime_hint == "flat":
+        base_notional_usd = float(base_notional_usd * flat_notional_multiplier)
     max_gross_leverage = float(max(1.0, THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE))
     fee_rate = max(0.0, float(paper_fee_bps)) / 10_000.0
+    flat_regime_max_abs_buy_hold_return = float(
+        max(0.0, THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN)
+    )
     uptrend_long_bias_min_exposure_fraction = float(
         np.clip(
             THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION,
@@ -1751,16 +1770,32 @@ def _run_execution_aligned_backtest(
     preliminary_last_mark_price = (
         float(valid_mark_prices[-1]) if valid_mark_prices.size > 0 else 0.0
     )
-    uptrend_long_bias_active = bool(
-        uptrend_long_bias_min_exposure_fraction > 0.0
-        and preliminary_first_mark_price > 0.0
-        and preliminary_last_mark_price > preliminary_first_mark_price
+    preliminary_buy_hold_return = (
+        _safe_div(
+            float(preliminary_last_mark_price - preliminary_first_mark_price),
+            float(preliminary_first_mark_price),
+        )
+        if preliminary_first_mark_price > 0.0 and preliminary_last_mark_price > 0.0
+        else 0.0
     )
-    downtrend_short_bias_active = bool(
-        downtrend_short_bias_min_exposure_fraction > 0.0
-        and preliminary_first_mark_price > 0.0
-        and preliminary_last_mark_price < preliminary_first_mark_price
-    )
+    if resolved_regime_hint == "uptrend":
+        uptrend_long_bias_active = bool(uptrend_long_bias_min_exposure_fraction > 0.0)
+        downtrend_short_bias_active = False
+    elif resolved_regime_hint == "downtrend":
+        uptrend_long_bias_active = False
+        downtrend_short_bias_active = bool(downtrend_short_bias_min_exposure_fraction > 0.0)
+    elif resolved_regime_hint == "flat":
+        uptrend_long_bias_active = False
+        downtrend_short_bias_active = False
+    else:
+        uptrend_long_bias_active = bool(
+            uptrend_long_bias_min_exposure_fraction > 0.0
+            and preliminary_buy_hold_return > 0.0
+        )
+        downtrend_short_bias_active = bool(
+            downtrend_short_bias_min_exposure_fraction > 0.0
+            and preliminary_buy_hold_return < 0.0
+        )
     uptrend_bias_target_reached = False
     downtrend_bias_target_reached = False
 
@@ -2008,8 +2043,23 @@ def _run_execution_aligned_backtest(
     )
     min_uptrend_equity_return = float(max(0.0, THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN))
     min_downtrend_equity_return = float(max(0.0, THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN))
-    uptrend_regime_detected = bool(buy_hold_return > 0.0)
-    downtrend_regime_detected = bool(buy_hold_return < 0.0)
+    min_flat_equity_return = float(max(0.0, THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN))
+    if resolved_regime_hint == "uptrend":
+        uptrend_regime_detected = True
+        downtrend_regime_detected = False
+        flat_regime_detected = False
+    elif resolved_regime_hint == "downtrend":
+        uptrend_regime_detected = False
+        downtrend_regime_detected = True
+        flat_regime_detected = False
+    elif resolved_regime_hint == "flat":
+        uptrend_regime_detected = False
+        downtrend_regime_detected = False
+        flat_regime_detected = True
+    else:
+        uptrend_regime_detected = bool(buy_hold_return > 0.0)
+        downtrend_regime_detected = bool(buy_hold_return < 0.0)
+        flat_regime_detected = False
     uptrend_capture_pass = bool(
         (not uptrend_regime_detected) or (equity_return >= min_uptrend_equity_return)
     )
@@ -2029,6 +2079,37 @@ def _run_execution_aligned_backtest(
             (
                 float(min_uptrend_equity_return - equity_return)
                 if uptrend_regime_detected and min_uptrend_equity_return > 0.0
+                else 0.0
+            ),
+        )
+    )
+    flat_capture_pass = bool((not flat_regime_detected) or (equity_return >= min_flat_equity_return))
+    if flat_regime_detected and min_flat_equity_return > 0.0:
+        flat_capture_ratio = float(
+            np.clip(
+                _safe_div(float(equity_return), float(min_flat_equity_return)),
+                -1.0,
+                1.0,
+            )
+        )
+    else:
+        flat_capture_ratio = 1.0
+    flat_capture_shortfall_to_target = float(
+        max(
+            0.0,
+            (
+                float(min_flat_equity_return - equity_return)
+                if flat_regime_detected and min_flat_equity_return > 0.0
+                else 0.0
+            ),
+        )
+    )
+    flat_capture_excess_over_target = float(
+        max(
+            0.0,
+            (
+                float(equity_return - min_flat_equity_return)
+                if flat_regime_detected and min_flat_equity_return > 0.0
                 else 0.0
             ),
         )
@@ -2153,6 +2234,12 @@ def _run_execution_aligned_backtest(
         "selection_constraint_min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
         "selection_constraint_min_uptrend_equity_return": float(min_uptrend_equity_return),
         "selection_constraint_min_downtrend_equity_return": float(min_downtrend_equity_return),
+        "selection_constraint_min_flat_equity_return": float(min_flat_equity_return),
+        "selection_constraint_flat_regime_max_abs_buy_hold_return": float(
+            flat_regime_max_abs_buy_hold_return
+        ),
+        "selection_constraint_flat_notional_multiplier": float(flat_notional_multiplier),
+        "selection_constraint_regime_hint": resolved_regime_hint,
         "selection_constraint_uptrend_long_bias_active": bool(uptrend_long_bias_active),
         "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
             uptrend_long_bias_min_exposure_fraction
@@ -2182,6 +2269,7 @@ def _run_execution_aligned_backtest(
         ),
         "selection_constraint_uptrend_regime_detected": bool(uptrend_regime_detected),
         "selection_constraint_downtrend_regime_detected": bool(downtrend_regime_detected),
+        "selection_constraint_flat_regime_detected": bool(flat_regime_detected),
         "selection_constraint_uptrend_capture_pass": bool(uptrend_capture_pass),
         "selection_constraint_uptrend_capture_ratio": float(uptrend_capture_ratio),
         "selection_constraint_uptrend_capture_shortfall_to_target": float(
@@ -2197,6 +2285,14 @@ def _run_execution_aligned_backtest(
         ),
         "selection_constraint_downtrend_capture_excess_over_target": float(
             downtrend_capture_excess_over_target
+        ),
+        "selection_constraint_flat_capture_pass": bool(flat_capture_pass),
+        "selection_constraint_flat_capture_ratio": float(flat_capture_ratio),
+        "selection_constraint_flat_capture_shortfall_to_target": float(
+            flat_capture_shortfall_to_target
+        ),
+        "selection_constraint_flat_capture_excess_over_target": float(
+            flat_capture_excess_over_target
         ),
         "first_mark_price": float(first_mark_price),
         "last_mark_price": float(last_mark_price),
@@ -2236,6 +2332,7 @@ def _evaluate_model(
     paper_starting_cash_usd: float,
     paper_fee_bps: float,
     paper_slippage_bps: float,
+    regime_hint: str | None = None,
 ) -> dict[str, Any]:
     expected = test_frame["label"].astype(str).tolist()
     forward_returns = test_frame["forward_return"].to_numpy(dtype=float)
@@ -2272,6 +2369,7 @@ def _evaluate_model(
         paper_starting_cash_usd=paper_starting_cash_usd,
         paper_fee_bps=paper_fee_bps,
         paper_slippage_bps=paper_slippage_bps,
+        regime_hint=regime_hint,
     )
     return {
         "accuracy": accuracy,
@@ -2462,10 +2560,45 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
             ),
         )
     )
+    min_flat_equity_return = float(
+        max(
+            0.0,
+            metrics.get(
+                "selection_constraint_min_flat_equity_return",
+                THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN,
+            ),
+        )
+    )
+    flat_regime_max_abs_buy_hold_return = float(
+        max(
+            0.0,
+            metrics.get(
+                "selection_constraint_flat_regime_max_abs_buy_hold_return",
+                THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN,
+            ),
+        )
+    )
+    regime_hint = _normalize_regime_hint(metrics.get("selection_constraint_regime_hint"))
+    if regime_hint == "uptrend":
+        default_uptrend_regime_detected = True
+        default_downtrend_regime_detected = False
+        default_flat_regime_detected = False
+    elif regime_hint == "downtrend":
+        default_uptrend_regime_detected = False
+        default_downtrend_regime_detected = True
+        default_flat_regime_detected = False
+    elif regime_hint == "flat":
+        default_uptrend_regime_detected = False
+        default_downtrend_regime_detected = False
+        default_flat_regime_detected = True
+    else:
+        default_uptrend_regime_detected = bool(buy_hold_return > 0.0)
+        default_downtrend_regime_detected = bool(buy_hold_return < 0.0)
+        default_flat_regime_detected = False
     uptrend_regime_detected = bool(
         metrics.get(
             "selection_constraint_uptrend_regime_detected",
-            buy_hold_return > 0.0,
+            default_uptrend_regime_detected,
         )
     )
     if "selection_constraint_uptrend_capture_pass" in metrics:
@@ -2518,7 +2651,7 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
     downtrend_regime_detected = bool(
         metrics.get(
             "selection_constraint_downtrend_regime_detected",
-            buy_hold_return < 0.0,
+            default_downtrend_regime_detected,
         )
     )
     if "selection_constraint_downtrend_capture_pass" in metrics:
@@ -2571,6 +2704,47 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
     downtrend_short_bias_exposure_ratio = float(
         np.clip(downtrend_short_bias_exposure_ratio, -1.0, 1.0)
     )
+    flat_regime_detected = bool(
+        metrics.get(
+            "selection_constraint_flat_regime_detected",
+            default_flat_regime_detected,
+        )
+    )
+    if "selection_constraint_flat_capture_pass" in metrics:
+        flat_capture_pass = float(bool(metrics.get("selection_constraint_flat_capture_pass")))
+    else:
+        flat_capture_pass = float(
+            (not flat_regime_detected) or (execution_equity_return >= min_flat_equity_return)
+        )
+    if "selection_constraint_flat_capture_ratio" in metrics:
+        flat_capture_ratio = float(metrics.get("selection_constraint_flat_capture_ratio", 0.0))
+    elif flat_regime_detected and min_flat_equity_return > 0.0:
+        flat_capture_ratio = float(
+            np.clip(
+                _safe_div(float(execution_equity_return), float(min_flat_equity_return)),
+                -1.0,
+                1.0,
+            )
+        )
+    else:
+        flat_capture_ratio = 1.0
+    if "selection_constraint_flat_capture_shortfall_to_target" in metrics:
+        flat_capture_shortfall_to_target = float(
+            max(
+                0.0,
+                metrics.get(
+                    "selection_constraint_flat_capture_shortfall_to_target",
+                    0.0,
+                ),
+            )
+        )
+    elif flat_regime_detected and min_flat_equity_return > 0.0:
+        flat_capture_shortfall_to_target = float(
+            max(0.0, float(min_flat_equity_return - execution_equity_return))
+        )
+    else:
+        flat_capture_shortfall_to_target = 0.0
+    flat_capture_shortfall_score = float(-flat_capture_shortfall_to_target)
     trade_attempt_pass = float(execution_trade_attempts >= min_trade_attempts)
     fill_rate_pass = float(execution_fill_rate >= min_fill_rate)
     combined_constraint_pass = float(
@@ -2580,6 +2754,7 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
         and uptrend_long_bias_exposure_pass > 0.0
         and downtrend_capture_pass > 0.0
         and downtrend_short_bias_exposure_pass > 0.0
+        and flat_capture_pass > 0.0
     )
     trade_attempt_ratio = min(
         1.0,
@@ -2598,6 +2773,7 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
         uptrend_long_bias_exposure_pass,
         downtrend_capture_pass,
         downtrend_short_bias_exposure_pass,
+        flat_capture_pass,
         trade_attempt_ratio,
         fill_rate_ratio,
         execution_realized_pnl_delta_usd,
@@ -2609,6 +2785,8 @@ def _execution_selection_rank(metrics: dict[str, Any]) -> tuple[float, ...]:
         downtrend_capture_ratio,
         downtrend_capture_shortfall_score,
         downtrend_short_bias_exposure_ratio,
+        flat_capture_ratio,
+        flat_capture_shortfall_score,
         float(uptrend_lift_term * uptrend_lift_weight),
         buy_hold_relative_lift,
         binary_actionable_precision,
@@ -2654,6 +2832,7 @@ def _select_best_model_family(
     paper_starting_cash_usd: float,
     paper_fee_bps: float,
     paper_slippage_bps: float,
+    regime_hint: str | None = None,
     optimize_action_confidence: bool = False,
 ) -> tuple[dict[str, Any], str, dict[str, Any], list[dict[str, Any]], float]:
     candidate_models = _fit_model_family_candidates(train_frame)
@@ -2681,6 +2860,7 @@ def _select_best_model_family(
                 paper_starting_cash_usd=paper_starting_cash_usd,
                 paper_fee_bps=paper_fee_bps,
                 paper_slippage_bps=paper_slippage_bps,
+                regime_hint=regime_hint,
                 minimum_threshold=action_confidence_threshold,
                 optimize_thresholds=True,
             )
@@ -2696,6 +2876,7 @@ def _select_best_model_family(
                 paper_starting_cash_usd=paper_starting_cash_usd,
                 paper_fee_bps=paper_fee_bps,
                 paper_slippage_bps=paper_slippage_bps,
+                regime_hint=regime_hint,
             )
         rank = _evaluation_selection_rank(evaluation)
         actionable = (
@@ -2760,6 +2941,7 @@ def _select_best_model_family(
                 paper_starting_cash_usd=paper_starting_cash_usd,
                 paper_fee_bps=paper_fee_bps,
                 paper_slippage_bps=paper_slippage_bps,
+                regime_hint=regime_hint,
                 minimum_threshold=action_confidence_threshold,
                 optimize_thresholds=True,
             )
@@ -2774,6 +2956,7 @@ def _select_best_model_family(
                 paper_starting_cash_usd=paper_starting_cash_usd,
                 paper_fee_bps=paper_fee_bps,
                 paper_slippage_bps=paper_slippage_bps,
+                regime_hint=regime_hint,
             )
     family_metrics.sort(
         key=lambda item: tuple(float(value) for value in item.get("selection_rank", [])),
@@ -2798,6 +2981,7 @@ def _select_action_confidence_frontier(
     paper_starting_cash_usd: float,
     paper_fee_bps: float,
     paper_slippage_bps: float,
+    regime_hint: str | None,
     minimum_threshold: float,
     optimize_thresholds: bool,
 ) -> tuple[float, dict[str, Any], list[dict[str, Any]]]:
@@ -2822,6 +3006,7 @@ def _select_action_confidence_frontier(
             paper_starting_cash_usd=paper_starting_cash_usd,
             paper_fee_bps=paper_fee_bps,
             paper_slippage_bps=paper_slippage_bps,
+            regime_hint=regime_hint,
         )
         expectancy = dict(evaluation.get("expectancy_metrics", {}))
         actionable = dict(evaluation.get("actionable_metrics", {}))
@@ -2884,11 +3069,23 @@ def _select_action_confidence_frontier(
             "selection_constraint_min_downtrend_equity_return": float(
                 THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
             ),
+            "selection_constraint_min_flat_equity_return": float(
+                THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN
+            ),
             "selection_constraint_uptrend_lift_weight": float(
                 THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT
             ),
             "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
                 THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+            ),
+            "selection_constraint_downtrend_short_bias_min_exposure_fraction": float(
+                THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION
+            ),
+            "selection_constraint_flat_regime_max_abs_buy_hold_return": float(
+                THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN
+            ),
+            "selection_constraint_regime_hint": execution_backtest.get(
+                "selection_constraint_regime_hint"
             ),
             "selection_constraint_max_gross_leverage": float(
                 THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE
@@ -2968,6 +3165,27 @@ def _select_action_confidence_frontier(
                     1.0,
                 )
             ),
+            "selection_constraint_flat_regime_detected": bool(
+                execution_backtest.get("selection_constraint_flat_regime_detected", False)
+            ),
+            "selection_constraint_flat_capture_pass": bool(
+                execution_backtest.get("selection_constraint_flat_capture_pass", True)
+            ),
+            "selection_constraint_flat_capture_ratio": float(
+                execution_backtest.get("selection_constraint_flat_capture_ratio", 1.0)
+            ),
+            "selection_constraint_flat_capture_shortfall_to_target": float(
+                execution_backtest.get(
+                    "selection_constraint_flat_capture_shortfall_to_target",
+                    0.0,
+                )
+            ),
+            "selection_constraint_flat_capture_excess_over_target": float(
+                execution_backtest.get(
+                    "selection_constraint_flat_capture_excess_over_target",
+                    0.0,
+                )
+            ),
         }
         frontier_rows.append(row)
         rank = _execution_selection_rank(row)
@@ -2987,6 +3205,7 @@ def _select_action_confidence_frontier(
             paper_starting_cash_usd=paper_starting_cash_usd,
             paper_fee_bps=paper_fee_bps,
             paper_slippage_bps=paper_slippage_bps,
+            regime_hint=regime_hint,
         )
         expectancy = dict(selected_evaluation.get("expectancy_metrics", {}))
         actionable = dict(selected_evaluation.get("actionable_metrics", {}))
@@ -3033,6 +3252,9 @@ def _select_action_confidence_frontier(
                 "uptrend_long_bias_mean_exposure_fraction": float(
                     execution_backtest.get("uptrend_long_bias_mean_exposure_fraction", 0.0)
                 ),
+                "downtrend_short_bias_mean_exposure_fraction": float(
+                    execution_backtest.get("downtrend_short_bias_mean_exposure_fraction", 0.0)
+                ),
                 "selection_constraint_min_trade_attempts": int(
                     THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS
                 ),
@@ -3040,11 +3262,26 @@ def _select_action_confidence_frontier(
                 "selection_constraint_min_uptrend_equity_return": float(
                     THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
                 ),
+                "selection_constraint_min_downtrend_equity_return": float(
+                    THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
+                ),
+                "selection_constraint_min_flat_equity_return": float(
+                    THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN
+                ),
                 "selection_constraint_uptrend_lift_weight": float(
                     THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT
                 ),
                 "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
                     THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+                ),
+                "selection_constraint_downtrend_short_bias_min_exposure_fraction": float(
+                    THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION
+                ),
+                "selection_constraint_flat_regime_max_abs_buy_hold_return": float(
+                    THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN
+                ),
+                "selection_constraint_regime_hint": execution_backtest.get(
+                    "selection_constraint_regime_hint"
                 ),
                 "selection_constraint_max_gross_leverage": float(
                     THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE
@@ -3086,6 +3323,63 @@ def _select_action_confidence_frontier(
                     execution_backtest.get(
                         "selection_constraint_uptrend_long_bias_exposure_ratio",
                         1.0,
+                    )
+                ),
+                "selection_constraint_downtrend_regime_detected": bool(
+                    execution_backtest.get("selection_constraint_downtrend_regime_detected", False)
+                ),
+                "selection_constraint_downtrend_capture_pass": bool(
+                    execution_backtest.get("selection_constraint_downtrend_capture_pass", True)
+                ),
+                "selection_constraint_downtrend_capture_ratio": float(
+                    execution_backtest.get("selection_constraint_downtrend_capture_ratio", 1.0)
+                ),
+                "selection_constraint_downtrend_capture_shortfall_to_target": float(
+                    execution_backtest.get(
+                        "selection_constraint_downtrend_capture_shortfall_to_target",
+                        0.0,
+                    )
+                ),
+                "selection_constraint_downtrend_capture_excess_over_target": float(
+                    execution_backtest.get(
+                        "selection_constraint_downtrend_capture_excess_over_target",
+                        0.0,
+                    )
+                ),
+                "selection_constraint_downtrend_short_bias_active": bool(
+                    execution_backtest.get("selection_constraint_downtrend_short_bias_active", False)
+                ),
+                "selection_constraint_downtrend_short_bias_exposure_pass": bool(
+                    execution_backtest.get(
+                        "selection_constraint_downtrend_short_bias_exposure_pass",
+                        True,
+                    )
+                ),
+                "selection_constraint_downtrend_short_bias_exposure_ratio": float(
+                    execution_backtest.get(
+                        "selection_constraint_downtrend_short_bias_exposure_ratio",
+                        1.0,
+                    )
+                ),
+                "selection_constraint_flat_regime_detected": bool(
+                    execution_backtest.get("selection_constraint_flat_regime_detected", False)
+                ),
+                "selection_constraint_flat_capture_pass": bool(
+                    execution_backtest.get("selection_constraint_flat_capture_pass", True)
+                ),
+                "selection_constraint_flat_capture_ratio": float(
+                    execution_backtest.get("selection_constraint_flat_capture_ratio", 1.0)
+                ),
+                "selection_constraint_flat_capture_shortfall_to_target": float(
+                    execution_backtest.get(
+                        "selection_constraint_flat_capture_shortfall_to_target",
+                        0.0,
+                    )
+                ),
+                "selection_constraint_flat_capture_excess_over_target": float(
+                    execution_backtest.get(
+                        "selection_constraint_flat_capture_excess_over_target",
+                        0.0,
                     )
                 ),
             }
@@ -3192,6 +3486,7 @@ def train_trigger_model(
     orderbook_features_enabled: bool = False,
     orderbook_features_path: Path | None = None,
     orderbook_feature_columns: tuple[str, ...] | list[str] | None = None,
+    selection_regime_hint: str | None = None,
 ) -> TriggerModelTrainingResult:
     source_data_path = (
         input_file.expanduser().resolve()
@@ -3287,6 +3582,7 @@ def train_trigger_model(
     resolved_horizon = int(max(1, horizon_bars))
     resolved_buy_threshold = float(max(0.0005, buy_threshold))
     resolved_sell_threshold = float(max(0.0005, abs(sell_threshold)))
+    resolved_selection_regime_hint = _normalize_regime_hint(selection_regime_hint)
     resolved_cost_bps = float(max(0.0, cost_bps))
     resolved_trade_quality_min_score = float(np.clip(trade_quality_min_score, 0.0, 1.0))
     resolved_action_confidence_threshold = float(np.clip(action_confidence_threshold, 0.0, 1.0))
@@ -3338,6 +3634,7 @@ def train_trigger_model(
                 paper_starting_cash_usd=resolved_paper_starting_cash_usd,
                 paper_fee_bps=resolved_paper_fee_bps,
                 paper_slippage_bps=resolved_paper_slippage_bps,
+                regime_hint=resolved_selection_regime_hint,
                 optimize_action_confidence=True,
             )
             expectancy = dict(candidate_eval.get("expectancy_metrics", {}))
@@ -3405,11 +3702,26 @@ def train_trigger_model(
                     "selection_constraint_min_uptrend_equity_return": float(
                         THRESHOLD_SELECTION_MIN_UPTREND_EQUITY_RETURN
                     ),
+                    "selection_constraint_min_downtrend_equity_return": float(
+                        THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
+                    ),
+                    "selection_constraint_min_flat_equity_return": float(
+                        THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN
+                    ),
                     "selection_constraint_uptrend_lift_weight": float(
                         THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT
                     ),
                     "selection_constraint_uptrend_long_bias_min_exposure_fraction": float(
                         THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
+                    ),
+                    "selection_constraint_downtrend_short_bias_min_exposure_fraction": float(
+                        THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION
+                    ),
+                    "selection_constraint_flat_regime_max_abs_buy_hold_return": float(
+                        THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN
+                    ),
+                    "selection_constraint_regime_hint": execution_backtest.get(
+                        "selection_constraint_regime_hint"
                     ),
                     "selection_constraint_max_gross_leverage": float(
                         THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE
@@ -3451,6 +3763,63 @@ def train_trigger_model(
                         execution_backtest.get(
                             "selection_constraint_uptrend_long_bias_exposure_ratio",
                             1.0,
+                        )
+                    ),
+                    "selection_constraint_downtrend_regime_detected": bool(
+                        execution_backtest.get("selection_constraint_downtrend_regime_detected", False)
+                    ),
+                    "selection_constraint_downtrend_capture_pass": bool(
+                        execution_backtest.get("selection_constraint_downtrend_capture_pass", True)
+                    ),
+                    "selection_constraint_downtrend_capture_ratio": float(
+                        execution_backtest.get("selection_constraint_downtrend_capture_ratio", 1.0)
+                    ),
+                    "selection_constraint_downtrend_capture_shortfall_to_target": float(
+                        execution_backtest.get(
+                            "selection_constraint_downtrend_capture_shortfall_to_target",
+                            0.0,
+                        )
+                    ),
+                    "selection_constraint_downtrend_capture_excess_over_target": float(
+                        execution_backtest.get(
+                            "selection_constraint_downtrend_capture_excess_over_target",
+                            0.0,
+                        )
+                    ),
+                    "selection_constraint_downtrend_short_bias_active": bool(
+                        execution_backtest.get("selection_constraint_downtrend_short_bias_active", False)
+                    ),
+                    "selection_constraint_downtrend_short_bias_exposure_pass": bool(
+                        execution_backtest.get(
+                            "selection_constraint_downtrend_short_bias_exposure_pass",
+                            True,
+                        )
+                    ),
+                    "selection_constraint_downtrend_short_bias_exposure_ratio": float(
+                        execution_backtest.get(
+                            "selection_constraint_downtrend_short_bias_exposure_ratio",
+                            1.0,
+                        )
+                    ),
+                    "selection_constraint_flat_regime_detected": bool(
+                        execution_backtest.get("selection_constraint_flat_regime_detected", False)
+                    ),
+                    "selection_constraint_flat_capture_pass": bool(
+                        execution_backtest.get("selection_constraint_flat_capture_pass", True)
+                    ),
+                    "selection_constraint_flat_capture_ratio": float(
+                        execution_backtest.get("selection_constraint_flat_capture_ratio", 1.0)
+                    ),
+                    "selection_constraint_flat_capture_shortfall_to_target": float(
+                        execution_backtest.get(
+                            "selection_constraint_flat_capture_shortfall_to_target",
+                            0.0,
+                        )
+                    ),
+                    "selection_constraint_flat_capture_excess_over_target": float(
+                        execution_backtest.get(
+                            "selection_constraint_flat_capture_excess_over_target",
+                            0.0,
                         )
                     ),
                     "selected_model_family": candidate_model_family,
@@ -3506,6 +3875,7 @@ def train_trigger_model(
             paper_starting_cash_usd=resolved_paper_starting_cash_usd,
             paper_fee_bps=resolved_paper_fee_bps,
             paper_slippage_bps=resolved_paper_slippage_bps,
+            regime_hint=resolved_selection_regime_hint,
             minimum_threshold=resolved_action_confidence_threshold,
             optimize_thresholds=bool(optimize_thresholds),
         )
@@ -3541,6 +3911,7 @@ def train_trigger_model(
             paper_starting_cash_usd=resolved_paper_starting_cash_usd,
             paper_fee_bps=resolved_paper_fee_bps,
             paper_slippage_bps=resolved_paper_slippage_bps,
+            regime_hint=resolved_selection_regime_hint,
             minimum_threshold=resolved_action_confidence_threshold,
             optimize_thresholds=bool(optimize_thresholds),
         )
@@ -3613,6 +3984,7 @@ def train_trigger_model(
         "sell_threshold": float(selected_sell_threshold),
         "trade_quality_min_score": float(resolved_trade_quality_min_score),
         "selected_action_confidence_threshold": float(selected_action_confidence_threshold),
+        "selection_regime_hint": resolved_selection_regime_hint,
         "feature_columns": list(FEATURE_COLUMNS),
         "labels": list(TRIGGER_LABELS),
         "model_family": selected_model_family,
@@ -3688,6 +4060,7 @@ def train_trigger_model(
                 "paper_starting_cash_usd": resolved_paper_starting_cash_usd,
                 "paper_fee_bps": resolved_paper_fee_bps,
                 "paper_slippage_bps": resolved_paper_slippage_bps,
+                "selection_regime_hint": resolved_selection_regime_hint,
             },
             "one_way_cost_bps": resolved_cost_bps,
         },
@@ -3701,6 +4074,12 @@ def train_trigger_model(
                 "min_downtrend_equity_return": float(
                     THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
                 ),
+                "min_flat_equity_return": float(THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN),
+                "flat_regime_max_abs_buy_hold_return": float(
+                    THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN
+                ),
+                "flat_notional_multiplier": float(THRESHOLD_SELECTION_FLAT_NOTIONAL_MULTIPLIER),
+                "selection_regime_hint": resolved_selection_regime_hint,
                 "uptrend_lift_weight": float(THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT),
                 "uptrend_long_bias_min_exposure_fraction": float(
                     THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION
@@ -3731,6 +4110,14 @@ def train_trigger_model(
                     "min_downtrend_equity_return": float(
                         THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN
                     ),
+                    "min_flat_equity_return": float(THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN),
+                    "flat_regime_max_abs_buy_hold_return": float(
+                        THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN
+                    ),
+                    "flat_notional_multiplier": float(
+                        THRESHOLD_SELECTION_FLAT_NOTIONAL_MULTIPLIER
+                    ),
+                    "selection_regime_hint": resolved_selection_regime_hint,
                     "uptrend_lift_weight": float(THRESHOLD_SELECTION_UPTREND_LIFT_WEIGHT),
                     "uptrend_long_bias_min_exposure_fraction": float(
                         THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION

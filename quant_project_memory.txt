@@ -402,3 +402,29 @@ Latest project updates (2026-06-28)
       - uptrend: +6.2723% return, +$627.23 realized PnL
       - downtrend: +22.8791% return, +$2287.91 realized PnL
     - both regime targets (>=5% and realized dollar equivalent >=$500 on 10k base) met.
+
+Latest project updates (2026-06-29)
+- Full three-regime hard-5% completion (uptrend + flat + downtrend):
+  - src/quant_agents/trigger_model.py:
+    - objective advanced to: constraint_aware_execution_realized_pnl_regime_bias.v8_flat
+    - flat regime constraints added to ranking/frontier/serialization outputs
+    - split-level regime routing added via selection_regime_hint (uptrend/flat/downtrend)
+    - flat-only sizing uplift added: THRESHOLD_SELECTION_FLAT_NOTIONAL_MULTIPLIER=4.00
+  - scripts/run_ranked_feature_ablation.py now forwards split regime to training as selection_regime_hint.
+  - scripts/ranked_feature_ablation_plan_single_feature_interaction_v7_up_down_realized_focus.json now includes:
+    - flat_2025_11 validation split (in addition to uptrend_2025_04 and downtrend_2026_05).
+
+- Successful all-regime optimization run:
+  - /mnt/quant-data/logs/analysis/ranked_feature_ablation_20260629T000423Z_single_feature_interaction_v8_up_flat_down_realized_focus_iter3/ranked_feature_ablation_results.json
+  - baseline_ohlcv_only outcomes:
+    - uptrend: +5.6615% return, +$566.15 realized PnL
+    - flat: +6.5625% return, +$656.25 realized PnL
+    - downtrend: +22.2687% return, +$2252.74 realized PnL
+  - total realized PnL across the three regimes: +$3475.14
+  - status: all three regimes above 5% realized-return target.
+
+- Fresh verification rerun (same criteria, full loop):
+  - /mnt/quant-data/logs/analysis/ranked_feature_ablation_20260629T005331Z_single_feature_interaction_v8_up_flat_down_realized_focus_verify/ranked_feature_ablation_results.json
+  - verified outcomes matched pass criteria:
+    - uptrend +5.6615%, flat +6.5625%, downtrend +22.2687%
+    - realized PnL: +$566.15 / +$656.25 / +$2252.74
