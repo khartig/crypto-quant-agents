@@ -125,6 +125,10 @@ button {
   margin-top: -8px;
 }
 
+.chart-range-controls {
+  margin-top: -8px;
+}
+
 .zoom-state {
   font-size: 13px;
   margin-left: 6px;
@@ -137,6 +141,11 @@ button {
   min-width: 240px;
   color: var(--muted);
   font-size: 13px;
+}
+
+.range-control.wide {
+  min-width: 340px;
+  flex: 1 1 340px;
 }
 
 .range-control input[type="range"] {

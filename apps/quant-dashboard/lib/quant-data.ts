@@ -7,12 +7,17 @@ import type {
   ModelTrainingRunSummary,
   PaperTradeExecutionRow,
   PaperTradePerformanceSummary,
+  RegimeBacktestRunSummary,
+  RegimeBacktestSummary,
   ReasonDetail,
   TriggerAlertRow,
   TriggerPredictionRow
 } from "@/lib/types";
 
 const DEFAULT_QUANT_ROOT = "/mnt/quant-data";
+const DASHBOARD_PREDICTION_LIMIT = 5000;
+const DASHBOARD_PAPER_EXECUTION_LIMIT = 5000;
+const DASHBOARD_ABLATION_RESULTS_SCAN_LIMIT = 800;
 
 function quantDataRoot(): string {
   return process.env.QUANT_DATA_ROOT || DEFAULT_QUANT_ROOT;
@@ -37,7 +42,7 @@ function normalizeReasonDetails(value: unknown): ReasonDetail[] {
       impact: asNumber(payload.impact, 0),
       supports: String(payload.supports || ""),
       value: asNumber(payload.value, 0),
-      vsAlternative: String(payload.vs_alternative || "")
+      vsAlternative: String(payload.vs_alternative ?? payload.vsAlternative ?? "")
     });
   }
   return rows.slice(0, 8);
@@ -112,6 +117,26 @@ function asNullableNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeTimestampUtc(
+  timestampValue: unknown,
+  createdAtValue: unknown
+): string {
+  const createdAtUtc = String(createdAtValue || "");
+  const timestampUtc = String(timestampValue || "");
+  if (!timestampUtc) {
+    return createdAtUtc;
+  }
+  const parsedTimestamp = Date.parse(timestampUtc);
+  if (!Number.isFinite(parsedTimestamp)) {
+    return createdAtUtc || timestampUtc;
+  }
+  const year = new Date(parsedTimestamp).getUTCFullYear();
+  if (year < 2000) {
+    return createdAtUtc || timestampUtc;
+  }
+  return timestampUtc;
+}
+
 function normalizeRecommendation(value: unknown): "buy" | "sell" | "hold" {
   const normalized = String(value || "").toLowerCase();
   if (normalized === "buy" || normalized === "sell" || normalized === "hold") {
@@ -147,6 +172,11 @@ async function loadPredictions(root: string, limit = 200): Promise<TriggerPredic
     if (recommendation !== "buy" && recommendation !== "sell" && recommendation !== "hold") {
       continue;
     }
+    const createdAtUtc = String(payload.created_at_utc || "");
+    const predictionTimestampUtc = normalizeTimestampUtc(
+      payload.prediction_timestamp_utc,
+      payload.created_at_utc
+    );
     const topReasonsRaw = Array.isArray(payload.top_reasons) ? payload.top_reasons : [];
     const topReasons = topReasonsRaw
       .map((reason) => String(reason))
@@ -174,8 +204,8 @@ async function loadPredictions(root: string, limit = 200): Promise<TriggerPredic
 
     rows.push({
       id: filePath,
-      createdAtUtc: String(payload.created_at_utc || ""),
-      predictionTimestampUtc: String(payload.prediction_timestamp_utc || ""),
+      createdAtUtc,
+      predictionTimestampUtc,
       exchange: String(payload.exchange || ""),
       symbol: String(payload.symbol || ""),
       timeframe: String(payload.timeframe || ""),
@@ -240,6 +270,11 @@ async function loadAlerts(root: string, limit = 200): Promise<TriggerAlertRow[]>
       if (recommendation !== "buy" && recommendation !== "sell" && recommendation !== "hold") {
         continue;
       }
+      const createdAtUtc = String(payload.created_at_utc || "");
+      const predictionTimestampUtc = normalizeTimestampUtc(
+        payload.prediction_timestamp_utc,
+        payload.created_at_utc
+      );
       const topReasonsRaw = Array.isArray(payload.top_reasons) ? payload.top_reasons : [];
       const topReasons = topReasonsRaw
         .map((reason) => String(reason))
@@ -247,8 +282,8 @@ async function loadAlerts(root: string, limit = 200): Promise<TriggerAlertRow[]>
         .slice(0, 5);
       rows.push({
         id: `${alertPath}:${rows.length}`,
-        createdAtUtc: String(payload.created_at_utc || ""),
-        predictionTimestampUtc: String(payload.prediction_timestamp_utc || ""),
+        createdAtUtc,
+        predictionTimestampUtc,
         exchange: String(payload.exchange || ""),
         symbol: String(payload.symbol || ""),
         timeframe: String(payload.timeframe || ""),
@@ -367,7 +402,7 @@ async function loadModelPerformance(root: string, limit = 40): Promise<ModelPerf
 
 async function loadPaperTradingPerformance(
   root: string,
-  limit = 240
+  limit = DASHBOARD_PAPER_EXECUTION_LIMIT
 ): Promise<PaperTradePerformanceSummary> {
   const base = path.join(root, "paper-trading");
   if (!(await pathExists(base))) {
@@ -405,7 +440,12 @@ async function loadPaperTradingPerformance(
         : "skipped";
     executions.push({
       id: executionRecordPath,
+      runId: String(payload.run_id || ""),
       createdAtUtc: String(payload.created_at_utc || ""),
+      predictionTimestampUtc: normalizeTimestampUtc(
+        payload.prediction_timestamp_utc,
+        payload.created_at_utc
+      ),
       exchange: String(payload.exchange || ""),
       symbol: String(payload.symbol || ""),
       timeframe: String(payload.timeframe || ""),
@@ -413,9 +453,13 @@ async function loadPaperTradingPerformance(
       executedAction: normalizeRecommendation(payload.executed_action),
       executionStatus,
       executedNotionalUsd: asNumber(payload.executed_notional_usd, 0),
+      markPrice: asNullableNumber(payload.mark_price),
+      executionPrice: asNullableNumber(payload.execution_price),
       feeUsd: asNumber(payload.fee_usd, 0),
+      fillRatio: asNumber(payload.fill_ratio, 0),
       realizedPnlDeltaUsd: asNumber(payload.realized_pnl_delta_usd, 0),
       cashAfterUsd: asNullableNumber(payload.cash_after_usd),
+      positionQtyAfter: asNullableNumber(payload.position_qty_after),
       reason: String(payload.reason || ""),
       executionRecordPath
     });
@@ -448,14 +492,173 @@ async function loadPaperTradingPerformance(
   };
 }
 
+async function loadRegimeBacktestSummary(root: string): Promise<RegimeBacktestSummary> {
+  const emptySummary: RegimeBacktestSummary = {
+    runCount: 0,
+    totalRealizedPnlDeltaUsd: 0,
+    averageEquityReturn: null,
+    sourceResultsPath: null,
+    runs: []
+  };
+  const analysisRoot = path.join(root, "logs", "analysis");
+  if (!(await pathExists(analysisRoot))) {
+    return emptySummary;
+  }
+
+  const resultFiles = await listFilesRecursive(
+    analysisRoot,
+    (name) => name === "ranked_feature_ablation_results.json",
+    DASHBOARD_ABLATION_RESULTS_SCAN_LIMIT
+  );
+  if (!resultFiles.length) {
+    return emptySummary;
+  }
+
+  const sortedResultFiles = resultFiles.sort().reverse();
+  const prioritized = sortedResultFiles.filter((filePath) =>
+    filePath.includes("up_flat_down_realized_focus")
+  );
+  const fallback = sortedResultFiles.filter(
+    (filePath) => !filePath.includes("up_flat_down_realized_focus")
+  );
+  const candidateFiles = [...prioritized, ...fallback];
+
+  for (const resultsPath of candidateFiles) {
+    const parsed = await readJson(resultsPath);
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const payload = parsed as Record<string, unknown>;
+    const scenarioRunsRaw = payload.scenario_runs;
+    const splitCoverageRaw = payload.split_coverage;
+    if (!Array.isArray(scenarioRunsRaw) || scenarioRunsRaw.length === 0) {
+      continue;
+    }
+
+    const splitCoverageByName = new Map<
+      string,
+      { startUtc: string; endUtc: string; regime: string }
+    >();
+    if (Array.isArray(splitCoverageRaw)) {
+      for (const item of splitCoverageRaw) {
+        if (!item || typeof item !== "object") {
+          continue;
+        }
+        const entry = item as Record<string, unknown>;
+        const splitName = String(entry.name || "");
+        if (!splitName) {
+          continue;
+        }
+        splitCoverageByName.set(splitName, {
+          startUtc: String(entry.start_utc || ""),
+          endUtc: String(entry.end_utc || ""),
+          regime: String(entry.regime || "")
+        });
+      }
+    }
+
+    const runs: RegimeBacktestRunSummary[] = [];
+    for (let index = 0; index < scenarioRunsRaw.length; index += 1) {
+      const item = scenarioRunsRaw[index];
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const row = item as Record<string, unknown>;
+      const status = String(row.status || "success").toLowerCase();
+      const isSuccessfulStatus =
+        !status ||
+        status === "success" ||
+        status === "ok" ||
+        status === "succeeded" ||
+        status === "completed";
+      if (!isSuccessfulStatus) {
+        continue;
+      }
+      const split = String(row.split || "");
+      const scenario = String(row.scenario || "");
+      if (!split || !scenario) {
+        continue;
+      }
+      const coverage = splitCoverageByName.get(split);
+      const startUtc = String(
+        coverage?.startUtc || row.start_utc || row.startUtc || ""
+      );
+      const endUtc = String(
+        coverage?.endUtc || row.end_utc || row.endUtc || startUtc
+      );
+      runs.push({
+        id: `${scenario}:${split}:${index}`,
+        scenario,
+        split,
+        regime: String(row.regime || coverage?.regime || split || ""),
+        startUtc,
+        endUtc,
+        sampleCount: asNumber(row.sample_count ?? row.samples ?? row.sampleCount, 0),
+        trainCount: asNumber(row.train_count ?? row.train_samples ?? row.trainCount, 0),
+        testCount: asNumber(row.test_count ?? row.test_samples ?? row.testCount, 0),
+        equityReturn: asNullableNumber(
+          row.execution_backtest_equity_return ?? row.equity_return ?? row.equityReturn
+        ),
+        realizedPnlDeltaUsd: asNumber(
+          row.execution_backtest_realized_pnl_delta_usd ??
+            row.realized_pnl_delta_usd ??
+            row.realizedPnlDeltaUsd,
+          0
+        ),
+        sourceResultsPath: resultsPath
+      });
+    }
+
+    if (!runs.length) {
+      continue;
+    }
+
+    runs.sort((left, right) => {
+      const leftTs = Date.parse(left.startUtc || left.endUtc || "");
+      const rightTs = Date.parse(right.startUtc || right.endUtc || "");
+      const leftValue = Number.isFinite(leftTs) ? leftTs : Number.POSITIVE_INFINITY;
+      const rightValue = Number.isFinite(rightTs) ? rightTs : Number.POSITIVE_INFINITY;
+      return leftValue - rightValue;
+    });
+
+    const totalRealizedPnlDeltaUsd = runs.reduce(
+      (total, row) => total + row.realizedPnlDeltaUsd,
+      0
+    );
+    const equityReturns = runs
+      .map((row) => row.equityReturn)
+      .filter((value): value is number => value !== null && Number.isFinite(value));
+    return {
+      runCount: runs.length,
+      totalRealizedPnlDeltaUsd,
+      averageEquityReturn:
+        equityReturns.length > 0
+          ? equityReturns.reduce((total, value) => total + value, 0) / equityReturns.length
+          : null,
+      sourceResultsPath: resultsPath,
+      runs
+    };
+  }
+
+  return emptySummary;
+}
+
 export async function loadDashboardOverview(): Promise<DashboardOverview> {
   const root = quantDataRoot();
-  const [predictions, alerts, latestAgentPlane, modelPerformance, paperTradingPerformance] = await Promise.all([
-    loadPredictions(root, 200),
+  const [
+    predictions,
+    alerts,
+    latestAgentPlane,
+    modelPerformance,
+    paperTradingPerformance,
+    regimeBacktests
+  ] = await Promise.all([
+    loadPredictions(root, DASHBOARD_PREDICTION_LIMIT),
     loadAlerts(root, 200),
     loadLatestAgentPlane(root),
     loadModelPerformance(root, 40),
-    loadPaperTradingPerformance(root, 240)
+    loadPaperTradingPerformance(root, DASHBOARD_PAPER_EXECUTION_LIMIT),
+    loadRegimeBacktestSummary(root)
   ]);
 
   return {
@@ -466,7 +669,8 @@ export async function loadDashboardOverview(): Promise<DashboardOverview> {
     latestAgentPlane,
     performance: {
       model: modelPerformance,
-      paperTrading: paperTradingPerformance
+      paperTrading: paperTradingPerformance,
+      regimeBacktests
     }
   };
 }

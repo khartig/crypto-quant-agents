@@ -96,7 +96,9 @@ export interface ModelPerformanceSummary {
 
 export interface PaperTradeExecutionRow {
   id: string;
+  runId: string;
   createdAtUtc: string;
+  predictionTimestampUtc: string;
   exchange: string;
   symbol: string;
   timeframe: string;
@@ -104,9 +106,13 @@ export interface PaperTradeExecutionRow {
   executedAction: Recommendation;
   executionStatus: "executed" | "skipped" | "rejected";
   executedNotionalUsd: number;
+  markPrice: number | null;
+  executionPrice: number | null;
   feeUsd: number;
+  fillRatio: number;
   realizedPnlDeltaUsd: number;
   cashAfterUsd: number | null;
+  positionQtyAfter: number | null;
   reason: string;
   executionRecordPath: string;
 }
@@ -123,9 +129,33 @@ export interface PaperTradePerformanceSummary {
   executions: PaperTradeExecutionRow[];
 }
 
+export interface RegimeBacktestRunSummary {
+  id: string;
+  scenario: string;
+  split: string;
+  regime: string;
+  startUtc: string;
+  endUtc: string;
+  sampleCount: number;
+  trainCount: number;
+  testCount: number;
+  equityReturn: number | null;
+  realizedPnlDeltaUsd: number;
+  sourceResultsPath: string;
+}
+
+export interface RegimeBacktestSummary {
+  runCount: number;
+  totalRealizedPnlDeltaUsd: number;
+  averageEquityReturn: number | null;
+  sourceResultsPath: string | null;
+  runs: RegimeBacktestRunSummary[];
+}
+
 export interface PerformanceOverview {
   model: ModelPerformanceSummary;
   paperTrading: PaperTradePerformanceSummary;
+  regimeBacktests: RegimeBacktestSummary;
 }
 
 export interface DashboardOverview {

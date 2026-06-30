@@ -234,3 +234,49 @@ Achieve minimum profitability target of 5.0% with full backtest verification on 
     - flat: return `+6.5625%`, realized PnL `+$656.25`
     - downtrend: return `+22.2687%`, realized PnL `+$2252.74`
   - verification status: all three regimes remained above the `5%` realized-return target.
+### 2026-06-30T04:52:52Z
+- Overfit-safe sample-size sweep completed for trigger model:
+  - script: `scripts/run_trigger_walkforward_sample_sweep.py`
+  - sample sizes evaluated: `11232,25000,50000,100000`
+  - successful full artifact:
+    - `/tmp/trigger_walkforward_sample_sweep_backfill_20260630T003801Z/trigger_walkforward_sample_sweep.json`
+  - selected production configuration:
+    - sample size `11232`
+    - model family `gaussian_nb`
+    - action confidence threshold `0.45`
+- Production trigger model promoted:
+  - `/mnt/quant-data/models/trigger-models/exchange=binanceus/symbol=BTC-USDT/interval=30m/20260630T014626Z/model.json`
+  - verified:
+    - `model_family=gaussian_nb`
+    - `selected_action_confidence_threshold=0.45`
+    - `training_metrics.sample_count=11232`
+- Drawdown root-cause analysis on recent live replay window:
+  - data:
+    - `/mnt/quant-data/raw/exchange=binanceus/symbol=BTC-USDT/interval=30m/year=2026/month=06/ohlcv_20260630T022332Z.parquet`
+  - window:
+    - `2026-06-10 06:00:00+00:00` -> `2026-06-30 01:30:00+00:00`
+  - baseline replay:
+    - realized PnL `+$1180.80`
+    - max drawdown `-48.75%`
+    - executed/rejected `24 / 17`
+  - identified pattern:
+    - aggressive short-bias + high leverage into rising price path
+    - repeated `insufficient_margin` rejections while staying exposed to adverse short move.
+- Risk mitigation implemented in `src/quant_agents/trigger_model.py`:
+  - parameter changes:
+    - `THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION: 5.00 -> 1.00`
+    - `THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION: 5.00 -> 1.00`
+    - `THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE: 6.00 -> 2.00`
+  - new controls:
+    - `THRESHOLD_SELECTION_MARGIN_REJECTION_COOLDOWN_BARS=4`
+    - `THRESHOLD_SELECTION_DRAWDOWN_THROTTLE_START=0.10`
+    - `THRESHOLD_SELECTION_DRAWDOWN_KILL_SWITCH=0.20`
+    - `THRESHOLD_SELECTION_POST_KILL_SWITCH_COOLDOWN_BARS=12`
+  - new metrics/counters exported in execution diagnostics for cooldown/throttle/kill-switch behavior.
+- Post-mitigation replay verification (same model + same window):
+  - realized PnL `+$406.09`
+  - max drawdown `-9.38%`
+  - executed/rejected `40 / 0`
+  - drawdown improvement vs baseline:
+    - absolute reduction: `39.37` percentage points
+    - relative reduction in drawdown severity: `~80.77%`

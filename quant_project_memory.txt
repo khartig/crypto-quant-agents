@@ -428,3 +428,71 @@ Latest project updates (2026-06-29)
   - verified outcomes matched pass criteria:
     - uptrend +5.6615%, flat +6.5625%, downtrend +22.2687%
     - realized PnL: +$566.15 / +$656.25 / +$2252.74
+
+Latest project updates (2026-06-30)
+- Overfit-safe walk-forward sample-size sweep (binanceus BTC/USDT 30m):
+  - script:
+    - `scripts/run_trigger_walkforward_sample_sweep.py`
+  - requested sample sizes:
+    - `11232,25000,50000,100000`
+  - successful full-sweep artifact:
+    - `/tmp/trigger_walkforward_sample_sweep_backfill_20260630T003801Z/trigger_walkforward_sample_sweep.json`
+  - selected production-safe configuration:
+    - sample size: `11232`
+    - model family: `gaussian_nb`
+    - action confidence threshold: `0.45`
+
+- Production trigger model update:
+  - promoted model artifact:
+    - `/mnt/quant-data/models/trigger-models/exchange=binanceus/symbol=BTC-USDT/interval=30m/20260630T014626Z/model.json`
+  - verified model payload fields:
+    - `model_family=gaussian_nb`
+    - `selected_action_confidence_threshold=0.45`
+    - `training_metrics.sample_count=11232`
+  - training parameters retained:
+    - `labeling_mode=triple_barrier_v2`
+    - `horizon_bars=6`
+    - `buy_threshold=0.012`
+    - `sell_threshold=0.003`
+    - `trade_quality_min_score=0.55`
+    - `cost_bps=7.5`
+  - execution config retained:
+    - `paper_notional_usd=100`
+    - `paper_starting_cash_usd=10000`
+    - `paper_fee_bps=5`
+    - `paper_slippage_bps=1`
+
+- Recent-live replay drawdown diagnosis (same fixed window):
+  - dataset:
+    - `/mnt/quant-data/raw/exchange=binanceus/symbol=BTC-USDT/interval=30m/year=2026/month=06/ohlcv_20260630T022332Z.parquet`
+  - window:
+    - `2026-06-10 06:00:00+00:00` -> `2026-06-30 01:30:00+00:00`
+  - pre-mitigation replay:
+    - realized PnL: `+$1180.80`
+    - max drawdown: `-48.75%`
+    - executed/rejected: `24 / 17`
+  - identified failure mode:
+    - heavy short-bias under rising BTC prices with repeated `insufficient_margin` sell rejections while remaining in an underwater short.
+
+- Drawdown mitigation implemented in `src/quant_agents/trigger_model.py`:
+  - reduced aggressiveness:
+    - `THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION: 5.00 -> 1.00`
+    - `THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION: 5.00 -> 1.00`
+    - `THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE: 6.00 -> 2.00`
+  - new controls:
+    - `THRESHOLD_SELECTION_MARGIN_REJECTION_COOLDOWN_BARS=4`
+    - `THRESHOLD_SELECTION_DRAWDOWN_THROTTLE_START=0.10`
+    - `THRESHOLD_SELECTION_DRAWDOWN_KILL_SWITCH=0.20`
+    - `THRESHOLD_SELECTION_POST_KILL_SWITCH_COOLDOWN_BARS=12`
+  - new telemetry counters:
+    - cooldown suppression count for margin-rejected sell loops
+    - drawdown throttle suppression count
+    - kill-switch flatten / cooldown suppression counts
+
+- Post-mitigation replay verification (same model + same dataset window):
+  - realized PnL: `+$406.09`
+  - max drawdown: `-9.38%`
+  - executed/rejected: `40 / 0`
+  - drawdown change vs pre-mitigation:
+    - absolute improvement: `39.37` percentage points
+    - relative severity reduction: `~80.77%`

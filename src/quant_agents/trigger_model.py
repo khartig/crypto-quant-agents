@@ -88,10 +88,14 @@ THRESHOLD_SELECTION_MIN_DOWNTREND_EQUITY_RETURN = 0.05
 THRESHOLD_SELECTION_MIN_FLAT_EQUITY_RETURN = 0.05
 THRESHOLD_SELECTION_FLAT_REGIME_MAX_ABS_BUY_HOLD_RETURN = 0.05
 THRESHOLD_SELECTION_CONFIDENCE_RESCUE_FLOOR = 0.10
-THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION = 5.00
-THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION = 5.00
-THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE = 6.00
+THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION = 1.00
+THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION = 1.00
+THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE = 2.00
 THRESHOLD_SELECTION_FLAT_NOTIONAL_MULTIPLIER = 4.00
+THRESHOLD_SELECTION_MARGIN_REJECTION_COOLDOWN_BARS = 4
+THRESHOLD_SELECTION_DRAWDOWN_THROTTLE_START = 0.10
+THRESHOLD_SELECTION_DRAWDOWN_KILL_SWITCH = 0.20
+THRESHOLD_SELECTION_POST_KILL_SWITCH_COOLDOWN_BARS = 12
 
 def _normalize_regime_hint(raw: str | None) -> str | None:
     if raw is None:
@@ -1243,32 +1247,69 @@ def latest_trigger_model_path(root: Path, exchange: str, symbol: str, timeframe:
         raise FileNotFoundError(f"No trigger model artifacts found under: {base}")
     return candidates[-1]
 
+def _normalize_sample_weights(
+    sample_weights: np.ndarray | Sequence[float] | None,
+    row_count: int,
+) -> np.ndarray:
+    if row_count <= 0:
+        return np.zeros(0, dtype=float)
+    if sample_weights is None:
+        return np.ones(row_count, dtype=float)
+    weights = np.asarray(sample_weights, dtype=float).reshape(-1)
+    if weights.shape[0] != row_count:
+        raise RuntimeError(
+            "Sample-weight length mismatch: "
+            f"expected {row_count}, got {weights.shape[0]}"
+        )
+    weights = np.where(np.isfinite(weights), weights, 0.0)
+    weights = np.clip(weights, 0.0, None)
+    if float(np.sum(weights)) <= 0.0:
+        return np.ones(row_count, dtype=float)
+    return weights.astype(float, copy=False)
 
-def _fit_gaussian_model(train_frame: pd.DataFrame) -> dict[str, Any]:
+
+def _weighted_mean_and_std(values: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if values.size == 0:
+        raise RuntimeError("Cannot compute weighted moments on empty values.")
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0:
+        raise RuntimeError("Cannot compute weighted moments with non-positive weight sum.")
+    mean = np.average(values, axis=0, weights=weights)
+    variance = np.average((values - mean) ** 2, axis=0, weights=weights)
+    std = np.sqrt(np.maximum(variance, 0.0))
+    return np.asarray(mean, dtype=float), np.asarray(std, dtype=float)
+
+
+def _fit_gaussian_model(
+    train_frame: pd.DataFrame,
+    *,
+    sample_weights: np.ndarray | Sequence[float] | None = None,
+) -> dict[str, Any]:
     x_train = train_frame[list(FEATURE_COLUMNS)].to_numpy(dtype=float)
     y_train = train_frame["label"].astype(str).to_numpy()
     if x_train.size == 0:
         raise RuntimeError("Training frame is empty")
+    normalized_weights = _normalize_sample_weights(sample_weights, len(train_frame))
 
-    global_mean = np.nanmean(x_train, axis=0)
-    global_std = np.nanstd(x_train, axis=0)
+    global_mean, global_std = _weighted_mean_and_std(x_train, normalized_weights)
     global_std = np.where(global_std < 1e-6, 1e-6, global_std)
-    total_samples = len(train_frame)
+    total_weight = float(np.sum(normalized_weights))
 
     class_stats: dict[str, Any] = {}
     prior_total = 0.0
     for label in TRIGGER_LABELS:
         mask = y_train == label
         class_samples = x_train[mask]
+        class_weights = normalized_weights[mask]
         count = int(class_samples.shape[0])
-        if count >= 2:
-            mean = np.nanmean(class_samples, axis=0)
-            std = np.nanstd(class_samples, axis=0)
+        class_weight_total = float(np.sum(class_weights))
+        if count >= 2 and class_weight_total > 0.0:
+            mean, std = _weighted_mean_and_std(class_samples, class_weights)
             std = np.where(std < 1e-6, 1e-6, std)
         else:
             mean = global_mean
             std = global_std
-        prior = max(1e-9, count / total_samples)
+        prior = max(1e-9, class_weight_total / max(total_weight, 1e-12))
         prior_total += prior
         class_stats[label] = {
             "count": count,
@@ -1292,38 +1333,41 @@ def _fit_regularized_lda_model(
     *,
     shrinkage: float = 0.15,
     ridge: float = 1e-5,
+    sample_weights: np.ndarray | Sequence[float] | None = None,
 ) -> dict[str, Any]:
     x_train = train_frame[list(FEATURE_COLUMNS)].to_numpy(dtype=float)
     y_train = train_frame["label"].astype(str).to_numpy()
     if x_train.size == 0:
         raise RuntimeError("Training frame is empty")
-
-    global_mean = np.nanmean(x_train, axis=0)
-    global_std = np.nanstd(x_train, axis=0)
+    normalized_weights = _normalize_sample_weights(sample_weights, len(train_frame))
+    global_mean, global_std = _weighted_mean_and_std(x_train, normalized_weights)
     global_std = np.where(global_std < 1e-6, 1e-6, global_std)
-    total_samples = len(train_frame)
+    total_weight = float(np.sum(normalized_weights))
     feature_count = x_train.shape[1]
 
     class_stats: dict[str, Any] = {}
     priors: dict[str, float] = {}
     prior_total = 0.0
     centered_chunks: list[np.ndarray] = []
+    centered_weight_chunks: list[np.ndarray] = []
     for label in TRIGGER_LABELS:
         mask = y_train == label
         class_samples = x_train[mask]
+        class_weights = normalized_weights[mask]
         count = int(class_samples.shape[0])
-        if count >= 2:
-            mean = np.nanmean(class_samples, axis=0)
-            std = np.nanstd(class_samples, axis=0)
+        class_weight_total = float(np.sum(class_weights))
+        if count >= 2 and class_weight_total > 0.0:
+            mean, std = _weighted_mean_and_std(class_samples, class_weights)
             std = np.where(std < 1e-6, 1e-6, std)
             centered_chunks.append(class_samples - mean)
+            centered_weight_chunks.append(class_weights)
         elif count == 1:
             mean = class_samples[0]
             std = global_std
         else:
             mean = global_mean
             std = global_std
-        prior = max(1e-9, count / total_samples)
+        prior = max(1e-9, class_weight_total / max(total_weight, 1e-12))
         prior_total += prior
         priors[label] = prior
         class_stats[label] = {
@@ -1339,7 +1383,13 @@ def _fit_regularized_lda_model(
 
     if centered_chunks:
         centered = np.vstack(centered_chunks)
-        pooled_cov = np.cov(centered, rowvar=False, bias=True)
+        centered_weights = np.concatenate(centered_weight_chunks)
+        centered_weight_total = float(np.sum(centered_weights))
+        if centered_weight_total > 0.0:
+            weighted_centered = centered * centered_weights[:, None]
+            pooled_cov = (weighted_centered.T @ centered) / centered_weight_total
+        else:
+            pooled_cov = np.cov(centered, rowvar=False, bias=True)
     else:
         pooled_cov = np.diag(global_std**2)
     pooled_cov = np.asarray(pooled_cov, dtype=float)
@@ -1719,6 +1769,7 @@ def _run_execution_aligned_backtest(
         "fee_bps": max(0.0, float(paper_fee_bps)),
         "positions": {},
     }
+    equity_curve_usd: list[float] = [float(starting_cash)]
 
     status_counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
@@ -1757,8 +1808,33 @@ def _run_execution_aligned_backtest(
     uptrend_long_bias_suppressed_sell_count = 0
     downtrend_short_bias_forced_sell_count = 0
     downtrend_short_bias_suppressed_buy_count = 0
+    downtrend_short_bias_cooldown_suppressed_sell_count = 0
+    drawdown_throttle_suppressed_action_count = 0
+    drawdown_kill_switch_forced_flatten_count = 0
+    drawdown_kill_switch_cooldown_suppressed_action_count = 0
     uptrend_long_exposure_fraction_samples: list[float] = []
     downtrend_short_exposure_fraction_samples: list[float] = []
+    sell_margin_rejection_cooldown_bars_remaining = 0
+    kill_switch_pause_bars_remaining = 0
+    equity_peak_reference_usd = float(starting_cash)
+    margin_rejection_cooldown_bars = max(
+        0,
+        int(THRESHOLD_SELECTION_MARGIN_REJECTION_COOLDOWN_BARS),
+    )
+    drawdown_throttle_start = float(
+        np.clip(THRESHOLD_SELECTION_DRAWDOWN_THROTTLE_START, 0.0, 0.99)
+    )
+    drawdown_kill_switch = float(
+        np.clip(
+            max(drawdown_throttle_start, THRESHOLD_SELECTION_DRAWDOWN_KILL_SWITCH),
+            0.0,
+            0.995,
+        )
+    )
+    post_kill_switch_cooldown_bars = max(
+        0,
+        int(THRESHOLD_SELECTION_POST_KILL_SWITCH_COOLDOWN_BARS),
+    )
 
     valid_mark_prices = np.asarray(close_prices, dtype=float)
     valid_mark_prices = valid_mark_prices[
@@ -1839,6 +1915,10 @@ def _run_execution_aligned_backtest(
 
         action = str(label) if label in {"buy", "sell"} else "hold"
         requested_notional_usd = float(base_notional_usd)
+        if sell_margin_rejection_cooldown_bars_remaining > 0:
+            sell_margin_rejection_cooldown_bars_remaining -= 1
+        if kill_switch_pause_bars_remaining > 0:
+            kill_switch_pause_bars_remaining -= 1
         (
             current_long_exposure_fraction,
             current_short_exposure_fraction,
@@ -1848,6 +1928,13 @@ def _run_execution_aligned_backtest(
             current_long_notional,
             current_gross_notional,
         ) = _current_exposure_snapshot(mark_price)
+        equity_peak_reference_usd = max(
+            float(equity_peak_reference_usd),
+            float(current_equity),
+        )
+        current_drawdown = (
+            _safe_div(float(current_equity), float(equity_peak_reference_usd)) - 1.0
+        )
         if max_gross_leverage > 1.0:
             max_additional_position_notional = float(
                 max(
@@ -1911,6 +1998,39 @@ def _run_execution_aligned_backtest(
             elif action == "buy" and downtrend_bias_target_reached:
                 action = "hold"
                 downtrend_short_bias_suppressed_buy_count += 1
+        if (
+            action == "sell"
+            and sell_margin_rejection_cooldown_bars_remaining > 0
+            and current_quantity <= 0.0
+        ):
+            action = "hold"
+            downtrend_short_bias_cooldown_suppressed_sell_count += 1
+        increases_directional_exposure = bool(
+            (action == "buy" and current_quantity >= 0.0)
+            or (action == "sell" and current_quantity <= 0.0)
+        )
+        if (
+            kill_switch_pause_bars_remaining > 0
+            and action in {"buy", "sell"}
+            and increases_directional_exposure
+        ):
+            action = "hold"
+            drawdown_kill_switch_cooldown_suppressed_action_count += 1
+        if (
+            current_drawdown <= -drawdown_throttle_start
+            and action in {"buy", "sell"}
+            and increases_directional_exposure
+        ):
+            action = "hold"
+            drawdown_throttle_suppressed_action_count += 1
+        if current_drawdown <= -drawdown_kill_switch and abs(current_quantity) > 1e-12:
+            action = "buy" if current_quantity < 0.0 else "sell"
+            requested_notional_usd = float(abs(current_quantity) * mark_price)
+            kill_switch_pause_bars_remaining = max(
+                int(kill_switch_pause_bars_remaining),
+                int(post_kill_switch_cooldown_bars),
+            )
+            drawdown_kill_switch_forced_flatten_count += 1
 
         if action == "buy" and requested_notional_usd <= 0.0:
             action = "hold"
@@ -1945,6 +2065,11 @@ def _run_execution_aligned_backtest(
         status_counts.update([execution_status])
         action_counts.update([executed_action])
         reason_counts.update([reason])
+        if execution_status == "rejected" and reason == "insufficient_margin" and action == "sell":
+            sell_margin_rejection_cooldown_bars_remaining = max(
+                int(sell_margin_rejection_cooldown_bars_remaining),
+                int(margin_rejection_cooldown_bars),
+            )
         if execution_status == "executed":
             executed += 1
         (
@@ -1952,10 +2077,11 @@ def _run_execution_aligned_backtest(
             post_short_exposure_fraction,
             _,
             _,
-            _,
+            post_equity,
             _,
             _,
         ) = _current_exposure_snapshot(mark_price)
+        equity_curve_usd.append(float(post_equity))
         uptrend_long_exposure_fraction_samples.append(float(post_long_exposure_fraction))
         downtrend_short_exposure_fraction_samples.append(float(post_short_exposure_fraction))
 
@@ -2002,10 +2128,11 @@ def _run_execution_aligned_backtest(
                 post_short_exposure_fraction,
                 _,
                 _,
-                _,
+                post_equity,
                 _,
                 _,
             ) = _current_exposure_snapshot(last_mark_price)
+            equity_curve_usd.append(float(post_equity))
             uptrend_long_exposure_fraction_samples.append(float(post_long_exposure_fraction))
             downtrend_short_exposure_fraction_samples.append(float(post_short_exposure_fraction))
 
@@ -2015,6 +2142,17 @@ def _run_execution_aligned_backtest(
     realized_pnl_usd = float(position.get("realized_pnl_usd", 0.0))
     final_equity = final_cash + (final_quantity * last_mark_price)
     equity_delta = final_equity - starting_cash
+    if not equity_curve_usd:
+        equity_curve_usd = [float(starting_cash), float(final_equity)]
+    elif abs(equity_curve_usd[-1] - float(final_equity)) > 1e-9:
+        equity_curve_usd.append(float(final_equity))
+    equity_curve = np.asarray(equity_curve_usd, dtype=float)
+    equity_curve = np.where(np.isfinite(equity_curve), equity_curve, float(starting_cash))
+    equity_curve = np.where(equity_curve > 0.0, equity_curve, float(starting_cash))
+    equity_curve_peaks = np.maximum.accumulate(equity_curve)
+    drawdown_curve = (equity_curve / np.where(equity_curve_peaks > 0.0, equity_curve_peaks, 1.0)) - 1.0
+    max_drawdown = float(np.min(drawdown_curve)) if drawdown_curve.size else 0.0
+    ending_drawdown = float(drawdown_curve[-1]) if drawdown_curve.size else 0.0
     rejection_count = int(status_counts.get("rejected", 0))
     fill_rate = _safe_div(float(executed), float(attempted))
     rejection_rate = _safe_div(float(rejection_count), float(attempted))
@@ -2208,6 +2346,9 @@ def _run_execution_aligned_backtest(
         "equity_after_usd": float(final_equity),
         "equity_delta_usd": float(equity_delta),
         "equity_return": equity_return,
+        "max_drawdown": max_drawdown,
+        "ending_drawdown": ending_drawdown,
+        "equity_curve_point_count": int(len(equity_curve_usd)),
         "buy_hold_return": float(buy_hold_return),
         "buy_hold_equity_after_usd": float(buy_hold_equity_after_usd),
         "buy_hold_equity_delta_usd": float(buy_hold_equity_delta_usd),
@@ -2230,6 +2371,18 @@ def _run_execution_aligned_backtest(
         "downtrend_short_bias_suppressed_buy_count": int(
             downtrend_short_bias_suppressed_buy_count
         ),
+        "downtrend_short_bias_cooldown_suppressed_sell_count": int(
+            downtrend_short_bias_cooldown_suppressed_sell_count
+        ),
+        "drawdown_throttle_suppressed_action_count": int(
+            drawdown_throttle_suppressed_action_count
+        ),
+        "drawdown_kill_switch_forced_flatten_count": int(
+            drawdown_kill_switch_forced_flatten_count
+        ),
+        "drawdown_kill_switch_cooldown_suppressed_action_count": int(
+            drawdown_kill_switch_cooldown_suppressed_action_count
+        ),
         "selection_constraint_min_trade_attempts": int(THRESHOLD_SELECTION_MIN_TRADE_ATTEMPTS),
         "selection_constraint_min_fill_rate": float(THRESHOLD_SELECTION_MIN_FILL_RATE),
         "selection_constraint_min_uptrend_equity_return": float(min_uptrend_equity_return),
@@ -2249,6 +2402,14 @@ def _run_execution_aligned_backtest(
             downtrend_short_bias_min_exposure_fraction
         ),
         "selection_constraint_max_gross_leverage": float(max_gross_leverage),
+        "selection_constraint_margin_rejection_cooldown_bars": int(
+            margin_rejection_cooldown_bars
+        ),
+        "selection_constraint_drawdown_throttle_start": float(drawdown_throttle_start),
+        "selection_constraint_drawdown_kill_switch": float(drawdown_kill_switch),
+        "selection_constraint_post_kill_switch_cooldown_bars": int(
+            post_kill_switch_cooldown_bars
+        ),
         "selection_constraint_uptrend_long_bias_exposure_pass": bool(
             uptrend_long_bias_exposure_pass
         ),
@@ -2811,11 +2972,21 @@ def _evaluation_selection_rank(evaluation: dict[str, Any]) -> tuple[float, ...]:
     return (*_execution_selection_rank(merged), float(evaluation.get("accuracy", 0.0)))
 
 
-def _fit_model_family_candidates(train_frame: pd.DataFrame) -> dict[str, dict[str, Any]]:
+def _fit_model_family_candidates(
+    train_frame: pd.DataFrame,
+    *,
+    sample_weights: np.ndarray | Sequence[float] | None = None,
+) -> dict[str, dict[str, Any]]:
     candidates: dict[str, dict[str, Any]] = {}
-    candidates["gaussian_nb"] = _fit_gaussian_model(train_frame)
+    candidates["gaussian_nb"] = _fit_gaussian_model(
+        train_frame,
+        sample_weights=sample_weights,
+    )
     try:
-        candidates["regularized_lda"] = _fit_regularized_lda_model(train_frame)
+        candidates["regularized_lda"] = _fit_regularized_lda_model(
+            train_frame,
+            sample_weights=sample_weights,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("regularized_lda fit failed; falling back to gaussian_nb only: %s", exc)
     return candidates

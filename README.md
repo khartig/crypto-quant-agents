@@ -402,6 +402,39 @@ python scripts/backfill_trigger_history.py --exchange kraken --symbol BTC/USDT -
 python scripts/run_ranked_feature_ablation.py --config scripts/ranked_feature_ablation_plan.json
 quant-agents train-trigger-model --exchange binanceus --symbol BTC/USDT --timeframe 1h --horizon-bars 2 --buy-threshold 0.005 --sell-threshold 0.005 --cost-bps 9 --no-optimize-thresholds --input-file /mnt/quant-data/curated/training/ohlcv_binanceus_BTC-USDT_1h_20260610T173442Z_train_preweek.parquet
 ```
+Overfit-safe walk-forward + out-of-time sample-size sweep (with storage precheck for large pulls):
+```bash path=null start=null
+python scripts/run_trigger_walkforward_sample_sweep.py --exchange binanceus --symbol BTC/USDT --timeframe 30m --sample-sizes 11232,25000,50000,100000
+```
+Latest 30m production model/risk configuration (2026-06-30):
+- Production model:
+  - `/mnt/quant-data/models/trigger-models/exchange=binanceus/symbol=BTC-USDT/interval=30m/20260630T014626Z/model.json`
+- Training/model selection:
+  - sample size: `11232`
+  - model family: `gaussian_nb`
+  - action confidence threshold: `0.45`
+  - labeling mode: `triple_barrier_v2`
+  - horizon bars: `6`
+  - buy/sell thresholds: `0.012 / 0.003`
+  - trade-quality minimum score: `0.55`
+  - cost basis for diagnostics: `7.5 bps`
+- Execution backtest defaults:
+  - `paper_notional_usd=100`
+  - `paper_starting_cash_usd=10000`
+  - `paper_fee_bps=5`
+  - `paper_slippage_bps=1`
+- Drawdown mitigation defaults in `src/quant_agents/trigger_model.py`:
+  - `THRESHOLD_SELECTION_UPTREND_LONG_BIAS_MIN_EXPOSURE_FRACTION=1.00`
+  - `THRESHOLD_SELECTION_DOWNTREND_SHORT_BIAS_MIN_EXPOSURE_FRACTION=1.00`
+  - `THRESHOLD_SELECTION_MAX_GROSS_LEVERAGE=2.00`
+  - `THRESHOLD_SELECTION_MARGIN_REJECTION_COOLDOWN_BARS=4`
+  - `THRESHOLD_SELECTION_DRAWDOWN_THROTTLE_START=0.10`
+  - `THRESHOLD_SELECTION_DRAWDOWN_KILL_SWITCH=0.20`
+  - `THRESHOLD_SELECTION_POST_KILL_SWITCH_COOLDOWN_BARS=12`
+- Recent-live replay impact (same dataset window before vs after mitigation):
+  - max drawdown: `-48.75% -> -9.38%`
+  - realized PnL: `+$1180.80 -> +$406.09`
+  - fill/rejections: `24 executed / 17 rejected -> 40 executed / 0 rejected`
 Baseline vs baseline+orderbook comparison recipe:
 ```bash path=null start=null
 quant-agents capture-orderbook --exchange binanceus --symbol BTC/USDT --sample-count 600 --sample-interval-seconds 1 --depth-limit 50

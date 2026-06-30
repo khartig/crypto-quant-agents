@@ -7,6 +7,7 @@ import {
   ComposedChart,
   Legend,
   Line,
+  ReferenceArea,
   ResponsiveContainer,
   Scatter,
   Tooltip,
@@ -15,6 +16,8 @@ import {
 } from "recharts";
 import type {
   DashboardOverview,
+  PaperTradeExecutionRow,
+  RegimeBacktestRunSummary,
   Recommendation,
   TriggerAlertRow,
   TriggerPredictionRow
@@ -40,14 +43,18 @@ interface MarkerPoint {
   price: number;
   recommendation: Recommendation;
   confidence: number;
-  source: "prediction" | "alert";
+  source: "prediction" | "alert" | "trade" | "regime";
   prediction?: TriggerPredictionRow;
   alert?: TriggerAlertRow;
+  trade?: PaperTradeExecutionRow;
+  regimeRun?: RegimeBacktestRunSummary;
 }
 
 type SelectedDatum =
   | { kind: "prediction"; row: TriggerPredictionRow }
   | { kind: "alert"; row: TriggerAlertRow }
+  | { kind: "trade"; row: PaperTradeExecutionRow }
+  | { kind: "regime"; row: RegimeBacktestRunSummary }
   | null;
 
 interface DragPanState {
@@ -57,6 +64,7 @@ interface DragPanState {
 }
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
+const RANGE_SLIDER_STEPS = 1000;
 const RECOMMENDATION_OPTIONS: Recommendation[] = ["buy", "sell", "hold"];
 
 function clampDomainToBounds(
@@ -111,6 +119,13 @@ function formatTimeTick(value: number): string {
   return date.toISOString().slice(5, 16).replace("T", " ");
 }
 
+function formatDateTimeLabel(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "n/a";
+  }
+  return new Date(value).toISOString().slice(0, 16).replace("T", " ");
+}
+
 function formatNumber(value: number | null | undefined, digits = 4): string {
   if (value === null || value === undefined || !Number.isFinite(value)) {
     return "n/a";
@@ -123,6 +138,13 @@ function formatPercent(value: number | null | undefined, digits = 2): string {
     return "n/a";
   }
   return `${(value * 100).toFixed(digits)}%`;
+}
+
+function formatUsd(value: number | null | undefined, digits = 2): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "n/a";
+  }
+  return `${value.toFixed(digits)} USD`;
 }
 
 function renderPredictionShape(props: any) {
@@ -158,6 +180,151 @@ function renderAlertShape(props: any) {
   return <circle cx={cx} cy={cy} r={4} fill={fill} stroke="#ffffff" strokeWidth={1} />;
 }
 
+function renderTradeShape(props: any) {
+  const { cx, cy, payload } = props;
+  if (typeof cx !== "number" || typeof cy !== "number" || !payload) {
+    return <g />;
+  }
+  const recommendation = payload.recommendation as Recommendation;
+  if (recommendation === "buy") {
+    return (
+      <text x={cx} y={cy + 5} fill="#00e676" textAnchor="middle" fontSize={16}>
+        ▲
+      </text>
+    );
+  }
+  if (recommendation === "sell") {
+    return (
+      <text x={cx} y={cy + 5} fill="#ff6b6b" textAnchor="middle" fontSize={16}>
+        ▼
+      </text>
+    );
+  }
+  return <circle cx={cx} cy={cy} r={4} fill="#f2c14e" stroke="#111830" strokeWidth={1} />;
+}
+
+function renderRegimeShape(props: any) {
+  const { cx, cy, payload } = props;
+  if (typeof cx !== "number" || typeof cy !== "number" || !payload) {
+    return <g />;
+  }
+  const run = payload.regimeRun as RegimeBacktestRunSummary | undefined;
+  const pnl = run?.realizedPnlDeltaUsd ?? 0;
+  const fill = pnl >= 0 ? "#16a34a" : "#dc2626";
+  return (
+    <g>
+      <rect x={cx - 4} y={cy - 4} width={8} height={8} fill={fill} stroke="#ffffff" strokeWidth={1} />
+    </g>
+  );
+}
+
+function isMarkerPoint(value: unknown): value is MarkerPoint {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const payload = value as Record<string, unknown>;
+  return (
+    typeof payload.id === "string" &&
+    typeof payload.source === "string" &&
+    typeof payload.timeMs === "number" &&
+    typeof payload.price === "number"
+  );
+}
+
+interface PriceTooltipEntry {
+  color?: string;
+  name?: string;
+  payload?: ChartPoint | MarkerPoint;
+  value?: number | string;
+}
+
+interface PriceTooltipProps {
+  active?: boolean;
+  label?: number | string;
+  payload?: PriceTooltipEntry[];
+}
+
+function PriceChartTooltip({ active, label, payload }: PriceTooltipProps) {
+  if (!active || !payload || payload.length === 0) {
+    return null;
+  }
+  const markerById = new Map<string, MarkerPoint>();
+  const numericRows: Array<{ color?: string; name: string; value: number }> = [];
+  for (const entry of payload) {
+    if (isMarkerPoint(entry.payload)) {
+      markerById.set(entry.payload.id, entry.payload);
+      continue;
+    }
+    const parsedValue =
+      typeof entry.value === "number" ? entry.value : Number.parseFloat(String(entry.value));
+    if (!Number.isFinite(parsedValue)) {
+      continue;
+    }
+    numericRows.push({
+      color: entry.color,
+      name: String(entry.name || "value"),
+      value: parsedValue
+    });
+  }
+  const markers = Array.from(markerById.values());
+  const labelValue =
+    typeof label === "number" ? label : Number.parseFloat(typeof label === "string" ? label : "");
+
+  return (
+    <div className="chart-tooltip">
+      <div className="chart-tooltip-time">{formatTimeTick(labelValue)}</div>
+      {numericRows.map((row) => (
+        <div className="chart-tooltip-row" key={`${row.name}:${row.color || "none"}`}>
+          <span className="chart-tooltip-name">
+            {row.color ? <span className="chart-tooltip-color" style={{ background: row.color }} /> : null}
+            {row.name}
+          </span>
+          <span className="chart-tooltip-value">{formatNumber(row.value, 5)}</span>
+        </div>
+      ))}
+      {markers.map((marker) => (
+        <div className="chart-tooltip-marker" key={marker.id}>
+          <div className="chart-tooltip-row">
+            <span className="chart-tooltip-name">
+              <span className={`pill ${marker.recommendation}`}>{marker.recommendation}</span>
+              {marker.source === "trade" ? "trade marker" : `${marker.source} marker`}
+            </span>
+            <span className="chart-tooltip-value">@ {formatNumber(marker.price, 2)}</span>
+          </div>
+          {marker.source === "trade" && marker.trade ? (
+            <>
+              <div className="chart-tooltip-sub">
+                notional={formatUsd(marker.trade.executedNotionalUsd, 2)} • fee=
+                {formatUsd(marker.trade.feeUsd, 4)}
+              </div>
+              {marker.trade.executedAction === "sell" ? (
+                <div className="chart-tooltip-sub">
+                  sell PnL Δ = {formatUsd(marker.trade.realizedPnlDeltaUsd, 4)}
+                </div>
+              ) : null}
+            </>
+          ) : marker.source === "regime" && marker.regimeRun ? (
+            <>
+              <div className="chart-tooltip-sub">
+                {marker.regimeRun.regime} ({marker.regimeRun.split})
+              </div>
+              <div className="chart-tooltip-sub">
+                window: {marker.regimeRun.startUtc || "n/a"} → {marker.regimeRun.endUtc || "n/a"}
+              </div>
+              <div className="chart-tooltip-sub">
+                realized PnL Δ = {formatUsd(marker.regimeRun.realizedPnlDeltaUsd, 2)} • return=
+                {formatPercent(marker.regimeRun.equityReturn, 2)}
+              </div>
+            </>
+          ) : (
+            <div className="chart-tooltip-sub">confidence={formatNumber(marker.confidence, 3)}</div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function HomePage() {
   const [data, setData] = useState<DashboardOverview | null>(null);
   const [loading, setLoading] = useState(true);
@@ -168,6 +335,8 @@ export default function HomePage() {
   ]);
   const [showPredictionsOnChart, setShowPredictionsOnChart] = useState(true);
   const [showAlertsOnChart, setShowAlertsOnChart] = useState(true);
+  const [showTradesOnChart, setShowTradesOnChart] = useState(true);
+  const [showRegimeBacktestsOnChart, setShowRegimeBacktestsOnChart] = useState(true);
   const [showCloseLine, setShowCloseLine] = useState(true);
   const [showSmaFastLine, setShowSmaFastLine] = useState(true);
   const [showSmaSlowLine, setShowSmaSlowLine] = useState(true);
@@ -180,6 +349,14 @@ export default function HomePage() {
   const [selectedDatum, setSelectedDatum] = useState<SelectedDatum>(null);
   const [activeTab, setActiveTab] = useState<"signals" | "performance">("signals");
   const [zoomDomain, setZoomDomain] = useState<[number, number] | null>(null);
+  const [dateRangeSlider, setDateRangeSlider] = useState<[number, number]>([
+    0,
+    RANGE_SLIDER_STEPS
+  ]);
+  const [priceRangeSlider, setPriceRangeSlider] = useState<[number, number]>([
+    0,
+    RANGE_SLIDER_STEPS
+  ]);
   const [isDragPanning, setIsDragPanning] = useState(false);
   const chartStackRef = useRef<HTMLDivElement | null>(null);
   const dragPanRef = useRef<DragPanState | null>(null);
@@ -215,17 +392,23 @@ export default function HomePage() {
     return ["all", ...Array.from(symbols).sort()];
   }, [data?.predictions]);
 
-  const filteredPredictions = useMemo(() => {
+  const symbolScopedPredictions = useMemo(() => {
     return (data?.predictions || []).filter((row) => {
       if (symbolFilter !== "all" && row.symbol !== symbolFilter) {
         return false;
       }
+      return true;
+    });
+  }, [data?.predictions, symbolFilter]);
+
+  const filteredPredictions = useMemo(() => {
+    return symbolScopedPredictions.filter((row) => {
       if (!recommendationFilter.includes(row.recommendation)) {
         return false;
       }
       return true;
     });
-  }, [data?.predictions, symbolFilter, recommendationFilter]);
+  }, [symbolScopedPredictions, recommendationFilter]);
 
   const filteredAlerts = useMemo(() => {
     return (data?.alerts || []).filter((row) => {
@@ -245,11 +428,33 @@ export default function HomePage() {
   const highConfidence = filteredPredictions.filter((row) => row.confidence >= 0.7);
   const modelPerformance = data?.performance.model;
   const paperTradingPerformance = data?.performance.paperTrading;
+  const regimeBacktestPerformance = data?.performance.regimeBacktests;
   const recentModelRuns = modelPerformance?.runs.slice(0, 12) || [];
   const recentExecutions = paperTradingPerformance?.executions.slice(0, 20) || [];
+  const regimeBacktestRuns = useMemo(
+    () => regimeBacktestPerformance?.runs || [],
+    [regimeBacktestPerformance?.runs]
+  );
+  const filteredTradeExecutions = useMemo(() => {
+    return (paperTradingPerformance?.executions || []).filter((row) => {
+      if (row.executionStatus !== "executed") {
+        return false;
+      }
+      if (row.executedAction !== "buy" && row.executedAction !== "sell") {
+        return false;
+      }
+      if (symbolFilter !== "all" && row.symbol !== symbolFilter) {
+        return false;
+      }
+      if (!recommendationFilter.includes(row.executedAction)) {
+        return false;
+      }
+      return true;
+    });
+  }, [paperTradingPerformance?.executions, recommendationFilter, symbolFilter]);
 
   const chartPoints = useMemo<ChartPoint[]>(() => {
-    return filteredPredictions
+    const rows: ChartPoint[] = symbolScopedPredictions
       .map((row) => {
         const timestamp = row.predictionTimestampUtc || row.createdAtUtc;
         const parsed = Date.parse(timestamp);
@@ -269,9 +474,41 @@ export default function HomePage() {
           volatility24: row.volatility24
         };
       })
-      .filter((row): row is ChartPoint => row !== null)
-      .sort((a, b) => a.timeMs - b.timeMs);
-  }, [filteredPredictions]);
+      .filter((row): row is ChartPoint => row !== null);
+    for (const run of regimeBacktestRuns) {
+      const startMs = Date.parse(run.startUtc || "");
+      const endMs = Date.parse(run.endUtc || run.startUtc || "");
+      if (Number.isFinite(startMs)) {
+        rows.push({
+          id: `regime-window-start:${run.id}`,
+          timeMs: startMs,
+          timeLabel: run.startUtc || "",
+          closePrice: null,
+          smaFast: null,
+          smaSlow: null,
+          macd: null,
+          macdHist: null,
+          rsi14: null,
+          volatility24: null
+        });
+      }
+      if (Number.isFinite(endMs)) {
+        rows.push({
+          id: `regime-window-end:${run.id}`,
+          timeMs: endMs,
+          timeLabel: run.endUtc || run.startUtc || "",
+          closePrice: null,
+          smaFast: null,
+          smaSlow: null,
+          macd: null,
+          macdHist: null,
+          rsi14: null,
+          volatility24: null
+        });
+      }
+    }
+    return rows.sort((a, b) => a.timeMs - b.timeMs);
+  }, [symbolScopedPredictions, regimeBacktestRuns]);
 
   const fullDomain = useMemo<[number, number] | null>(() => {
     if (!chartPoints.length) {
@@ -309,11 +546,11 @@ export default function HomePage() {
 
   const predictionByPath = useMemo(() => {
     const map = new Map<string, TriggerPredictionRow>();
-    for (const row of filteredPredictions) {
+    for (const row of symbolScopedPredictions) {
       map.set(row.predictionPath, row);
     }
     return map;
-  }, [filteredPredictions]);
+  }, [symbolScopedPredictions]);
 
   const predictionMarkers = useMemo<MarkerPoint[]>(() => {
     const rows: MarkerPoint[] = [];
@@ -363,11 +600,111 @@ export default function HomePage() {
     }
     return rows;
   }, [filteredAlerts, predictionByPath]);
+
+  const tradeMarkers = useMemo<MarkerPoint[]>(() => {
+    const rows: MarkerPoint[] = [];
+    for (const row of filteredTradeExecutions) {
+      const timestamp = row.predictionTimestampUtc || row.createdAtUtc;
+      const parsed = Date.parse(timestamp);
+      if (!Number.isFinite(parsed)) {
+        continue;
+      }
+      let markerPrice = row.executionPrice ?? row.markPrice;
+      if (markerPrice === null) {
+        let nearestPoint: ChartPoint | null = null;
+        let nearestDelta = Number.POSITIVE_INFINITY;
+        for (const point of chartPoints) {
+          if (point.closePrice === null) {
+            continue;
+          }
+          const delta = Math.abs(point.timeMs - parsed);
+          if (delta < nearestDelta) {
+            nearestDelta = delta;
+            nearestPoint = point;
+          }
+        }
+        markerPrice = nearestPoint?.closePrice ?? null;
+      }
+      if (markerPrice === null || !Number.isFinite(markerPrice)) {
+        continue;
+      }
+      rows.push({
+        id: `trade:${row.id}`,
+        timeMs: parsed,
+        timeLabel: timestamp,
+        price: markerPrice,
+        recommendation: row.executedAction,
+        confidence: 1,
+        source: "trade",
+        trade: row
+      });
+    }
+    return rows.sort((a, b) => a.timeMs - b.timeMs);
+  }, [chartPoints, filteredTradeExecutions]);
+  const regimeRanges = useMemo(() => {
+    return regimeBacktestRuns
+      .map((run) => {
+        const parsedStart = Date.parse(run.startUtc || "");
+        const parsedEnd = Date.parse(run.endUtc || run.startUtc || "");
+        if (!Number.isFinite(parsedStart) || !Number.isFinite(parsedEnd)) {
+          return null;
+        }
+        const startMs = Math.min(parsedStart, parsedEnd);
+        const endMs = Math.max(parsedStart, parsedEnd);
+        return {
+          id: run.id,
+          startMs,
+          endMs,
+          run
+        };
+      })
+      .filter(
+        (row): row is { id: string; startMs: number; endMs: number; run: RegimeBacktestRunSummary } =>
+          row !== null
+      )
+      .sort((left, right) => left.startMs - right.startMs);
+  }, [regimeBacktestRuns]);
+  const regimeMarkers = useMemo<MarkerPoint[]>(() => {
+    const rows: MarkerPoint[] = [];
+    for (const run of regimeBacktestRuns) {
+      const timestamp = run.endUtc || run.startUtc;
+      const parsed = Date.parse(timestamp);
+      if (!Number.isFinite(parsed)) {
+        continue;
+      }
+      let markerPrice: number | null = null;
+      let nearestDelta = Number.POSITIVE_INFINITY;
+      for (const point of chartPoints) {
+        if (point.closePrice === null) {
+          continue;
+        }
+        const delta = Math.abs(point.timeMs - parsed);
+        if (delta < nearestDelta) {
+          nearestDelta = delta;
+          markerPrice = point.closePrice;
+        }
+      }
+      if (markerPrice === null || !Number.isFinite(markerPrice)) {
+        continue;
+      }
+      rows.push({
+        id: `regime:${run.id}`,
+        timeMs: parsed,
+        timeLabel: timestamp,
+        price: markerPrice,
+        recommendation: run.realizedPnlDeltaUsd >= 0 ? "buy" : "sell",
+        confidence: 1,
+        source: "regime",
+        regimeRun: run
+      });
+    }
+    return rows.sort((a, b) => a.timeMs - b.timeMs);
+  }, [chartPoints, regimeBacktestRuns]);
   const markerFocusDomain = useMemo<[number, number] | null>(() => {
     if (!fullDomain) {
       return null;
     }
-    const markerTimes = [...predictionMarkers, ...alertMarkers]
+    const markerTimes = [...predictionMarkers, ...alertMarkers, ...tradeMarkers, ...regimeMarkers]
       .map((marker) => marker.timeMs)
       .sort((a, b) => a - b);
     if (!markerTimes.length) {
@@ -384,7 +721,7 @@ export default function HomePage() {
       end += padding;
     }
     return clampDomainToBounds(start, end, fullDomain);
-  }, [predictionMarkers, alertMarkers, minimumZoomSpanMs, fullDomain]);
+  }, [predictionMarkers, alertMarkers, tradeMarkers, regimeMarkers, minimumZoomSpanMs, fullDomain]);
 
   const fullSpanMs = useMemo(() => {
     if (!fullDomain) {
@@ -406,12 +743,127 @@ export default function HomePage() {
     }
     return [visibleDomain[0], visibleDomain[1]];
   }, [visibleDomain]);
+  const fullDomainStart = fullDomain ? fullDomain[0] : null;
+  const fullDomainEnd = fullDomain ? fullDomain[1] : null;
+  const visibleDomainStart = visibleDomain ? visibleDomain[0] : null;
+  const visibleDomainEnd = visibleDomain ? visibleDomain[1] : null;
+
+  const activePriceBounds = useMemo<[number, number] | null>(() => {
+    let minPrice = Number.POSITIVE_INFINITY;
+    let maxPrice = Number.NEGATIVE_INFINITY;
+    const withinVisibleDomain = (timeMs: number) =>
+      !visibleDomain || (timeMs >= visibleDomain[0] && timeMs <= visibleDomain[1]);
+    const consider = (value: number | null | undefined) => {
+      if (value === null || value === undefined || !Number.isFinite(value)) {
+        return;
+      }
+      minPrice = Math.min(minPrice, value);
+      maxPrice = Math.max(maxPrice, value);
+    };
+
+    for (const point of chartPoints) {
+      if (!withinVisibleDomain(point.timeMs)) {
+        continue;
+      }
+      if (showCloseLine) {
+        consider(point.closePrice);
+      }
+      if (showSmaFastLine) {
+        consider(point.smaFast);
+      }
+      if (showSmaSlowLine) {
+        consider(point.smaSlow);
+      }
+    }
+    if (showPredictionsOnChart) {
+      for (const marker of predictionMarkers) {
+        if (withinVisibleDomain(marker.timeMs)) {
+          consider(marker.price);
+        }
+      }
+    }
+    if (showAlertsOnChart) {
+      for (const marker of alertMarkers) {
+        if (withinVisibleDomain(marker.timeMs)) {
+          consider(marker.price);
+        }
+      }
+    }
+    if (showTradesOnChart) {
+      for (const marker of tradeMarkers) {
+        if (withinVisibleDomain(marker.timeMs)) {
+          consider(marker.price);
+        }
+      }
+    }
+    if (showRegimeBacktestsOnChart) {
+      for (const marker of regimeMarkers) {
+        if (withinVisibleDomain(marker.timeMs)) {
+          consider(marker.price);
+        }
+      }
+    }
+
+    if (!Number.isFinite(minPrice) || !Number.isFinite(maxPrice)) {
+      return null;
+    }
+    if (maxPrice <= minPrice) {
+      const pad = Math.max(Math.abs(minPrice) * 0.01, 1);
+      return [minPrice - pad, maxPrice + pad];
+    }
+    const pad = (maxPrice - minPrice) * 0.04;
+    return [minPrice - pad, maxPrice + pad];
+  }, [
+    alertMarkers,
+    chartPoints,
+    predictionMarkers,
+    showAlertsOnChart,
+    showCloseLine,
+    showPredictionsOnChart,
+    showRegimeBacktestsOnChart,
+    showSmaFastLine,
+    showSmaSlowLine,
+    showTradesOnChart,
+    regimeMarkers,
+    tradeMarkers,
+    visibleDomain
+  ]);
+
+  const priceAxisDomain = useMemo<[number, number] | null>(() => {
+    if (!activePriceBounds) {
+      return null;
+    }
+    const [boundMin, boundMax] = activePriceBounds;
+    const span = Math.max(1e-9, boundMax - boundMin);
+    let selectedMin = boundMin + (priceRangeSlider[0] / RANGE_SLIDER_STEPS) * span;
+    let selectedMax = boundMin + (priceRangeSlider[1] / RANGE_SLIDER_STEPS) * span;
+    if (selectedMax <= selectedMin) {
+      const minGap = Math.max(span / RANGE_SLIDER_STEPS, 1e-6);
+      selectedMax = selectedMin + minGap;
+    }
+    return [selectedMin, selectedMax];
+  }, [activePriceBounds, priceRangeSlider]);
+
+  const selectedDateRange = useMemo<[number | null, number | null]>(() => {
+    if (!fullDomain) {
+      return [null, null];
+    }
+    const [boundStart] = fullDomain;
+    const startMs = boundStart + (dateRangeSlider[0] / RANGE_SLIDER_STEPS) * fullSpanMs;
+    const endMs = boundStart + (dateRangeSlider[1] / RANGE_SLIDER_STEPS) * fullSpanMs;
+    return [startMs, endMs];
+  }, [dateRangeSlider, fullDomain, fullSpanMs]);
+
+  const selectedPriceRange = useMemo<[number | null, number | null]>(() => {
+    if (!priceAxisDomain) {
+      return [null, null];
+    }
+    return [priceAxisDomain[0], priceAxisDomain[1]];
+  }, [priceAxisDomain]);
 
   const canZoomIn = fullDomain !== null && visibleSpanMs > minimumZoomSpanMs + 1;
   const canZoomOut = fullDomain !== null && visibleSpanMs < fullSpanMs - 1;
   const canDragPan = canZoomOut;
-  const fullDomainStart = fullDomain ? fullDomain[0] : null;
-  const fullDomainEnd = fullDomain ? fullDomain[1] : null;
 
   const beginDragPan = useCallback(
     (event: { button: number; clientX: number }) => {
@@ -447,9 +899,69 @@ export default function HomePage() {
     [fullDomain, fullSpanMs, minimumZoomSpanMs, visibleDomain]
   );
 
+  const applyDateRangeSlider = useCallback(
+    (requestedStartStep: number, requestedEndStep: number) => {
+      if (!fullDomain) {
+        return;
+      }
+      let startStep = Math.round(requestedStartStep);
+      let endStep = Math.round(requestedEndStep);
+      startStep = Math.max(0, Math.min(startStep, RANGE_SLIDER_STEPS - 1));
+      endStep = Math.min(RANGE_SLIDER_STEPS, Math.max(endStep, startStep + 1));
+      const nextSlider: [number, number] = [startStep, endStep];
+      setDateRangeSlider(nextSlider);
+
+      if (startStep === 0 && endStep === RANGE_SLIDER_STEPS) {
+        setZoomDomain(null);
+        return;
+      }
+      const [boundStart, boundEnd] = fullDomain;
+      const span = Math.max(1, boundEnd - boundStart);
+      const targetStart = boundStart + (startStep / RANGE_SLIDER_STEPS) * span;
+      const targetEnd = boundStart + (endStep / RANGE_SLIDER_STEPS) * span;
+      setZoomDomain(clampDomainToBounds(targetStart, targetEnd, fullDomain));
+    },
+    [fullDomain]
+  );
+
   useEffect(() => {
     setZoomDomain(null);
   }, [fullDomainStart, fullDomainEnd]);
+
+  useEffect(() => {
+    if (!fullDomain || !visibleDomain) {
+      setDateRangeSlider((prev) =>
+        prev[0] === 0 && prev[1] === RANGE_SLIDER_STEPS ? prev : [0, RANGE_SLIDER_STEPS]
+      );
+      return;
+    }
+    const [boundStart, boundEnd] = fullDomain;
+    const span = Math.max(1, boundEnd - boundStart);
+    let startStep = Math.round(((visibleDomain[0] - boundStart) / span) * RANGE_SLIDER_STEPS);
+    let endStep = Math.round(((visibleDomain[1] - boundStart) / span) * RANGE_SLIDER_STEPS);
+    startStep = Math.max(0, Math.min(startStep, RANGE_SLIDER_STEPS - 1));
+    endStep = Math.min(RANGE_SLIDER_STEPS, Math.max(endStep, startStep + 1));
+    setDateRangeSlider((prev) =>
+      prev[0] === startStep && prev[1] === endStep ? prev : [startStep, endStep]
+    );
+  }, [fullDomainStart, fullDomainEnd, visibleDomainStart, visibleDomainEnd, fullDomain, visibleDomain]);
+
+  useEffect(() => {
+    setPriceRangeSlider((prev) =>
+      prev[0] === 0 && prev[1] === RANGE_SLIDER_STEPS ? prev : [0, RANGE_SLIDER_STEPS]
+    );
+  }, [fullDomainStart, fullDomainEnd, symbolFilter]);
+
+  useEffect(() => {
+    setPriceRangeSlider((prev) => {
+      let nextMin = Math.max(0, Math.min(prev[0], RANGE_SLIDER_STEPS - 1));
+      let nextMax = Math.min(RANGE_SLIDER_STEPS, Math.max(prev[1], nextMin + 1));
+      if (nextMin === prev[0] && nextMax === prev[1]) {
+        return prev;
+      }
+      return [nextMin, nextMax];
+    });
+  }, [activePriceBounds]);
 
   useEffect(() => {
     if (canDragPan) {
@@ -617,8 +1129,24 @@ export default function HomePage() {
         >
           Alerts ({filteredAlerts.length})
         </button>
+        <button
+          type="button"
+          className={`toggle-btn large ${showTradesOnChart ? "active" : ""}`}
+          onClick={() => setShowTradesOnChart((prev) => !prev)}
+        >
+          Executed Trades ({tradeMarkers.length})
+        </button>
+        <button
+          type="button"
+          className={`toggle-btn large ${showRegimeBacktestsOnChart ? "active" : ""}`}
+          onClick={() => setShowRegimeBacktestsOnChart((prev) => !prev)}
+        >
+          Regime Backtests ({regimeMarkers.length})
+        </button>
         <div className="stats-inline muted">
-          actionable={actionablePredictions.length} • high-confidence={highConfidence.length}
+          actionable={actionablePredictions.length} • high-confidence={highConfidence.length} • trades=
+          {tradeMarkers.length} • regime PnL=
+          {formatUsd(regimeBacktestPerformance?.totalRealizedPnlDeltaUsd, 2)}
         </div>
       </section>
 
@@ -709,6 +1237,82 @@ export default function HomePage() {
         <span className="muted zoom-state">Window: {formatSpanLabel(visibleSpanMs)}</span>
         {canDragPan ? <span className="muted zoom-state">Drag chart left/right to pan</span> : null}
       </section>
+      <section className="button-row compact chart-range-controls">
+        <label className="range-control wide">
+          Date start ({formatDateTimeLabel(selectedDateRange[0])})
+          <input
+            type="range"
+            min={0}
+            max={RANGE_SLIDER_STEPS - 1}
+            step={1}
+            value={dateRangeSlider[0]}
+            disabled={!fullDomain}
+            onChange={(event) =>
+              applyDateRangeSlider(Number(event.target.value), dateRangeSlider[1])
+            }
+          />
+        </label>
+        <label className="range-control wide">
+          Date end ({formatDateTimeLabel(selectedDateRange[1])})
+          <input
+            type="range"
+            min={1}
+            max={RANGE_SLIDER_STEPS}
+            step={1}
+            value={dateRangeSlider[1]}
+            disabled={!fullDomain}
+            onChange={(event) =>
+              applyDateRangeSlider(dateRangeSlider[0], Number(event.target.value))
+            }
+          />
+        </label>
+      </section>
+      <section className="button-row compact chart-range-controls">
+        <label className="range-control wide">
+          Price bottom ({formatNumber(selectedPriceRange[0], 2)})
+          <input
+            type="range"
+            min={0}
+            max={RANGE_SLIDER_STEPS - 1}
+            step={1}
+            value={priceRangeSlider[0]}
+            disabled={!activePriceBounds}
+            onChange={(event) => {
+              const nextBottom = Number(event.target.value);
+              setPriceRangeSlider((prev) => {
+                const boundedBottom = Math.max(0, Math.min(nextBottom, prev[1] - 1));
+                return [boundedBottom, prev[1]];
+              });
+            }}
+          />
+        </label>
+        <label className="range-control wide">
+          Price top ({formatNumber(selectedPriceRange[1], 2)})
+          <input
+            type="range"
+            min={1}
+            max={RANGE_SLIDER_STEPS}
+            step={1}
+            value={priceRangeSlider[1]}
+            disabled={!activePriceBounds}
+            onChange={(event) => {
+              const nextTop = Number(event.target.value);
+              setPriceRangeSlider((prev) => {
+                const boundedTop = Math.min(RANGE_SLIDER_STEPS, Math.max(nextTop, prev[0] + 1));
+                return [prev[0], boundedTop];
+              });
+            }}
+          />
+        </label>
+        <button
+          type="button"
+          className="toggle-btn"
+          onClick={() => setPriceRangeSlider([0, RANGE_SLIDER_STEPS])}
+          disabled={priceRangeSlider[0] === 0 && priceRangeSlider[1] === RANGE_SLIDER_STEPS}
+        >
+          Reset Price Range
+        </button>
+      </section>
       <section className="button-row compact chart-controls">
         <label className="range-control">
           Price panel height
@@ -785,7 +1389,7 @@ export default function HomePage() {
                     orientation="left"
                     tick={{ fill: "#a6b0cf", fontSize: 11 }}
                     width={82}
-                    domain={["auto", "auto"]}
+                    domain={priceAxisDomain ? [priceAxisDomain[0], priceAxisDomain[1]] : ["auto", "auto"]}
                     label={{
                       value: "Price (USD)",
                       angle: -90,
@@ -795,10 +1399,37 @@ export default function HomePage() {
                     }}
                   />
                   <Tooltip
-                    labelFormatter={(value) => formatTimeTick(Number(value))}
-                    formatter={(value: any, name: string) => [formatNumber(Number(value), 5), name]}
+                    content={<PriceChartTooltip />}
                   />
                   <Legend />
+                  {showRegimeBacktestsOnChart
+                    ? regimeRanges.map(({ id, startMs, endMs, run }) => {
+                        const normalizedRegime = (run.regime || "").toLowerCase();
+                        const fill = normalizedRegime.includes("up")
+                          ? "#22c55e"
+                          : normalizedRegime.includes("down")
+                            ? "#3b82f6"
+                            : normalizedRegime.includes("flat")
+                              ? "#eab308"
+                              : "#64748b";
+                        const stroke = run.realizedPnlDeltaUsd >= 0 ? "#22c55e" : "#ef4444";
+                        return (
+                          <ReferenceArea
+                            key={`regime-area:${id}`}
+                            x1={startMs}
+                            x2={endMs}
+                            yAxisId="price"
+                            ifOverflow="visible"
+                            fill={fill}
+                            fillOpacity={0.08}
+                            stroke={stroke}
+                            strokeOpacity={0.45}
+                            strokeWidth={1}
+                            onClick={() => setSelectedDatum({ kind: "regime", row: run })}
+                          />
+                        );
+                      })
+                    : null}
                   {showCloseLine ? (
                     <Line
                       yAxisId="price"
@@ -859,6 +1490,36 @@ export default function HomePage() {
                         const payload = event?.payload as MarkerPoint | undefined;
                         if (payload?.alert) {
                           setSelectedDatum({ kind: "alert", row: payload.alert });
+                        }
+                      }}
+                    />
+                  ) : null}
+                  {showTradesOnChart ? (
+                    <Scatter
+                      yAxisId="price"
+                      name="Executed trades"
+                      data={tradeMarkers}
+                      dataKey="price"
+                      shape={renderTradeShape}
+                      onClick={(event: any) => {
+                        const payload = event?.payload as MarkerPoint | undefined;
+                        if (payload?.trade) {
+                          setSelectedDatum({ kind: "trade", row: payload.trade });
+                        }
+                      }}
+                    />
+                  ) : null}
+                  {showRegimeBacktestsOnChart ? (
+                    <Scatter
+                      yAxisId="price"
+                      name="Regime backtests"
+                      data={regimeMarkers}
+                      dataKey="price"
+                      shape={renderRegimeShape}
+                      onClick={(event: any) => {
+                        const payload = event?.payload as MarkerPoint | undefined;
+                        if (payload?.regimeRun) {
+                          setSelectedDatum({ kind: "regime", row: payload.regimeRun });
                         }
                       }}
                     />
@@ -974,8 +1635,8 @@ export default function HomePage() {
         <h2>Selected marker details</h2>
         {!selectedDatum ? (
           <p className="muted">
-            Select a prediction arrow or alert marker on the chart to inspect confidence,
-            probabilities, and rationale details.
+            Select a prediction/alert marker, executed trade marker, or regime marker on the chart
+            to inspect confidence, trade sizing, and realized PnL details.
           </p>
         ) : selectedDatum.kind === "prediction" ? (
           <div className="detail-panel">
@@ -1009,7 +1670,7 @@ export default function HomePage() {
               ))}
             </ul>
           </div>
-        ) : (
+        ) : selectedDatum.kind === "alert" ? (
           <div className="detail-panel">
             <div>
               <span className={`pill ${selectedDatum.row.recommendation}`}>
@@ -1040,6 +1701,64 @@ export default function HomePage() {
                 <li key={`${selectedDatum.row.id}-${reason}`}>{reason}</li>
               ))}
             </ul>
+            <p className="muted">alert record: {selectedDatum.row.alertPath}</p>
+          </div>
+        ) : selectedDatum.kind === "regime" ? (
+          <div className="detail-panel">
+            <div>
+              <span
+                className={`pill ${selectedDatum.row.realizedPnlDeltaUsd >= 0 ? "buy" : "sell"}`}
+              >
+                {selectedDatum.row.realizedPnlDeltaUsd >= 0 ? "profit" : "loss"}
+              </span>{" "}
+              regime backtest
+            </div>
+            <div className="muted">
+              {selectedDatum.row.scenario} • split={selectedDatum.row.split} • regime=
+              {selectedDatum.row.regime || "n/a"}
+            </div>
+            <p>
+              window={selectedDatum.row.startUtc || "n/a"} → {selectedDatum.row.endUtc || "n/a"}
+            </p>
+            <p>
+              samples={selectedDatum.row.sampleCount} • train/test={selectedDatum.row.trainCount}/
+              {selectedDatum.row.testCount}
+            </p>
+            <p>
+              realized PnL Δ={formatUsd(selectedDatum.row.realizedPnlDeltaUsd, 2)} • equity return=
+              {formatPercent(selectedDatum.row.equityReturn, 2)}
+            </p>
+            <p className="muted">source: {selectedDatum.row.sourceResultsPath}</p>
+          </div>
+        ) : (
+          <div className="detail-panel">
+            <div>
+              <span className={`pill ${selectedDatum.row.executedAction}`}>
+                {selectedDatum.row.executedAction}
+              </span>{" "}
+              executed trade
+            </div>
+            <div className="muted">
+              {selectedDatum.row.exchange} {selectedDatum.row.symbol} ({selectedDatum.row.timeframe}) •{" "}
+              {selectedDatum.row.predictionTimestampUtc || selectedDatum.row.createdAtUtc}
+            </div>
+            <p>
+              status={selectedDatum.row.executionStatus} • intent={selectedDatum.row.intentAction} • fill=
+              {formatPercent(selectedDatum.row.fillRatio, 2)}
+            </p>
+            <p>
+              mark={formatNumber(selectedDatum.row.markPrice, 2)} execution=
+              {formatNumber(selectedDatum.row.executionPrice, 2)} notional=
+              {formatUsd(selectedDatum.row.executedNotionalUsd, 2)} fee=
+              {formatUsd(selectedDatum.row.feeUsd, 4)}
+            </p>
+            <p>
+              realized PnL Δ={formatUsd(selectedDatum.row.realizedPnlDeltaUsd, 4)} cash after=
+              {formatUsd(selectedDatum.row.cashAfterUsd, 2)} position qty after=
+              {formatNumber(selectedDatum.row.positionQtyAfter, 8)}
+            </p>
+            <p className="muted">reason={selectedDatum.row.reason || "n/a"}</p>
+            <p className="muted">execution record: {selectedDatum.row.executionRecordPath}</p>
           </div>
         )}
       </section>
@@ -1078,6 +1797,22 @@ export default function HomePage() {
             <article className="card">
               <div className="label">Fees paid (USD)</div>
               <div className="value">{formatNumber(paperTradingPerformance?.totalFeesUsd, 2)}</div>
+            </article>
+            <article className="card">
+              <div className="label">Regime backtests tracked</div>
+              <div className="value">{regimeBacktestPerformance?.runCount ?? 0}</div>
+            </article>
+            <article className="card">
+              <div className="label">Regime realized PnL delta (USD)</div>
+              <div className="value">
+                {formatNumber(regimeBacktestPerformance?.totalRealizedPnlDeltaUsd, 2)}
+              </div>
+            </article>
+            <article className="card">
+              <div className="label">Regime avg equity return</div>
+              <div className="value">
+                {formatPercent(regimeBacktestPerformance?.averageEquityReturn, 2)}
+              </div>
             </article>
           </section>
 
@@ -1160,6 +1895,52 @@ export default function HomePage() {
                   ))}
                 </tbody>
               </table>
+            )}
+          </section>
+          <section className="section">
+            <h2>Regime backtest performance</h2>
+            {!regimeBacktestRuns.length ? (
+              <p className="muted">
+                No ranked ablation regime summaries found yet under the analysis output path.
+              </p>
+            ) : (
+              <>
+                <p className="muted">
+                  Source results: <code>{regimeBacktestPerformance?.sourceResultsPath || "n/a"}</code>
+                </p>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Scenario</th>
+                      <th>Split</th>
+                      <th>Regime</th>
+                      <th>Window (UTC)</th>
+                      <th>Samples</th>
+                      <th>Train/Test</th>
+                      <th>Equity Return</th>
+                      <th>Realized PnL Δ USD</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {regimeBacktestRuns.map((row) => (
+                      <tr key={row.id}>
+                        <td>{row.scenario}</td>
+                        <td>{row.split}</td>
+                        <td>{row.regime || "n/a"}</td>
+                        <td>
+                          {row.startUtc || "n/a"} → {row.endUtc || "n/a"}
+                        </td>
+                        <td>{row.sampleCount}</td>
+                        <td>
+                          {row.trainCount}/{row.testCount}
+                        </td>
+                        <td>{formatPercent(row.equityReturn, 2)}</td>
+                        <td>{formatNumber(row.realizedPnlDeltaUsd, 2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
             )}
           </section>
         </>
